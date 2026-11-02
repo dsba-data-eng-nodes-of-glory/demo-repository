@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+requests
+pandas
+numpy
+pyarrow
+pyspark
+kafka-python
+torch
+scikit-learn
+pyyaml
+plotly
+streamlit>=1.38.0
+python-multipart

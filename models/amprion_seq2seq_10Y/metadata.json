@@ -1,0 +1,48 @@
+{
+  "region_name": "amprion",
+  "input_file": "C:\\Users\\hp\\Documents\\Data Engg Project\\electricity-demand-forecasting\\data\\raw\\amprion.csv",
+  "model_path": "C:\\Users\\hp\\Documents\\Data Engg Project\\electricity-demand-forecasting\\models\\amprion_seq2seq_10Y\\amprion_encoder_decoder_lstm.pt",
+  "combined_data_path": "C:\\Users\\hp\\Documents\\Data Engg Project\\electricity-demand-forecasting\\data\\processed\\amprion_cleaned.csv",
+  "history": 672,
+  "horizon": 96,
+  "interval_minutes": 15,
+  "hidden_size": 32,
+  "batch_size": 2,
+  "history_features": [
+    "demand_scaled",
+    "temperature_scaled",
+    "hour_sin",
+    "hour_cos",
+    "weekday_sin",
+    "weekday_cos",
+    "year_sin",
+    "year_cos"
+  ],
+  "future_features": [
+    "future_temperature_scaled",
+    "temperature_rolling_mean_1h_scaled",
+    "temperature_rolling_mean_24h_scaled",
+    "hour_sin",
+    "hour_cos",
+    "weekday_sin",
+    "weekday_cos",
+    "year_sin",
+    "year_cos"
+  ],
+  "temperature_rolling_windows": {
+    "1_hour_steps": 4,
+    "24_hour_steps": 96
+  },
+  "scales": {
+    "amprion": {
+      "demand_mean": 5223.69287109375,
+      "demand_std": 897.0601196289062,
+      "temperature_mean": 11.548434257507324,
+      "temperature_std": 7.470761775970459
+    }
+  },
+  "best_validation_rmse_scaled": 0.3196708620556932,
+  "test_rmse_scaled": 0.3217270289875548,
+  "weather_mode": "observed",
+  "note": "Observed mode uses actual future temperature and is an oracle-weather benchmark, not operational forecast accuracy."
+}

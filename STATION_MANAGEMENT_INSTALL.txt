@@ -1,0 +1,25 @@
+STATION MANAGEMENT PATCH - INSTALLATION
+
+1. Stop FastAPI and Streamlit. Leave Kafka alone unless you are separately maintaining it.
+2. Make a backup copy of your current POC folder.
+3. Extract this ZIP directly into your existing POC folder (the folder containing backend, config, dashboard and src). Allow the listed files to be overwritten.
+4. In the electricity-spark environment, run:
+
+   pip install python-multipart
+
+5. Start Kafka separately and confirm it is healthy.
+6. Restart FastAPI from the POC folder:
+
+   uvicorn backend.main:app --host 127.0.0.1 --port 8000
+
+   Use one worker and do not use --reload.
+
+7. Start Streamlit:
+
+   streamlit run dashboard/app.py
+
+8. Open Station Management. Register a new station by uploading one continuous CSV with utc_timestamp, demand and temperature columns. Then train the model, create/verify topics, and activate the station.
+
+The patch does not include or replace your .env, raw datasets, existing Amprion model checkpoint, Kafka storage, Spark checkpoints, or output CSVs. It never deletes Kafka topics.
+
+Read docs/STATION_MANAGEMENT_SETUP.md for the workflow and CSV split details.

@@ -1,0 +1,84 @@
+{
+  "region_name": "50hertz",
+  "model_path": "C:\\Users\\hp\\Documents\\Data Engg Project\\electricity-demand-forecasting\\POC\\models\\50hertz\\v1\\50hertz_encoder_decoder_lstm.pt",
+  "history": 672,
+  "horizon": 96,
+  "interval_minutes": 15,
+  "hidden_size": 32,
+  "history_features": [
+    "demand_scaled",
+    "temperature_scaled",
+    "hour_sin",
+    "hour_cos",
+    "weekday_sin",
+    "weekday_cos",
+    "year_sin",
+    "year_cos"
+  ],
+  "future_features": [
+    "future_temperature_scaled",
+    "temperature_rolling_mean_1h_scaled",
+    "temperature_rolling_mean_24h_scaled",
+    "hour_sin",
+    "hour_cos",
+    "weekday_sin",
+    "weekday_cos",
+    "year_sin",
+    "year_cos"
+  ],
+  "scales": {
+    "50hertz": {
+      "demand_mean": 2919.154296875,
+      "demand_std": 471.11279296875,
+      "temperature_mean": 10.076163291931152,
+      "temperature_std": 7.499840259552002
+    }
+  },
+  "weather_mode": "last_observed_temperature_persistence",
+  "best_validation_rmse_scaled": 0.40923236312122613,
+  "best_validation_mae_original": 150.83146510053194,
+  "best_epoch": 6,
+  "training_csv": "C:\\Users\\hp\\Documents\\Data Engg Project\\electricity-demand-forecasting\\POC\\data\\raw\\stations\\50hertz\\50hertz_training.csv",
+  "rows": 56140,
+  "training_windows": 400,
+  "validation_windows": 100,
+  "training_history": [
+    {
+      "epoch": 1.0,
+      "train_rmse_scaled": 0.7123532007535583,
+      "validation_rmse_scaled": 0.5136699380584285,
+      "validation_mae_original": 190.9417820746671
+    },
+    {
+      "epoch": 2.0,
+      "train_rmse_scaled": 0.5429984313241474,
+      "validation_rmse_scaled": 0.4622471693428334,
+      "validation_mae_original": 168.78050482572175
+    },
+    {
+      "epoch": 3.0,
+      "train_rmse_scaled": 0.4982447898913422,
+      "validation_rmse_scaled": 0.42710674319617337,
+      "validation_mae_original": 160.1564336520255
+    },
+    {
+      "epoch": 4.0,
+      "train_rmse_scaled": 0.4833027797225236,
+      "validation_rmse_scaled": 0.4222187757748987,
+      "validation_mae_original": 155.4529928506255
+    },
+    {
+      "epoch": 5.0,
+      "train_rmse_scaled": 0.4687319822524203,
+      "validation_rmse_scaled": 0.41611204015103126,
+      "validation_mae_original": 156.80941743079475
+    },
+    {
+      "epoch": 6.0,
+      "train_rmse_scaled": 0.4640188929290057,
+      "validation_rmse_scaled": 0.40923236312122613,
+      "validation_mae_original": 150.83146510053194
+    }
+  ],
+  "note": "Future temperature uses last-observed persistence in both training and inference."
+}

@@ -1,0 +1,7 @@
+app_name: electricity-feature-extraction
+master: "local[2]"
+raw_topic: amprion-raw
+featured_topic: amprion-featured
+checkpoint_location: checkpoints/spark_amprion_features
+starting_offsets: earliest
+java_home: "C:/Program Files/Microsoft/jdk-17.0.20.101-hotspot"

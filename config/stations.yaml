@@ -1,0 +1,58 @@
+active_station: tennet
+stations:
+  amprion:
+    display_name: Amprion
+    enabled: false
+    status: stopped
+    input_file: data/raw/amprion.csv
+    history_file: data/raw/amprion_history.csv
+    raw_topic: amprion-raw
+    featured_topic: amprion-featured
+    model_checkpoint: models/amprion_seq2seq_10Y/amprion_encoder_decoder_lstm.pt
+    model_metadata: models/amprion_seq2seq_10Y/metadata.json
+    model_version: existing
+    stream_delay_seconds: 1.5
+  50hertz:
+    display_name: 50Hertz
+    enabled: false
+    status: stopped
+    training_file: data/raw/stations/50hertz/50hertz_training.csv
+    history_file: data/raw/stations/50hertz/50hertz_history.csv
+    input_file: data/raw/stations/50hertz/50hertz_stream.csv
+    raw_topic: 50hertz-raw
+    featured_topic: 50hertz-featured
+    model_checkpoint: models/50hertz/v1/50hertz_encoder_decoder_lstm.pt
+    model_metadata: models/50hertz/v1/metadata.json
+    model_version: v1
+    stream_delay_seconds: 1.5
+    interval_minutes: 15
+    history_steps: 672
+    horizon_steps: 96
+    registered_source_file: 50hertz_hist.csv
+    registered_rows: 70176
+    training_rows: 56140
+    stream_rows: 14036
+    stream_start_utc: '2025-08-07T19:00:00+00:00'
+    stream_end_utc: '2025-12-31T23:45:00+00:00'
+  tennet:
+    display_name: tennet
+    enabled: false
+    status: stopped
+    training_file: data/raw/stations/tennet/tennet_training.csv
+    history_file: data/raw/stations/tennet/tennet_history.csv
+    input_file: data/raw/stations/tennet/tennet_stream.csv
+    raw_topic: tennet-raw
+    featured_topic: tennet-featured
+    model_checkpoint: models/tennet/v1/tennet_encoder_decoder_lstm.pt
+    model_metadata: models/tennet/v1/metadata.json
+    model_version: v1
+    stream_delay_seconds: 0.3
+    interval_minutes: 15
+    history_steps: 672
+    horizon_steps: 96
+    registered_source_file: tennet_hist.csv
+    registered_rows: 98208
+    training_rows: 78566
+    stream_rows: 19642
+    stream_start_utc: '2026-03-29T09:30:00+00:00'
+    stream_end_utc: '2026-10-19T23:45:00+00:00'
