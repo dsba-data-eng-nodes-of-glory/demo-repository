@@ -46,7 +46,7 @@ stations:
     model_checkpoint: models/tennet/v1/tennet_encoder_decoder_lstm.pt
     model_metadata: models/tennet/v1/metadata.json
     model_version: v1
-    stream_delay_seconds: 0.3
+    stream_delay_seconds: 1.5
     interval_minutes: 15
     history_steps: 672
     horizon_steps: 96
