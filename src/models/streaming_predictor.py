@@ -1,8 +1,8 @@
 """Streaming encoder-decoder LSTM predictor for a configured electricity station.
 
 The trained model expects:
-  * history_steps x 8 historical features (default 672 x 8)
-  * horizon_steps x 9 future covariates (default 96 x 9)
+  * history_steps x 8 historical features (derived from the station interval)
+  * horizon_steps x 9 future covariates (derived from the station interval)
 
 The predictor loads its initial history window from a separate
 `data/raw/{station}_history.csv` file. It writes one startup forecast from
@@ -22,7 +22,7 @@ For a fresh Kafka consumer group starting at the earliest available offset:
 
 By default, the seed file is data/raw/amprion_history.csv when the station's
 streaming input file is data/raw/amprion.csv. The first Kafka row must be the
-next 15-minute observation after the final seed row.
+next observation after the final seed row, using the station's configured interval.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import joblib
 import pandas as pd
 import torch
 import yaml
@@ -46,6 +47,7 @@ from torch import nn
 
 from src.ingestion.file_loader import load_station_csv
 from src.storage.forecast_store import append_actuals, append_forecasts
+from src.models.tabular_forecasting import build_origin_features
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -115,12 +117,12 @@ def calendar_feature_map(timestamps: pd.DatetimeIndex) -> dict[str, np.ndarray]:
     }
 
 
-def load_history_source(csv_path: Path) -> pd.DataFrame:
+def load_history_source(csv_path: Path, interval_minutes: int = 15) -> pd.DataFrame:
     """Load and clean the station's configured source CSV for historical seeding."""
     if not csv_path.exists():
         raise FileNotFoundError(f"Historical seed CSV not found: {csv_path}")
 
-    frame = load_station_csv(csv_path).copy()
+    frame = load_station_csv(csv_path, interval_minutes=interval_minutes).copy()
     required = {"utc_timestamp", "demand", "temperature"}
     missing = required - set(frame.columns)
     if missing:
@@ -151,43 +153,68 @@ def load_model(
     station_id: str,
     checkpoint_path: Path,
     model_cfg: dict[str, Any],
-) -> tuple[nn.Module, dict[str, Any], torch.device]:
+) -> tuple[Any, dict[str, Any], torch.device]:
+    """Load the station's active registry model, falling back to its legacy LSTM."""
+    station_doc = load_yaml("config/stations.yaml")
+    station_entry = station_doc.get("stations", {}).get(station_id, {})
+    active = station_entry.get("active_model") or {}
+    if active.get("artifact_path"):
+        checkpoint_path = Path(active["artifact_path"])
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_absolute():
         checkpoint_path = ROOT / checkpoint_path
     checkpoint_path = checkpoint_path.resolve()
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Model artifact not found: {checkpoint_path}")
 
+    algorithm = str(active.get("algorithm") or station_entry.get("model_algorithm") or "lstm").lower()
     device = torch.device(model_cfg.get("device", "cpu"))
-    torch.set_num_threads(int(model_cfg.get("torch_num_threads", 2)))
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=device,
-        weights_only=False,
-    )
+    torch.set_num_threads(max(1, int(model_cfg.get("torch_num_threads", 2))))
 
+    if algorithm in {"random_forest", "gbt", "xgboost"} or checkpoint_path.suffix.lower() in {".joblib", ".pkl"}:
+        metadata_value = active.get("metadata_path")
+        metadata_path = Path(metadata_value) if metadata_value else checkpoint_path.parent / "metadata.json"
+        if not metadata_path.is_absolute():
+            metadata_path = ROOT / metadata_path
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"Model metadata not found: {metadata_path}")
+        checkpoint = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if checkpoint.get("station") not in (None, station_id):
+            raise ValueError(f"Model metadata station '{checkpoint.get('station')}' does not match '{station_id}'.")
+        if checkpoint.get("algorithm") != algorithm:
+            raise ValueError("Deployed algorithm and model metadata do not match.")
+        model = joblib.load(checkpoint_path)
+        checkpoint["region_name"] = station_id
+        checkpoint["history"] = int(checkpoint.get("history_steps", 672))
+        checkpoint["horizon"] = int(checkpoint.get("horizon_steps", 96))
+        checkpoint["interval_minutes"] = int(checkpoint.get("interval_minutes", 15))
+        checkpoint["algorithm"] = algorithm
+        checkpoint["model_version"] = active.get("version") or checkpoint.get("version")
+        log.info(
+            "Loaded %s model %s for station=%s | history=%d | horizon=%d",
+            algorithm, checkpoint_path, station_id, checkpoint["history"], checkpoint["horizon"],
+        )
+        return model, checkpoint, torch.device("cpu")
+
+    # Legacy and newly trained LSTM checkpoints retain their original feature contract.
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     checkpoint_station = checkpoint.get("region_name")
     if checkpoint_station != station_id:
         raise ValueError(
             f"Checkpoint region '{checkpoint_station}' does not match station '{station_id}'."
         )
-
     history_features = checkpoint["history_features"]
     future_features = checkpoint["future_features"]
     if len(history_features) != 8 or len(future_features) != 9:
         raise ValueError(
-            "This predictor is written for the supplied training schema: "
-            f"8 history and 9 future features. Checkpoint has "
-            f"{len(history_features)} and {len(future_features)}."
+            "This predictor is written for the supplied LSTM schema: "
+            f"8 history and 9 future features. Checkpoint has {len(history_features)} and {len(future_features)}."
         )
-
     history_steps = int(checkpoint["history"])
     horizon_steps = int(checkpoint["horizon"])
     interval_minutes = int(checkpoint["interval_minutes"])
     if history_steps <= 0 or horizon_steps <= 0 or interval_minutes <= 0:
         raise ValueError("Checkpoint history, horizon and interval must be positive.")
-
     model = EncoderDecoderLSTM(
         n_history_features=len(history_features),
         n_future_features=len(future_features),
@@ -195,22 +222,18 @@ def load_model(
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-
-    log.info("Loaded model: %s", checkpoint_path)
+    checkpoint["algorithm"] = "lstm"
+    checkpoint.setdefault("model_version", active.get("version") or station_entry.get("model_version", "legacy"))
+    log.info("Loaded LSTM model: %s", checkpoint_path)
     log.info(
         "Station=%s | history=%d | horizon=%d | interval=%d minutes | device=%s",
-        station_id,
-        history_steps,
-        horizon_steps,
-        interval_minutes,
-        device,
+        station_id, history_steps, horizon_steps, interval_minutes, device,
     )
     log.info("Training weather mode in checkpoint: %s", checkpoint.get("weather_mode", "unknown"))
     log.warning(
-        "Weather shortcut enabled: future temperature is held at the latest "
-        "observed value. This is a temporary persistence assumption, not a weather forecast."
+        "Weather shortcut enabled: future temperature is held at the latest observed value. "
+        "This is a temporary persistence assumption, not a weather forecast."
     )
-
     checkpoint["history_features"] = history_features
     checkpoint["future_features"] = future_features
     return model, checkpoint, device
@@ -229,7 +252,7 @@ def build_model_inputs(
     rows: list[dict[str, Any]],
     checkpoint: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
-    """Build 672x8 history and 96x9 future inputs matching training features."""
+    """Build station-configured history and future inputs matching training features."""
     history_steps = int(checkpoint["history"])
     horizon_steps = int(checkpoint["horizon"])
     interval_minutes = int(checkpoint["interval_minutes"])
@@ -243,7 +266,7 @@ def build_model_inputs(
         pd.to_datetime([row["utc_timestamp"] for row in rows], utc=True)
     )
     if len(history_ts) > 1 and not np.all(np.diff(history_ts.asi8) == interval.value):
-        raise ValueError("Historical input window is not exactly 15-minute/interval continuous.")
+        raise ValueError(f"Historical input window is not continuous at the configured {interval_minutes}-minute interval.")
 
     demand = np.asarray([row["demand"] for row in rows], dtype=np.float32)
     historical_temp = np.asarray([row["temperature"] for row in rows], dtype=np.float32)
@@ -318,33 +341,51 @@ def build_model_inputs(
 
 def generate_forecast(
     rows: list[dict[str, Any]],
-    model: nn.Module,
+    model: Any,
     checkpoint: dict[str, Any],
     device: torch.device,
     checkpoint_path: Path,
 ) -> list[dict[str, Any]]:
-    x_history, x_future, future_ts = build_model_inputs(rows, checkpoint)
-    region = checkpoint["region_name"]
-    scales = checkpoint["scales"][region]
-
-    with torch.inference_mode():
-        prediction_scaled = model(
-            torch.from_numpy(x_history).unsqueeze(0).to(device),
-            torch.from_numpy(x_future).unsqueeze(0).to(device),
-        ).cpu().numpy().reshape(-1)
-
-    if len(prediction_scaled) != len(future_ts):
-        raise RuntimeError(
-            f"Model returned {len(prediction_scaled)} predictions for {len(future_ts)} timestamps."
-        )
-
-    predictions = (
-        prediction_scaled * float(scales["demand_std"])
-        + float(scales["demand_mean"])
+    algorithm = str(checkpoint.get("algorithm", "lstm")).lower()
+    region = str(checkpoint.get("region_name", checkpoint.get("station", "unknown")))
+    history_steps = int(checkpoint["history"])
+    horizon_steps = int(checkpoint["horizon"])
+    interval_minutes = int(checkpoint["interval_minutes"])
+    history_timestamps = pd.DatetimeIndex(pd.to_datetime([row["utc_timestamp"] for row in rows], utc=True))
+    if len(rows) < history_steps:
+        raise ValueError(f"Need {history_steps} history rows; received {len(rows)}.")
+    future_ts = pd.date_range(
+        start=history_timestamps[-1] + pd.Timedelta(minutes=interval_minutes),
+        periods=horizon_steps,
+        freq=pd.Timedelta(minutes=interval_minutes),
+        tz="UTC",
     )
+
+    if algorithm in {"random_forest", "gbt", "xgboost"}:
+        history_frame = pd.DataFrame(rows[-history_steps:])
+        features = build_origin_features(history_frame, future_ts, interval_minutes)
+        feature_names = checkpoint.get("feature_names", list(features.columns))
+        missing = set(feature_names) - set(features.columns)
+        if missing:
+            raise ValueError(f"Serving feature builder is missing model features: {sorted(missing)}")
+        predictions = np.asarray(model.predict(features.reindex(columns=feature_names)), dtype=float).reshape(-1)
+    else:
+        x_history, x_future, future_ts = build_model_inputs(rows, checkpoint)
+        region = checkpoint["region_name"]
+        scales = checkpoint["scales"][region]
+        with torch.inference_mode():
+            prediction_scaled = model(
+                torch.from_numpy(x_history).unsqueeze(0).to(device),
+                torch.from_numpy(x_future).unsqueeze(0).to(device),
+            ).cpu().numpy().reshape(-1)
+        predictions = prediction_scaled * float(scales["demand_std"]) + float(scales["demand_mean"])
+
+    if len(predictions) != len(future_ts):
+        raise RuntimeError(
+            f"Model returned {len(predictions)} predictions for {len(future_ts)} timestamps."
+        )
     issued_at = datetime.now(timezone.utc).isoformat()
     origin_at = pd.Timestamp(rows[-1]["utc_timestamp"]).isoformat()
-
     return [
         {
             "station_id": region,
@@ -354,7 +395,10 @@ def generate_forecast(
             "horizon_step": step,
             "predicted_demand": float(value),
             "model_file": checkpoint_path.name,
-            "weather_mode": "last_observed_temperature_persistence",
+            "model_version": checkpoint.get("model_version", "legacy"),
+            "algorithm": algorithm,
+            "experiment_id": checkpoint.get("experiment_id", ""),
+            "weather_mode": checkpoint.get("weather_mode", "last_observed_temperature_persistence"),
         }
         for step, (timestamp, value) in enumerate(zip(future_ts, predictions), start=1)
     ]
@@ -397,8 +441,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default="data/processed/forecasts.csv",
-        help="Forecast CSV output path (relative to the POC directory by default).",
+        default=None,
+        help="Forecast CSV output path; defaults to the station's configured forecasts_file.",
+    )
+    parser.add_argument(
+        "--actual-output",
+        default=None,
+        help="Actual-observation CSV output path; defaults to the station's configured actuals_file.",
     )
     parser.add_argument(
         "--replay",
@@ -420,7 +469,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1. LOAD MODEL AND INITIAL HISTORY
     # ------------------------------------------------------------------
-    checkpoint_path = Path(args.model or station["model_checkpoint"])
+    active_model = station.get("active_model") or {}
+    checkpoint_value = args.model or active_model.get("artifact_path") or station["model_checkpoint"]
+    checkpoint_path = Path(checkpoint_value)
     if not checkpoint_path.is_absolute():
         checkpoint_path = ROOT / checkpoint_path
     checkpoint_path = checkpoint_path.resolve()
@@ -436,10 +487,10 @@ def main() -> None:
         history_path = ROOT / history_path
     history_path = history_path.resolve()
 
-    history_source = load_history_source(history_path)
     history_steps = int(checkpoint["history"])
     horizon_steps = int(checkpoint["horizon"])
     interval_minutes = int(checkpoint["interval_minutes"])
+    history_source = load_history_source(history_path, interval_minutes=interval_minutes)
     interval = pd.Timedelta(minutes=interval_minutes)
 
     if len(history_source) < history_steps:
@@ -485,21 +536,24 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. OUTPUT PATHS AND FORECAST CADENCE
     # ------------------------------------------------------------------
-    actual_output_path = ROOT / "data" / "processed" / "actuals.csv"
-    output_path = Path(args.output)
+    forecast_value = args.output or station.get("forecasts_file") or "data/processed/forecasts.csv"
+    actual_value = args.actual_output or station.get("actuals_file") or "data/processed/actuals.csv"
+    actual_output_path = Path(actual_value)
+    output_path = Path(forecast_value)
+    if not actual_output_path.is_absolute():
+        actual_output_path = ROOT / actual_output_path
     if not output_path.is_absolute():
         output_path = ROOT / output_path
     actual_output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Set forecast_every_steps: 1 in config/model.yaml for a forecast after
-    # every 15-minute Kafka observation.
+    # Forecast cadence is counted in station observations, not wall-clock minutes.
     forecast_every = int(model_config.get("forecast_every_steps", 1))
     if forecast_every <= 0:
         raise ValueError("forecast_every_steps in config/model.yaml must be positive.")
 
     # ------------------------------------------------------------------
-    # 3. INITIAL FORECAST FROM THE 672 HISTORY ROWS
+    # 3. INITIAL FORECAST FROM THE CONFIGURED HISTORY WINDOW
     # ------------------------------------------------------------------
     initial_records = generate_forecast(
         list(buffer), model, checkpoint, device, checkpoint_path

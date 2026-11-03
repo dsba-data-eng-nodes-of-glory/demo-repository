@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -153,13 +154,16 @@ class PipelineManager:
             for service in self.SERVICE_NAMES
         }
         cfg = read_station_config().get("stations", {}).get(station, {})
-        checkpoint = resolve_root_path(cfg.get("model_checkpoint", "__missing_model__"))
+        active_model = cfg.get("active_model") or {}
+        active_artifact = active_model.get("artifact_path")
+        checkpoint = resolve_root_path(active_artifact or cfg.get("model_checkpoint", "__missing_model__"))
         return {
             "station": station,
             "kafka_tcp_available": snapshot["kafka_tcp_available"],
             "services": selected,
             "model_checkpoint": str(checkpoint),
             "model_ready": checkpoint.is_file(),
+            "active_model": active_model or None,
             "topics": {
                 "raw": cfg.get("raw_topic"),
                 "featured": cfg.get("featured_topic"),
@@ -273,6 +277,74 @@ class PipelineManager:
         finally:
             admin.close()
 
+    def start_model_experiment(
+        self,
+        station: str,
+        algorithm: str,
+        parameters: dict[str, Any],
+        training_options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Launch an immutable, versioned model training experiment."""
+        stations = read_station_config().get("stations", {})
+        if station not in stations:
+            raise ValueError(f"Unknown station '{station}'.")
+        entry = stations[station]
+        training_file = entry.get("training_file") or entry.get("input_file")
+        if not training_file or not resolve_root_path(training_file).is_file():
+            raise FileNotFoundError(f"Training CSV not found for '{station}': {training_file}")
+
+        key = self.process_key("training", station)
+        existing = self.processes.get(key)
+        if existing and existing.poll() is None:
+            raise RuntimeError(f"A training job is already running for station '{station}'.")
+
+        experiment_id = f"{station}-{algorithm}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        experiment_dir = ROOT / "models" / station / "experiments" / experiment_id
+        experiment_dir.mkdir(parents=True, exist_ok=True)
+        config_path = experiment_dir / "experiment.json"
+        experiment_config = {
+            "experiment_id": experiment_id,
+            "station": station,
+            "algorithm": algorithm,
+            "parameters": parameters,
+            "training_options": training_options or {},
+            "created_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        }
+        temporary = config_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(experiment_config, indent=2), encoding="utf-8")
+        temporary.replace(config_path)
+
+        try:
+            from src.models.model_registry import upsert_experiment
+            upsert_experiment({
+                "experiment_id": experiment_id,
+                "station": station,
+                "algorithm": algorithm,
+                "status": "queued",
+                "parameters": parameters,
+                "config_path": config_path.relative_to(ROOT).as_posix(),
+                "created_at": experiment_config["created_at"],
+            })
+        except Exception:
+            config_path.unlink(missing_ok=True)
+            raise
+
+        command = [sys.executable, "-u", "-m", "src.models.run_experiment", "--config", str(config_path)]
+        try:
+            result = self.start("training", command, station)
+        except Exception:
+            config_path.unlink(missing_ok=True)
+            raise
+        return {
+            "station": station,
+            "experiment_id": experiment_id,
+            "algorithm": algorithm,
+            "started": bool(result.get("started")),
+            "pid": result.get("pid"),
+            "log": result.get("log"),
+            "status": "queued",
+        }
+
     def start_training(self, station: str) -> dict[str, Any]:
         stations = read_station_config().get("stations", {})
         if station not in stations:
@@ -300,6 +372,17 @@ class PipelineManager:
             raise RuntimeError("Kafka broker is not reachable at 127.0.0.1:9092. Start Kafka first.")
 
         entry = stations[station]
+        # Isolate station outputs so one station can be stopped/reset while
+        # other station predictors continue writing their own result files.
+        registry_changed = False
+        if not entry.get("actuals_file"):
+            entry["actuals_file"] = f"data/processed/stations/{station}/actuals.csv"
+            registry_changed = True
+        if not entry.get("forecasts_file"):
+            entry["forecasts_file"] = f"data/processed/stations/{station}/forecasts.csv"
+            registry_changed = True
+        if registry_changed:
+            write_station_config(config)
         training_proc = self.processes.get(self.process_key("training", station))
         if training_proc and training_proc.poll() is None:
             raise RuntimeError(f"Station '{station}' is still training. Wait for training to finish before activation.")
@@ -309,8 +392,12 @@ class PipelineManager:
             history_file = resolve_root_path(history_value)
         else:
             history_file = stream_file.with_name(f"{station}_history.csv")
-        checkpoint = resolve_root_path(entry["model_checkpoint"])
-        for label, path in (("stream CSV", stream_file), ("history CSV", history_file), ("model checkpoint", checkpoint)):
+        active_model = entry.get("active_model") or {}
+        checkpoint_value = active_model.get("artifact_path") or entry.get("model_checkpoint")
+        if not checkpoint_value:
+            raise ValueError(f"Station '{station}' has no active model or legacy model_checkpoint configured.")
+        checkpoint = resolve_root_path(checkpoint_value)
+        for label, path in (("stream CSV", stream_file), ("history CSV", history_file), ("model artifact", checkpoint)):
             if not path.is_file():
                 raise FileNotFoundError(f"Station '{station}' {label} not found: {path}")
 
@@ -320,7 +407,10 @@ class PipelineManager:
         history_arg = ["--history-file", str(history_file)]
         commands = [
             ("spark", [python, "-u", "-m", "src.spark.streaming", "--station", station]),
-            ("predictor", [python, "-u", "-m", "src.models.streaming_predictor", "--station", station, *history_arg]),
+            ("predictor", [python, "-u", "-m", "src.models.streaming_predictor", "--station", station,
+                           "--model", str(checkpoint), *history_arg,
+                           "--output", str(resolve_root_path(entry["forecasts_file"])),
+                           "--actual-output", str(resolve_root_path(entry["actuals_file"]))]),
             ("producer", [python, "-u", "-m", "src.producers.csv_producer", "--station", station, *history_arg,
                            "--delay", str(float(entry.get("stream_delay_seconds", 1.0)))]),
         ]
@@ -338,8 +428,12 @@ class PipelineManager:
                     raise RuntimeError(f"{station} {name} exited during startup with code {proc.returncode}. Check logs/{station}_{name}.log")
             registry = read_station_config()
             registry["active_station"] = station
+            active_stations = set(registry.get("active_stations", []) or [])
+            active_stations.add(station)
+            registry["active_stations"] = sorted(active_stations)
             registry["stations"][station]["enabled"] = True
             registry["stations"][station]["status"] = "active"
+            registry["stations"][station]["topics_ready"] = True
             write_station_config(registry)
             return {"station": station, "started": started, "topics": topic_result, "status": self.station_status(station)}
         except Exception:
@@ -356,6 +450,11 @@ class PipelineManager:
             if station in registry.get("stations", {}):
                 registry["stations"][station]["enabled"] = False
                 registry["stations"][station]["status"] = "stopped"
+                active_stations = set(registry.get("active_stations", []) or [])
+                active_stations.discard(station)
+                registry["active_stations"] = sorted(active_stations)
+                if registry.get("active_station") == station:
+                    registry["active_station"] = next(iter(sorted(active_stations)), None)
                 write_station_config(registry)
             return {"station": station, "results": results}
 
@@ -698,10 +797,12 @@ class PipelineManager:
             raise ValueError("A station's raw_topic and featured_topic must be different.")
 
         self._assert_station_stopped(station)
-        # actuals.csv and forecasts.csv are shared append-only files today.
-        # Prevent a different station predictor from appending while this reset
-        # backs up and atomically filters the selected station's rows.
-        self._assert_other_predictors_stopped(station)
+        # New station registrations use isolated result files. This permits
+        # independent stop/reset while other stations continue forecasting.
+        # Legacy stations without isolated paths retain the original safety gate.
+        isolated_outputs = bool(stations[station].get("actuals_file") and stations[station].get("forecasts_file"))
+        if not isolated_outputs:
+            self._assert_other_predictors_stopped(station)
 
         # Do not truncate a topic that is also used by another registered station.
         for other_id, other in stations.items():
@@ -714,8 +815,9 @@ class PipelineManager:
                     "Give each station unique raw and featured topics before resetting."
                 )
 
-        # Preflight shared output schemas and checkpoint path before changing Kafka.
-        validate_station_output_files(station)
+        # Preflight output schema and checkpoint path before changing Kafka.
+        if not isolated_outputs:
+            validate_station_output_files(station)
         spark_cfg = read_spark_config()
         checkpoint_base = str(
             spark_cfg.get("checkpoint_location", "checkpoints/spark_features")
@@ -740,8 +842,23 @@ class PipelineManager:
         # Kafka topics are retained; only their existing records are expired.
         delete_output = self._clear_topic_records(raw_topic, featured_topic)
 
-        # Back up shared outputs and remove only the selected station's rows.
-        output_backup = prepare_station_outputs(station)
+        # Back up and clear this station's isolated result files. Legacy
+        # stations continue using the original shared-CSV filtering behavior.
+        output_backup = None
+        if isolated_outputs:
+            import datetime as _dt
+            backup_dir = ROOT / "data" / "processed" / "reset_backups" / f"{station}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            for field in ("actuals_file", "forecasts_file"):
+                output_path = resolve_root_path(stations[station][field])
+                if not output_path.is_relative_to(ROOT.resolve()):
+                    raise RuntimeError(f"Refusing to reset output outside POC folder: {output_path}")
+                if output_path.exists():
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(output_path, backup_dir / output_path.name)
+                    output_path.unlink()
+            output_backup = backup_dir if backup_dir.exists() else None
+        else:
+            output_backup = prepare_station_outputs(station)
 
         # Clear only this station's Spark checkpoint. The trained model and
         # source CSVs are intentionally preserved.
@@ -785,6 +902,7 @@ class PipelineManager:
         root = ROOT.resolve()
         file_fields = (
             "input_file", "history_file", "training_file", "model_checkpoint", "model_metadata",
+            "actuals_file", "forecasts_file",
         )
         own_files: dict[Path, str] = {}
         other_files: dict[Path, str] = {}

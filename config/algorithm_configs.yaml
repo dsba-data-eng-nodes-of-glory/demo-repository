@@ -1,0 +1,38 @@
+training_options:
+  validation_fraction: 0.15
+algorithms:
+  lstm:
+    epochs: 8
+    batch_size: 10
+    hidden_size: 64
+    learning_rate: 0.001
+    max_train_windows: 400
+    max_validation_windows: 80
+    patience: 4
+  random_forest:
+    n_estimators: 150
+    max_depth: 16
+    min_samples_leaf: 2
+    max_train_origins: 300
+    max_validation_origins: 80
+    random_state: 42
+    n_jobs: 1
+  gbt:
+    max_iter: 120
+    max_leaf_nodes: 31
+    learning_rate: 0.08
+    l2_regularization: 0.001
+    max_train_origins: 300
+    max_validation_origins: 80
+    random_state: 42
+  xgboost:
+    n_estimators: 250
+    max_depth: 10
+    learning_rate: 0.0025
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+    max_train_origins: 300
+    max_validation_origins: 80
+    random_state: 42
+    n_jobs: 1

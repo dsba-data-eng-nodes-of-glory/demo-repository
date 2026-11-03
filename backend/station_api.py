@@ -17,6 +17,7 @@ from backend.pipeline_manager import (
     resolve_root_path,
 )
 from src.ingestion.file_loader import load_station_csv
+from src.models.forecast_contract import derive_forecast_contract
 
 router = APIRouter(prefix="/stations", tags=["stations"])
 
@@ -60,6 +61,12 @@ async def onboard_station(
     file: UploadFile = File(...),
     display_name: str | None = Form(default=None),
     stream_fraction: float = Form(default=0.20),
+    timestamp_column: str | None = Form(default=None),
+    timestamp_format: str = Form(default="auto"),
+    source_timezone: str = Form(default="UTC"),
+    interval_minutes: int = Form(default=15),
+    raw_topic: str | None = Form(default=None),
+    featured_topic: str | None = Form(default=None),
 ):
     """Register a station from one continuous historical CSV.
 
@@ -79,9 +86,13 @@ async def onboard_station(
         raise HTTPException(status_code=409, detail=f"Station '{key}' is already registered.")
 
     model_settings = _read_model_settings()
-    history_steps = int(model_settings.get("history_steps", 672))
-    horizon_steps = int(model_settings.get("horizon_steps", 96))
-    interval_minutes = int(model_settings.get("interval_minutes", 15))
+    interval_minutes = int(interval_minutes or model_settings.get("interval_minutes", 15))
+    try:
+        forecast_contract = derive_forecast_contract(interval_minutes, model_settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    history_steps = int(forecast_contract["history_steps"])
+    horizon_steps = int(forecast_contract["horizon_steps"])
 
     station_dir = ROOT / "data" / "raw" / "stations" / key
     station_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +106,17 @@ async def onboard_station(
                     break
                 destination.write(chunk)
 
-        frame = load_station_csv(upload_path, interval_minutes=interval_minutes)
+        frame = load_station_csv(
+            upload_path,
+            interval_minutes=interval_minutes,
+            timestamp_column=timestamp_column,
+            timestamp_format=timestamp_format,
+            # The current onboarding UI intentionally assumes UTC for naive
+            # timestamps. Offset-aware values are normalized by the loader.
+            source_timezone=source_timezone or "UTC",
+        )
+        detected_source_columns = dict(frame.attrs.get("source_columns", {}))
+        timestamp_format_used = frame.attrs.get("timestamp_format_used", timestamp_format)
         minimum_training_rows = int((history_steps + horizon_steps + 30) / (1.0 - 0.15)) + 1
         split_at = int(len(frame) * (1.0 - stream_fraction))
         if split_at < minimum_training_rows:
@@ -141,13 +162,25 @@ async def onboard_station(
             "training_file": training_rel,
             "history_file": history_rel,
             "input_file": stream_rel,
-            "raw_topic": f"{key}-raw",
-            "featured_topic": f"{key}-featured",
+            "raw_topic": (raw_topic or "").strip() or f"{key}-raw",
+            "featured_topic": (featured_topic or "").strip() or f"{key}-featured",
+            "actuals_file": f"data/processed/stations/{key}/actuals.csv",
+            "forecasts_file": f"data/processed/stations/{key}/forecasts.csv",
+            # Store detected source mappings for reproducibility; users are not
+            # asked to select these columns in the onboarding form.
+            "timestamp_column": detected_source_columns.get("timestamp"),
+            "demand_column": detected_source_columns.get("demand"),
+            "temperature_column": detected_source_columns.get("temperature"),
+            "timestamp_format": timestamp_format,
+            "timestamp_format_used": timestamp_format_used,
+            "source_timezone_assumption": "UTC for naive timestamps; timezone-aware values converted to UTC",
             "model_checkpoint": checkpoint_rel,
             "model_metadata": metadata_rel,
             "model_version": "v1",
             "stream_delay_seconds": 0.3,
             "interval_minutes": interval_minutes,
+            "history_window_hours": forecast_contract["history_window_hours"],
+            "forecast_horizon_hours": forecast_contract["forecast_horizon_hours"],
             "history_steps": history_steps,
             "horizon_steps": horizon_steps,
             "registered_source_file": file.filename,
@@ -158,6 +191,22 @@ async def onboard_station(
             "stream_end_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[-1]).isoformat(),
         }
         write_station_config(config)
+        # Topic names default to <station>-raw and <station>-featured when
+        # left blank in the registration form. Try to create them immediately;
+        # registration remains valid if Kafka is temporarily unavailable.
+        topic_result = None
+        topic_warning = None
+        try:
+            topic_result = manager.ensure_station_topics(key)
+            config = read_station_config()
+            config["stations"][key]["topics_ready"] = True
+            write_station_config(config)
+        except Exception as exc:
+            topic_warning = str(exc)
+            config = read_station_config()
+            config["stations"][key]["topics_ready"] = False
+            config["stations"][key]["topic_setup_message"] = topic_warning
+            write_station_config(config)
         return {
             "station": key,
             "display_name": stations[key]["display_name"],
@@ -170,8 +219,13 @@ async def onboard_station(
             "stream_rows": len(stream_frame),
             "stream_start_utc": stations[key]["stream_start_utc"],
             "stream_end_utc": stations[key]["stream_end_utc"],
+            "detected_source_columns": detected_source_columns,
+            "timestamp_format_used": timestamp_format_used,
             "model_checkpoint": checkpoint_rel,
-            "next_step": f"POST /stations/{key}/train",
+            "topics": topic_result,
+            "topics_ready": bool(topic_result),
+            "topic_warning": topic_warning,
+            "next_step": "Train a model from Model Management, then activate this station from Home.",
         }
     except HTTPException:
         raise
@@ -213,6 +267,11 @@ def station_status(station: str):
         "history_file_exists": resolve_root_path(entry.get("history_file", "__missing__")).is_file(),
         "stream_file_exists": resolve_root_path(entry.get("input_file", "__missing__")).is_file(),
         "model_metadata": entry.get("model_metadata"),
+        "interval_minutes": int(entry.get("interval_minutes", 15)),
+        "history_steps": int(entry.get("history_steps", 672)),
+        "horizon_steps": int(entry.get("horizon_steps", 96)),
+        "history_window_hours": float(entry.get("history_window_hours", 168)),
+        "forecast_horizon_hours": float(entry.get("forecast_horizon_hours", 24)),
     })
     return status
 
@@ -232,7 +291,12 @@ def train_station(station: str):
 @router.post("/{station}/topics")
 def create_station_topics(station: str):
     try:
-        return manager.ensure_station_topics(station)
+        result = manager.ensure_station_topics(station)
+        config = read_station_config()
+        config["stations"][station]["topics_ready"] = True
+        config["stations"][station].pop("topic_setup_message", None)
+        write_station_config(config)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -255,12 +319,24 @@ def stop_station(station: str):
     config = read_station_config().get("stations", {})
     if station not in config:
         raise HTTPException(status_code=404, detail=f"Unknown station: {station}")
-    result = manager.stop_pipeline(station)
+    # Stop only this station, then automatically clear its Kafka records,
+    # Spark checkpoint and station-scoped result files. Other stations remain active.
+    stop_result = manager.stop_pipeline(station)
+    # Migrate this station to isolated output files before reset. This permits
+    # stopping it while other station predictors continue running. Legacy
+    # shared CSVs remain untouched as historical archives.
+    updated = read_station_config()
+    station_entry = updated["stations"][station]
+    station_entry.setdefault("actuals_file", f"data/processed/stations/{station}/actuals.csv")
+    station_entry.setdefault("forecasts_file", f"data/processed/stations/{station}/forecasts.csv")
+    write_station_config(updated)
+    reset_result = manager.reset_station_pipeline(station)
     updated = read_station_config()
     updated["stations"][station]["enabled"] = False
     updated["stations"][station]["status"] = "stopped"
     write_station_config(updated)
-    return result
+    return {"station": station, "stopped": stop_result, "reset": reset_result,
+            "message": f"{station} stopped and reset. Its source files and trained model were preserved."}
 
 
 @router.delete("/{station}")

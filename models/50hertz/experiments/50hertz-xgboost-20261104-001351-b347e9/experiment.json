@@ -1,0 +1,21 @@
+{
+  "experiment_id": "50hertz-xgboost-20261104-001351-b347e9",
+  "station": "50hertz",
+  "algorithm": "xgboost",
+  "parameters": {
+    "n_estimators": 250,
+    "max_depth": 10,
+    "learning_rate": 0.0025,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 1.0,
+    "max_train_origins": 300,
+    "max_validation_origins": 80,
+    "random_state": 42,
+    "n_jobs": 1
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "created_at": "2026-11-03T18:43:51Z"
+}

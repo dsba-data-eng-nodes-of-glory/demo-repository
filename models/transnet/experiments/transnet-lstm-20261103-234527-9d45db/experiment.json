@@ -1,0 +1,18 @@
+{
+  "experiment_id": "transnet-lstm-20261103-234527-9d45db",
+  "station": "transnet",
+  "algorithm": "lstm",
+  "parameters": {
+    "epochs": 6,
+    "batch_size": 10,
+    "hidden_size": 32,
+    "learning_rate": 0.001,
+    "max_train_windows": 400,
+    "max_validation_windows": 80,
+    "patience": 2
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "created_at": "2026-11-03T18:15:27Z"
+}

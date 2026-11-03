@@ -18,7 +18,7 @@ def rerun_page():
 
 api = setup_page("Station Management", "stations")
 st.title("Station Management")
-st.caption("Central control for station registration, data validation, LSTM training, Kafka topics and live streaming.")
+st.caption("Register station data, configure timestamp interpretation and manage registered station records.")
 
 
 def api_get(path: str):
@@ -52,36 +52,103 @@ stations = registry.get("stations", {})
 # ---------------------------------------------------------------------
 st.subheader("Register a new station")
 st.markdown(
-    "Upload one continuous 15-minute historical CSV containing **utc_timestamp, demand, temperature**. "
-    "The onboarding service reserves the final part as a simulated stream and uses the earlier data for training/validation."
+    "Upload historical station data. Timestamp, demand and temperature columns are detected automatically from the CSV headers. "
+    "Choose only the timestamp format and observation interval; timestamps are normalized to UTC."
 )
 with st.form("station_onboarding_form", clear_on_submit=False):
     c1, c2 = st.columns(2)
     with c1:
         station_id = st.text_input("Station ID", placeholder="tennet").strip().lower()
         display_name = st.text_input("Display name", placeholder="TenneT")
-    with c2:
         stream_fraction = st.slider("Reserve for demo stream (%)", min_value=10, max_value=50, value=20, step=5)
         uploaded = st.file_uploader("Historical station CSV", type=["csv"], key="station_csv_upload")
-    submitted = st.form_submit_button("Validate data and register station")
+    with c2:
+        st.markdown("**Timestamp configuration**")
+        format_options = {
+            "Auto detect (recommended)": "auto",
+            "DD-MM-YYYY HH:MM": "%d-%m-%Y %H:%M",
+            "DD-MM-YYYY HH:MM:SS": "%d-%m-%Y %H:%M:%S",
+            "DD.MM.YYYY HH:MM": "%d.%m.%Y %H:%M",
+            "DD.MM.YYYY HH:MM:SS": "%d.%m.%Y %H:%M:%S",
+            "DD/MM/YYYY HH:MM": "%d/%m/%Y %H:%M",
+            "MM/DD/YYYY HH:MM": "%m/%d/%Y %H:%M",
+            "YYYY-MM-DD HH:MM": "%Y-%m-%d %H:%M",
+            "YYYY-MM-DD HH:MM:SS": "%Y-%m-%d %H:%M:%S",
+            "ISO 8601": "auto",
+            "Custom format": "__custom__",
+        }
+        selected_format_label = st.selectbox(
+            "Timestamp format",
+            list(format_options),
+            index=0,
+            help="Auto detect supports common European, ISO 8601 and timezone-aware timestamp values.",
+        )
+        timestamp_format = format_options[selected_format_label]
+        if timestamp_format == "__custom__":
+            timestamp_format = st.text_input(
+                "Python datetime format",
+                value="%Y-%m-%d %H:%M:%S",
+                help="Example: %d-%m-%Y %H:%M",
+            ).strip()
+        interval_minutes = int(st.number_input(
+            "Source observation interval (minutes)",
+            min_value=5,
+            max_value=1440,
+            value=15,
+            step=1,
+            help=(
+                "Enter the spacing between consecutive observations in minutes. "
+                "The forecasting contract keeps a 7-day history and a 24-hour forecast horizon; "
+                "the number of rows is derived automatically. The interval must divide both durations exactly."
+            ),
+        ))
+        if 10080 % interval_minutes != 0 or 1440 % interval_minutes != 0:
+            st.warning(
+                f"{interval_minutes} minutes does not divide the 7-day history and 24-hour forecast "
+                "into whole observations. Choose a different interval."
+            )
+        else:
+            st.caption(
+                f"Timestamp, demand and temperature columns are detected automatically. "
+                f"The model will use {10080 // interval_minutes:,} history steps and "
+                f"{1440 // interval_minutes:,} forecast steps for a 7-day lookback and 24-hour horizon. "
+                "Offset-aware timestamps are converted to UTC; timezone-naive timestamps are assumed to be UTC."
+            )
+    st.markdown("**Optional Kafka topic names**")
+    topic_col1, topic_col2 = st.columns(2)
+    with topic_col1:
+        raw_topic = st.text_input("Raw topic (leave blank for automatic name)", placeholder="tennet-raw")
+    with topic_col2:
+        featured_topic = st.text_input("Featured topic (leave blank for automatic name)", placeholder="tennet-featured")
+    submitted = st.form_submit_button("Validate data and register station", type="primary")
 
 if submitted:
     if not station_id or uploaded is None:
         st.error("Enter a station ID and upload a CSV file.")
     else:
+        # The backend detects the required columns from the uploaded CSV header
+        # and returns a validation error with sample values when parsing fails.
         try:
             payload = {
                 "station_id": station_id,
                 "display_name": display_name or station_id.upper(),
                 "stream_fraction": stream_fraction / 100.0,
+                "timestamp_format": timestamp_format,
+                "interval_minutes": interval_minutes,
+                "raw_topic": raw_topic.strip(),
+                "featured_topic": featured_topic.strip(),
             }
             result = api_post(
                 "/stations/onboard",
                 data=payload,
                 files={"file": (uploaded.name, uploaded.getvalue(), "text/csv")},
-                timeout=180,
+                timeout=240,
             )
             st.success(f"Station '{result['station']}' registered and data validated.")
+            if result.get("topics_ready"):
+                st.success("Kafka topics were created or already existed.")
+            else:
+                st.warning(f"Station registered, but Kafka topics are pending: {result.get('topic_warning')}. Topics will be retried automatically when you activate the station after Kafka is available.")
             st.json(result)
             rerun_page()
         except requests.HTTPError as exc:
@@ -134,49 +201,9 @@ k4.metric("Station state", str(status.get("lifecycle_status", entry.get("status"
 with st.expander("Station configuration", expanded=False):
     st.json({k: v for k, v in entry.items() if k not in {"registered_source_file"}})
 
-# Lifecycle buttons: training, topics, activation and stop.
-st.markdown("#### Station lifecycle")
-col_train, col_topics, col_activate, col_stop = st.columns(4)
-with col_train:
-    if st.button("Train / retrain model", type="primary"):
-        try:
-            result = api_post(f"/stations/{selected}/train", timeout=30)
-            st.success("Training process started.")
-            st.json(result)
-        except requests.HTTPError as exc:
-            st.error(exc.response.text if exc.response is not None else str(exc))
-        except requests.RequestException as exc:
-            st.error(str(exc))
-with col_topics:
-    if st.button("Create / verify topics"):
-        try:
-            result = api_post(f"/stations/{selected}/topics", timeout=30)
-            st.success("Kafka topics are ready.")
-            st.json(result)
-        except requests.HTTPError as exc:
-            st.error(exc.response.text if exc.response is not None else str(exc))
-        except requests.RequestException as exc:
-            st.error(str(exc))
-with col_activate:
-    if st.button("Activate station"):
-        try:
-            result = api_post(f"/stations/{selected}/activate", timeout=60)
-            st.success("Station pipeline start requested.")
-            st.json(result)
-        except requests.HTTPError as exc:
-            st.error(exc.response.text if exc.response is not None else str(exc))
-        except requests.RequestException as exc:
-            st.error(str(exc))
-with col_stop:
-    if st.button("Stop station"):
-        try:
-            result = api_post(f"/stations/{selected}/stop", timeout=30)
-            st.success("Station services stop requested.")
-            st.json(result)
-        except requests.HTTPError as exc:
-            st.error(exc.response.text if exc.response is not None else str(exc))
-        except requests.RequestException as exc:
-            st.error(str(exc))
+# Lifecycle operations are controlled from Home so registered stations can be
+# independently activated and stopped/reset without duplicating controls here.
+st.info("Use the station cards on Home to activate a station, open its monitoring page, or stop + reset it. Kafka topics are provisioned automatically during registration and retried during activation. Model training is managed separately in Model Management.")
 
 # ---------------------------------------------------------------------
 # Service and model status
@@ -199,7 +226,7 @@ if model.get("checkpoint_exists"):
     m3.metric("Best epoch", str(metadata.get("best_epoch", "Not available")))
     st.caption(f"Checkpoint: {model.get('checkpoint_path')}")
 else:
-    st.info("No trained model exists yet. Train this station before activating its streaming pipeline.")
+    st.info("No trained model exists yet. Train a model from Model Management before activating this station from Home.")
 
 # ---------------------------------------------------------------------
 # Logs
@@ -216,7 +243,7 @@ if st.button("Refresh selected log"):
 if st.button("Refresh station status"):
     rerun_page()
 
-st.caption("Kafka is managed separately and must be running. Station activation creates missing topics but never deletes or truncates existing topics.")
+st.caption("Kafka topics are created automatically during registration when the broker is available. If Kafka is temporarily unavailable, activation retries topic creation automatically.")
 
 
 # ---------------------------------------------------------------------

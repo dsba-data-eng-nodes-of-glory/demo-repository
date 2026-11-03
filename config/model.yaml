@@ -1,6 +1,8 @@
 history_steps: 672
 horizon_steps: 96
 interval_minutes: 15
+history_window_hours: 168
+forecast_horizon_hours: 24
 forecast_every_steps: 1
 hidden_size: 32
 device: cpu

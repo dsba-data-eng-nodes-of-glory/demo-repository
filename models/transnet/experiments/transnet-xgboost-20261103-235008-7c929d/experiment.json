@@ -1,0 +1,21 @@
+{
+  "experiment_id": "transnet-xgboost-20261103-235008-7c929d",
+  "station": "transnet",
+  "algorithm": "xgboost",
+  "parameters": {
+    "n_estimators": 250,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "reg_lambda": 1.0,
+    "max_train_origins": 300,
+    "max_validation_origins": 80,
+    "random_state": 42,
+    "n_jobs": 1
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "created_at": "2026-11-03T18:20:08Z"
+}

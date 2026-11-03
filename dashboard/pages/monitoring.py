@@ -1,4 +1,4 @@
-"""Electricity demand monitoring: actual history connected to the latest 24-hour LSTM forecast."""
+"""Electricity demand monitoring: actual history connected to the selected model forecast."""
 
 from datetime import date, timedelta
 import pandas as pd
@@ -68,7 +68,7 @@ api = setup_page("Live Monitoring", "monitoring")
 
 st.title("⚡ Electricity Demand — Live Monitoring")
 st.caption(
-    "Actual demand transitions into the latest 24-hour LSTM forecast · "
+    "Actual demand transitions into the latest configured forecast · "
     "Data loaded through FastAPI · All timestamps in UTC"
 )
 
@@ -110,7 +110,7 @@ with st.sidebar:
         index=4,  # Default to 72 hours (3 days) before the forecast origin.
         format_func=lambda hours: f"Previous {hours} hours",
     )
-    show_forecast_table = st.checkbox("Show 96-step forecast table", value=False)
+    show_forecast_table = st.checkbox("Show forecast table", value=False)
 
 # ---------------------------------------------------------------------
 # Station selection
@@ -129,10 +129,18 @@ if not station_ids:
     st.stop()
 
 active_station = registry.get("active_station")
+try:
+    requested_station = st.query_params.get("station")
+except Exception:
+    requested_station = None
+preferred_station = requested_station if requested_station in station_ids else active_station
 default_index = (
-    station_ids.index(active_station) if active_station in station_ids else 0
+    station_ids.index(preferred_station) if preferred_station in station_ids else 0
 )
 station = st.selectbox("Station", station_ids, index=default_index)
+station_interval_minutes = int(stations[station].get("interval_minutes", 15))
+station_horizon_steps = int(stations[station].get("horizon_steps", 96))
+station_forecast_horizon_hours = float(stations[station].get("forecast_horizon_hours", 24))
 
 # ---------------------------------------------------------------------
 # Load saved actuals and forecasts through FastAPI
@@ -186,10 +194,10 @@ if (
         ):
             forecast_origin = latest_run["forecast_origin_utc"].dropna().iloc[0]
         elif not latest_run.empty:
-            # Fallback: first target timestamp minus one 15-minute interval.
+            # Fallback: first target timestamp minus the station's configured interval.
             forecast_origin = (
                 latest_run["forecast_timestamp_utc"].iloc[0]
-                - pd.Timedelta(minutes=15)
+                - pd.Timedelta(minutes=station_interval_minutes)
             )
 
 # Load actuals only after deriving the latest forecast origin. The API uses
@@ -253,7 +261,7 @@ if not latest_run.empty and "forecast_issued_at_utc" in latest_run.columns:
 st.divider()
 st.subheader("Live Demand Monitoring")
 st.caption(
-    "Solid line: actual demand · Dashed line: latest 24-hour LSTM forecast · "
+    "Solid line: actual demand · Dashed line: latest configured forecast · "
     "Vertical marker: forecast origin (Now)"
 )
 
@@ -338,7 +346,7 @@ if forecast_origin is not None and not actuals.empty and not latest_run.empty:
         chart_end = (
             latest_run["forecast_timestamp_utc"].max()
             if not latest_run.empty
-            else forecast_origin + pd.Timedelta(hours=24)
+            else forecast_origin + pd.Timedelta(hours=station_forecast_horizon_hours)
         )
 
         # Use fewer, readable labels across the 96-hour chart window.
@@ -379,7 +387,7 @@ elif not actuals.empty:
             line=dict(color="#1976D2", width=3.5),
         )
     )
-    st.info("Waiting for the first saved 24-hour forecast run.")
+    st.info("Waiting for the first saved forecast run.")
 
 else:
     st.info("Waiting for actual-demand observations and forecast records.")
@@ -505,10 +513,13 @@ else:
     st.info("Forecast history will appear after the predictor saves its first run.")
 
 # ---------------------------------------------------------------------
-# Optional 96-step forecast table
+# Optional forecast table (step count is station-specific)
 # ---------------------------------------------------------------------
 if show_forecast_table:
-    st.subheader("Current 24-Hour Forecast — 96 Steps")
+    st.subheader(
+        f"Current Forecast — {station_horizon_steps:,} Steps "
+        f"({station_forecast_horizon_hours:g} Hours · {station_interval_minutes}-Minute Interval)"
+    )
     if not latest_run.empty:
         st.dataframe(
             latest_run,
@@ -538,7 +549,7 @@ with st.expander("Storage and data status", expanded=False):
         )
     )
     st.write(
-        "**Forecast source:** Kafka → Spark → LSTM predictor → forecasts.csv"
+        "**Forecast source:** Kafka → Spark → selected model predictor → station forecasts file"
     )
     st.caption(
         "The main chart uses the latest saved forecast run and its forecast "

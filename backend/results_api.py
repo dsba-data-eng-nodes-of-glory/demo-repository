@@ -29,6 +29,20 @@ _CACHE_LOCK = RLock()
 _CACHE_MAX_ITEMS = 12
 
 
+def _station_output_path(station: str, kind: str) -> Path:
+    """Return station-isolated output when configured, else legacy shared CSV."""
+    try:
+        with STATION_CONFIG_FILE.open("r", encoding="utf-8") as file:
+            config = yaml.safe_load(file) or {}
+        value = config.get("stations", {}).get(station, {}).get(f"{kind}_file")
+        if value:
+            path = Path(value)
+            return path if path.is_absolute() else ROOT / path
+    except (OSError, ValueError, yaml.YAMLError):
+        pass
+    return ACTUAL_FILE if kind == "actuals" else FORECAST_FILE
+
+
 def _file_signature(path: Path) -> tuple[int, int]:
     stat = path.stat()
     return stat.st_mtime_ns, stat.st_size
@@ -259,7 +273,7 @@ def _combine_actuals(
 @router.get("/summary")
 def summary(station: str | None = None):
     if station:
-        frame = _read_station_rows(FORECAST_FILE, station, 1)
+        frame = _read_station_rows(_station_output_path(station, "forecasts"), station, 1)
     else:
         frame = _read_csv_tail(FORECAST_FILE, 1)
     if frame.empty:
@@ -273,7 +287,7 @@ def forecasts(
     station: str,
     limit: int = Query(default=5000, ge=1, le=20000),
 ):
-    frame = _read_station_rows(FORECAST_FILE, station, limit)
+    frame = _read_station_rows(_station_output_path(station, "forecasts"), station, limit)
     if frame.empty:
         return {"records": [], "message": "No forecast records found for this station"}
     return {"records": _json_safe_records(frame)}
@@ -286,7 +300,7 @@ def actuals(
     end_time: str | None = Query(default=None, description="Optional UTC cutoff, normally the forecast origin"),
 ):
     historical = _read_historical_actuals(station)
-    live = _read_station_rows(ACTUAL_FILE, station, limit)
+    live = _read_station_rows(_station_output_path(station, "actuals"), station, limit)
     frame = _combine_actuals(
         historical=historical,
         live=live,

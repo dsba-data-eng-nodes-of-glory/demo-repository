@@ -1,0 +1,18 @@
+{
+  "experiment_id": "transnet-gbt-20261103-234720-3b818d",
+  "station": "transnet",
+  "algorithm": "gbt",
+  "parameters": {
+    "max_iter": 120,
+    "max_leaf_nodes": 31,
+    "learning_rate": 0.08,
+    "l2_regularization": 0.001,
+    "max_train_origins": 300,
+    "max_validation_origins": 80,
+    "random_state": 42
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "created_at": "2026-11-03T18:17:20Z"
+}

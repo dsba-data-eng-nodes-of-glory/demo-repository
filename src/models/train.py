@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ import yaml
 
 from src.ingestion.file_loader import load_station_csv
 from src.features.feature_schema import HISTORY_FEATURES, FUTURE_FEATURES
+from src.models.forecast_contract import station_forecast_contract
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -140,27 +142,60 @@ def sample_indices(indices: np.ndarray, maximum: int) -> np.ndarray:
 
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
-             demand_mean: float, demand_std: float, criterion: nn.Module) -> tuple[float, float]:
+             demand_mean: float, demand_std: float, criterion: nn.Module) -> tuple[float, float, float, float, float, list[dict[str, float]]]:
+    """Evaluate on original MW scale while retaining scaled RMSE for compatibility."""
     model.eval()
-    losses: list[float] = []
-    absolute_errors: list[float] = []
-    squared_errors: list[float] = []
+    scaled_errors: list[np.ndarray] = []
+    original_errors: list[np.ndarray] = []
+    actual_values: list[np.ndarray] = []
+    scaled_error_matrices: list[np.ndarray] = []
+    actual_matrices: list[np.ndarray] = []
     with torch.inference_mode():
         for x_hist, x_future, y in loader:
             x_hist, x_future, y = x_hist.to(device), x_future.to(device), y.to(device)
             pred = model(x_hist, x_future)
-            losses.append(float(criterion(pred, y).item()))
-            error = (pred - y).detach().cpu().numpy().reshape(-1)
-            original_error = error * demand_std
-            absolute_errors.extend(np.abs(original_error).tolist())
-            squared_errors.extend(np.square(original_error).tolist())
-    if not losses:
-        return float("nan"), float("nan")
-    return float(math.sqrt(float(np.mean(losses)))), float(np.mean(absolute_errors))
+            pred_np = pred.detach().cpu().numpy().reshape(-1)
+            actual_scaled = y.detach().cpu().numpy().reshape(-1)
+            batch_scaled_error = pred_np - actual_scaled
+            scaled_errors.append(batch_scaled_error.reshape(-1))
+            scaled_error_matrices.append((pred.detach().cpu().numpy() - y.detach().cpu().numpy()))
+            pred_original = pred_np * demand_std + demand_mean
+            actual_original = actual_scaled * demand_std + demand_mean
+            original_errors.append(pred_original - actual_original)
+            actual_values.append(actual_original)
+            actual_matrices.append(y.detach().cpu().numpy() * demand_std + demand_mean)
+    if not scaled_errors:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), []
+    scaled_error = np.concatenate(scaled_errors)
+    error = np.concatenate(original_errors)
+    actual = np.concatenate(actual_values)
+    denominator = float(np.sum(np.abs(actual)))
+    error_matrix = np.concatenate(scaled_error_matrices, axis=0) * demand_std
+    actual_matrix = np.concatenate(actual_matrices, axis=0)
+    horizon_metrics: list[dict[str, float]] = []
+    for step in range(error_matrix.shape[1]):
+        step_error = error_matrix[:, step]
+        step_actual = actual_matrix[:, step]
+        step_denominator = float(np.sum(np.abs(step_actual)))
+        horizon_metrics.append({
+            "horizon_step": float(step + 1),
+            "mae_mw": float(np.mean(np.abs(step_error))),
+            "rmse_mw": float(np.sqrt(np.mean(np.square(step_error)))),
+            "wape_pct": float(np.sum(np.abs(step_error)) / step_denominator * 100.0) if step_denominator else float("nan"),
+            "bias_mw": float(np.mean(step_error)),
+        })
+    return (
+        float(np.sqrt(np.mean(np.square(scaled_error)))),
+        float(np.mean(np.abs(error))),
+        float(np.sqrt(np.mean(np.square(error)))),
+        float(np.sum(np.abs(error)) / denominator * 100.0) if denominator else float("nan"),
+        float(np.mean(error)),
+        horizon_metrics,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a station-specific 24-hour LSTM model.")
+    parser = argparse.ArgumentParser(description="Train a station-specific LSTM model using its configured sampling interval.")
     parser.add_argument("--station", required=True)
     parser.add_argument("--csv", default=None, help="Training CSV; defaults to station training_file/input_file")
     parser.add_argument("--output", default=None, help="Checkpoint output override")
@@ -196,9 +231,10 @@ def main() -> None:
         checkpoint_path = ROOT / checkpoint_path
     checkpoint_path = checkpoint_path.resolve()
 
-    history_steps = int(model_cfg.get("history_steps", 672))
-    horizon_steps = int(model_cfg.get("horizon_steps", 96))
-    interval_minutes = int(model_cfg.get("interval_minutes", 15))
+    contract = station_forecast_contract(station, model_cfg)
+    history_steps = int(contract["history_steps"])
+    horizon_steps = int(contract["horizon_steps"])
+    interval_minutes = int(contract["interval_minutes"])
     hidden_size = int(args.hidden_size or model_cfg.get("hidden_size", 32))
     torch_threads = int(model_cfg.get("torch_num_threads", 2))
     torch.set_num_threads(max(1, torch_threads))
@@ -257,6 +293,10 @@ def main() -> None:
 
     best_val_rmse = float("inf")
     best_val_mae_original = float("nan")
+    best_val_rmse_original = float("nan")
+    best_val_wape_pct = float("nan")
+    best_val_bias_mw = float("nan")
+    best_horizon_metrics: list[dict[str, float]] = []
     best_state: dict[str, torch.Tensor] | None = None
     best_epoch = 0
     epochs_without_improvement = 0
@@ -267,6 +307,7 @@ def main() -> None:
     print(f"History={history_steps} | horizon={horizon_steps} | interval={interval_minutes} min | "
           f"features={len(HISTORY_FEATURES)}/{len(FUTURE_FEATURES)} | hidden={hidden_size}", flush=True)
 
+    training_started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
         model.train()
         batch_losses: list[float] = []
@@ -280,7 +321,7 @@ def main() -> None:
             optimizer.step()
             batch_losses.append(float(loss.item()))
 
-        val_rmse_scaled, val_mae_original = evaluate(
+        val_rmse_scaled, val_mae_original, val_rmse_original, val_wape_pct, val_bias_mw, val_horizon_metrics = evaluate(
             model, val_loader, device, demand_mean, demand_std, criterion
         )
         train_rmse_scaled = float(math.sqrt(float(np.mean(batch_losses)))) if batch_losses else float("nan")
@@ -289,6 +330,8 @@ def main() -> None:
             "train_rmse_scaled": train_rmse_scaled,
             "validation_rmse_scaled": val_rmse_scaled,
             "validation_mae_original": val_mae_original,
+            "validation_rmse_original": val_rmse_original,
+            "validation_wape_pct": val_wape_pct,
         })
         print(f"Epoch {epoch}/{args.epochs} | train RMSE scaled={train_rmse_scaled:.5f} | "
               f"validation RMSE scaled={val_rmse_scaled:.5f} | "
@@ -297,6 +340,10 @@ def main() -> None:
         if np.isfinite(val_rmse_scaled) and val_rmse_scaled < best_val_rmse:
             best_val_rmse = val_rmse_scaled
             best_val_mae_original = val_mae_original
+            best_val_rmse_original = val_rmse_original
+            best_val_wape_pct = val_wape_pct
+            best_val_bias_mw = val_bias_mw
+            best_horizon_metrics = val_horizon_metrics
             best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
@@ -309,13 +356,17 @@ def main() -> None:
     if best_state is None:
         raise RuntimeError("Training did not produce a finite validation metric; checkpoint not saved.")
 
+    training_duration_seconds = time.perf_counter() - training_started
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
+        "algorithm": "lstm",
         "model_state_dict": best_state,
         "region_name": args.station,
         "history": history_steps,
         "horizon": horizon_steps,
         "interval_minutes": interval_minutes,
+        "history_window_hours": contract["history_window_hours"],
+        "forecast_horizon_hours": contract["forecast_horizon_hours"],
         "hidden_size": hidden_size,
         "history_features": list(HISTORY_FEATURES),
         "future_features": list(FUTURE_FEATURES),
@@ -330,6 +381,8 @@ def main() -> None:
         "weather_mode": "last_observed_temperature_persistence",
         "best_validation_rmse_scaled": best_val_rmse,
         "best_validation_mae_original": best_val_mae_original,
+        "best_validation_rmse_original": best_val_rmse_original,
+        "best_validation_wape_pct": best_val_wape_pct,
         "best_epoch": best_epoch,
         "training_rows": n_rows,
         "training_windows": len(train_ds),
@@ -346,6 +399,8 @@ def main() -> None:
         "history": history_steps,
         "horizon": horizon_steps,
         "interval_minutes": interval_minutes,
+        "history_window_hours": contract["history_window_hours"],
+        "forecast_horizon_hours": contract["forecast_horizon_hours"],
         "hidden_size": hidden_size,
         "history_features": list(HISTORY_FEATURES),
         "future_features": list(FUTURE_FEATURES),
@@ -353,11 +408,27 @@ def main() -> None:
         "weather_mode": checkpoint["weather_mode"],
         "best_validation_rmse_scaled": best_val_rmse,
         "best_validation_mae_original": best_val_mae_original,
+        "best_validation_rmse_original": best_val_rmse_original,
+        "best_validation_wape_pct": best_val_wape_pct,
         "best_epoch": best_epoch,
         "training_csv": str(csv_path),
         "rows": n_rows,
         "training_windows": len(train_ds),
         "validation_windows": len(val_ds),
+        "training_duration_seconds": float(training_duration_seconds),
+        "validation_metrics": {
+            "mae_mw": best_val_mae_original,
+            "rmse_mw": best_val_rmse_original,
+            "wape_pct": best_val_wape_pct,
+            "bias_mw": best_val_bias_mw,
+            "matched_observations": int(len(val_ds) * horizon_steps),
+        },
+        "horizon_metrics": best_horizon_metrics,
+        "validation_start_utc": pd.Timestamp(timestamps[split_row]).isoformat(),
+        "validation_end_utc": pd.Timestamp(timestamps[-1]).isoformat(),
+        "training_start_utc": pd.Timestamp(timestamps[0]).isoformat(),
+        "training_end_utc": pd.Timestamp(timestamps[split_row - 1]).isoformat(),
+        "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
         "training_history": history_log,
         "note": "Future temperature uses last-observed persistence in both training and inference.",
     }

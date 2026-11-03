@@ -1,0 +1,18 @@
+{
+  "experiment_id": "tennet-random_forest-20261103-215720-62bc98",
+  "station": "tennet",
+  "algorithm": "random_forest",
+  "parameters": {
+    "n_estimators": 100,
+    "max_depth": 16,
+    "min_samples_leaf": 2,
+    "max_train_origins": 300,
+    "max_validation_origins": 80,
+    "random_state": 42,
+    "n_jobs": 1
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "created_at": "2026-11-03T16:27:20Z"
+}

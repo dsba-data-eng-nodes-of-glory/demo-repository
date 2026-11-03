@@ -31,7 +31,12 @@ def start(request: StationRequest | None = None):
 @router.post("/stop")
 def stop(request: StationRequest | None = None):
     try:
-        return manager.stop_pipeline(request.station if request else None)
+        if request and request.station:
+            # Keep the legacy pipeline endpoint consistent with Home: a
+            # station-scoped stop also performs the station reset.
+            from backend.station_api import stop_station
+            return stop_station(request.station)
+        return manager.stop_pipeline(None)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

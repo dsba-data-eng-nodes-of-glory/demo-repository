@@ -1,4 +1,4 @@
-active_station: tennet
+active_station: null
 stations:
   amprion:
     display_name: Amprion
@@ -12,28 +12,9 @@ stations:
     model_metadata: models/amprion_seq2seq_10Y/metadata.json
     model_version: existing
     stream_delay_seconds: 1.5
-  50hertz:
-    display_name: 50Hertz
-    enabled: false
-    status: stopped
-    training_file: data/raw/stations/50hertz/50hertz_training.csv
-    history_file: data/raw/stations/50hertz/50hertz_history.csv
-    input_file: data/raw/stations/50hertz/50hertz_stream.csv
-    raw_topic: 50hertz-raw
-    featured_topic: 50hertz-featured
-    model_checkpoint: models/50hertz/v1/50hertz_encoder_decoder_lstm.pt
-    model_metadata: models/50hertz/v1/metadata.json
-    model_version: v1
-    stream_delay_seconds: 1.5
-    interval_minutes: 15
-    history_steps: 672
-    horizon_steps: 96
-    registered_source_file: 50hertz_hist.csv
-    registered_rows: 70176
-    training_rows: 56140
-    stream_rows: 14036
-    stream_start_utc: '2025-08-07T19:00:00+00:00'
-    stream_end_utc: '2025-12-31T23:45:00+00:00'
+    actuals_file: data/processed/stations/amprion/actuals.csv
+    forecasts_file: data/processed/stations/amprion/forecasts.csv
+    topics_ready: true
   tennet:
     display_name: tennet
     enabled: false
@@ -56,3 +37,104 @@ stations:
     stream_rows: 19642
     stream_start_utc: '2026-03-29T09:30:00+00:00'
     stream_end_utc: '2026-10-19T23:45:00+00:00'
+    active_model:
+      experiment_id: tennet-gbt-20261103-220047-34bdbf
+      algorithm: gbt
+      version: v1
+      artifact_path: models/tennet/experiments/tennet-gbt-20261103-220047-34bdbf/model.joblib
+      metadata_path: models/tennet/experiments/tennet-gbt-20261103-220047-34bdbf/metadata.json
+      feature_schema: electricity_tabular_v1
+      deployed_at: '2026-11-03T18:28:11.122146+00:00'
+    model_algorithm: gbt
+    actuals_file: data/processed/stations/tennet/actuals.csv
+    forecasts_file: data/processed/stations/tennet/forecasts.csv
+    topics_ready: true
+  transnet:
+    display_name: Transnet
+    enabled: false
+    status: stopped
+    training_file: data/raw/stations/transnet/transnet_training.csv
+    history_file: data/raw/stations/transnet/transnet_history.csv
+    input_file: data/raw/stations/transnet/transnet_stream.csv
+    raw_topic: transnet-raw
+    featured_topic: transnet-featured
+    actuals_file: data/processed/stations/transnet/actuals.csv
+    forecasts_file: data/processed/stations/transnet/forecasts.csv
+    timestamp_column: utc_timestamp
+    demand_column: demand
+    temperature_column: temperature
+    timestamp_format: auto
+    timestamp_format_used: auto
+    source_timezone_assumption: UTC for naive timestamps; timezone-aware values converted
+      to UTC
+    model_checkpoint: models/transnet/v1/transnet_encoder_decoder_lstm.pt
+    model_metadata: models/transnet/v1/metadata.json
+    model_version: v1
+    stream_delay_seconds: 0.3
+    interval_minutes: 15
+    history_window_hours: 168.0
+    forecast_horizon_hours: 24.0
+    history_steps: 672
+    horizon_steps: 96
+    registered_source_file: transnet_hist.csv
+    registered_rows: 98208
+    training_rows: 78566
+    stream_rows: 19642
+    stream_start_utc: '2026-03-29T09:30:00+00:00'
+    stream_end_utc: '2026-10-19T23:45:00+00:00'
+    topics_ready: true
+    topic_setup_message: 'Could not create Kafka topic ''topics'': ''list'' object
+      has no attribute ''get'''
+    active_model:
+      experiment_id: transnet-gbt-20261103-234720-3b818d
+      algorithm: gbt
+      version: v1
+      artifact_path: models/transnet/experiments/transnet-gbt-20261103-234720-3b818d/model.joblib
+      metadata_path: models/transnet/experiments/transnet-gbt-20261103-234720-3b818d/metadata.json
+      feature_schema: electricity_tabular_v1
+      deployed_at: '2026-11-03T18:22:57.814141+00:00'
+    model_algorithm: gbt
+  50hertz:
+    display_name: 50Hertz
+    enabled: false
+    status: stopped
+    training_file: data/raw/stations/50hertz/50hertz_training.csv
+    history_file: data/raw/stations/50hertz/50hertz_history.csv
+    input_file: data/raw/stations/50hertz/50hertz_stream.csv
+    raw_topic: 50hertz-raw
+    featured_topic: 50hertz-featured
+    actuals_file: data/processed/stations/50hertz/actuals.csv
+    forecasts_file: data/processed/stations/50hertz/forecasts.csv
+    timestamp_column: utc_timestamp
+    demand_column: demand
+    temperature_column: temperature
+    timestamp_format: auto
+    timestamp_format_used: auto
+    source_timezone_assumption: UTC for naive timestamps; timezone-aware values converted
+      to UTC
+    model_checkpoint: models/50hertz/v1/50hertz_encoder_decoder_lstm.pt
+    model_metadata: models/50hertz/v1/metadata.json
+    model_version: v1
+    stream_delay_seconds: 0.3
+    interval_minutes: 15
+    history_window_hours: 168.0
+    forecast_horizon_hours: 24.0
+    history_steps: 672
+    horizon_steps: 96
+    registered_source_file: 50hertz_hist.csv
+    registered_rows: 70176
+    training_rows: 56140
+    stream_rows: 14036
+    stream_start_utc: '2025-08-07T19:00:00+00:00'
+    stream_end_utc: '2025-12-31T23:45:00+00:00'
+    topics_ready: true
+    active_model:
+      experiment_id: 50hertz-xgboost-20261104-001243-b5e160
+      algorithm: xgboost
+      version: v1
+      artifact_path: models/50hertz/experiments/50hertz-xgboost-20261104-001243-b5e160/model.joblib
+      metadata_path: models/50hertz/experiments/50hertz-xgboost-20261104-001243-b5e160/metadata.json
+      feature_schema: electricity_tabular_v1
+      deployed_at: '2026-11-03T18:49:33.043363+00:00'
+    model_algorithm: xgboost
+active_stations: []

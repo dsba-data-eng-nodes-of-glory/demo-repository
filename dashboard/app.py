@@ -129,45 +129,88 @@ if not backend_ok:
     st.error(f"FastAPI is not reachable at {api}. Start the backend to load live platform information.\n\n{backend_error}")
 
 # ---------------------------------------------------------------------
-# Registered station inventory and dashboard selection
+# Registered station cards and independent lifecycle controls
 # ---------------------------------------------------------------------
-section_title("Registered stations", "Every station saved in the central registry appears here, whether its pipeline is running or stopped.")
+section_title(
+    "Registered stations",
+    "Each registered station has independent activation, stop/reset and monitoring controls. Kafka topics are created automatically during registration and retried during activation. Multiple stations can run simultaneously.",
+)
 if backend_ok and station_ids:
-    inventory_rows = []
-    for station_id in station_ids:
+    card_columns = st.columns(2, gap="large")
+    for index, station_id in enumerate(station_ids):
         entry = stations.get(station_id, {})
         status = station_statuses.get(station_id, {})
-        model = model_statuses.get(station_id, {})
         services = status.get("services", {})
-        running = [name for name, info in services.items() if info.get("running")]
-        inventory_rows.append({
-            "Station": entry.get("display_name", station_id),
-            "Station ID": station_id,
-            "Status": str(status.get("lifecycle_status", entry.get("status", "registered"))).replace("_", " ").title(),
-            "Model": "Ready" if model.get("checkpoint_exists") else "Not trained",
-            "Running services": ", ".join(running) if running else "—",
-            "Dashboard selection": "Selected" if station_id == active_station else "—",
-        })
-    st.dataframe(pd.DataFrame(inventory_rows), hide_index=True, use_container_width=True)
-
-    selected_idx = station_ids.index(active_station) if active_station in station_ids else 0
-    select_col, button_col = st.columns([3, 1], vertical_alignment="bottom")
-    with select_col:
-        dashboard_station = st.selectbox(
-            "Station to display in the forecast preview",
-            station_ids,
-            index=selected_idx,
-            format_func=lambda key: f"{stations[key].get('display_name', key)} ({key})",
-            key="home_dashboard_station_selector",
+        is_active = status.get("lifecycle_status") == "active" or any(
+            services.get(name, {}).get("running", False)
+            for name in ("spark", "predictor", "producer")
         )
-    with button_col:
-        if st.button("Use on dashboard", key="home_select_dashboard_station", use_container_width=True):
-            try:
-                selected_result = api_post(f"/stations/{dashboard_station}/select")
-                st.success(f"Dashboard selection saved: {selected_result.get('display_name', dashboard_station)}")
-                st.rerun()
-            except requests.RequestException as exc:
-                st.error(f"Could not save dashboard station selection: {exc}")
+        model_ready = bool(model_statuses.get(station_id, {}).get("checkpoint_exists"))
+        topics_ready = bool(entry.get("topics_ready"))
+        with card_columns[index % 2]:
+            with st.container(border=True):
+                display_name = html.escape(str(entry.get("display_name", station_id)))
+                training_running = bool(services.get("training", {}).get("running"))
+                if is_active:
+                    state_color, state_label = "#22c55e", "ACTIVE"
+                elif training_running:
+                    state_color, state_label = "#fbbf24", "TRAINING"
+                else:
+                    state_color, state_label = "#f87171", "STOPPED"
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:10px;margin:0 0 4px 0;">'
+                    f'<h3 style="margin:0;color:{state_color};font-weight:750;">{display_name}</h3>'
+                    f'<span style="font-size:10px;font-weight:700;letter-spacing:.08em;'
+                    f'color:{state_color};border:1px solid {state_color}66;'
+                    f'background:{state_color}18;border-radius:999px;padding:3px 8px;">{state_label}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"Station ID: `{station_id}`")
+                m1, m2, m3 = st.columns(3)
+                m1.markdown(
+                    f'<div style="border:1px solid {state_color}55;background:{state_color}12;'
+                    f'border-radius:12px;padding:10px 12px;min-height:86px;">'
+                    f'<div style="font-size:13px;color:#9db3cd;">State</div>'
+                    f'<div style="font-size:21px;line-height:1.35;font-weight:700;color:{state_color};">'
+                    f'{state_label.title()}</div></div>',
+                    unsafe_allow_html=True,
+                )
+                m2.metric("Model", "Ready" if model_ready else "Not trained")
+                m3.metric("Kafka topics", "Ready" if topics_ready else "Check")
+                st.caption(
+                    f"Raw: `{entry.get('raw_topic', station_id + '-raw')}`  ·  "
+                    f"Featured: `{entry.get('featured_topic', station_id + '-featured')}`"
+                )
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=(is_active or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
+                        try:
+                            response = requests.post(f"{api}/stations/{station_id}/activate", timeout=120)
+                            response.raise_for_status()
+                            st.success("Station activated.")
+                            st.rerun()
+                        except requests.RequestException as exc:
+                            detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
+                            st.error(f"Activation failed: {detail}")
+                with b2:
+                    if st.button("Stop + reset", key=f"home_stop_{station_id}", disabled=not is_active, use_container_width=True, help="Stops this station and automatically clears its Kafka records, Spark checkpoint and station result files. Source CSVs and trained model are retained."):
+                        try:
+                            response = requests.post(f"{api}/stations/{station_id}/stop", timeout=300)
+                            response.raise_for_status()
+                            st.success("Station stopped and reset. Other active stations are unaffected.")
+                            st.rerun()
+                        except requests.RequestException as exc:
+                            detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
+                            st.error(f"Stop/reset failed: {detail}")
+                with b3:
+                    st.page_link(
+                        "pages/monitoring.py",
+                        label="Monitor",
+                        icon="📈",
+                        use_container_width=True,
+                        query_params={"station": station_id},
+                    )
 elif backend_ok:
     st.info("No stations are registered yet. Open Station Management to add your first station.")
 
@@ -176,10 +219,10 @@ elif backend_ok:
 # ---------------------------------------------------------------------
 section_title("Your workspace", "Each module is connected to the same station registry and backend API.")
 modules = [
-    ("◉", "Station Management", "Register stations, validate CSV data, prepare training and stream files, and control each station lifecycle.", "pages/station_management.py", "Open station management", "#168ee2"),
+    ("◉", "Station Management", "Register stations, configure timestamp handling, inspect station data and manage station deletion.", "pages/station_management.py", "Open station management", "#168ee2"),
     ("▱", "Model Management", "Review model readiness, training metrics, model versions and checkpoint metadata.", "pages/model_management.py", "Open model management", "#9a5cf1"),
     ("▷", "Pipeline Control", "Start and stop station services independently and inspect Kafka, Spark, predictor and producer status.", "pages/pipeline_control.py", "Open pipeline control", "#18b88b"),
-    ("⌁", "Live Monitoring", "Explore actual demand, the latest 24-hour LSTM forecast and forecast history for each station.", "pages/monitoring.py", "Open monitoring", "#e89a43"),
+    ("⌁", "Live Monitoring", "Explore actual demand, the latest forecast from the selected model and forecast history for each station.", "pages/monitoring.py", "Open monitoring", "#e89a43"),
 ]
 card_cols = st.columns(4, gap="medium")
 for col, (icon, title, description, page, link_label, accent) in zip(card_cols, modules):
@@ -197,7 +240,11 @@ for col, (icon, title, description, page, link_label, accent) in zip(card_cols, 
 section_title("Demand signal preview", "Shows saved actuals and the latest forecast run when those records are available.")
 if backend_ok and active_station:
     try:
-        actual_payload = api_get("/results/actuals", {"station": active_station, "limit": 96})
+        active_entry = stations.get(active_station, {})
+        active_horizon_steps = int(active_entry.get("horizon_steps", 96))
+        actual_payload = api_get(
+            "/results/actuals", {"station": active_station, "limit": active_horizon_steps}
+        )
         forecast_payload = api_get("/results/forecasts", {"station": active_station, "limit": 2000})
         actuals = pd.DataFrame(actual_payload.get("records", []))
         forecasts = pd.DataFrame(forecast_payload.get("records", []))

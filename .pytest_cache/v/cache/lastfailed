@@ -1,0 +1,5 @@
+{
+  "tests/test_dynamic_interval.py": true,
+  "tests/test_modelops.py": true,
+  "tests/test_station_timestamp_config.py": true
+}

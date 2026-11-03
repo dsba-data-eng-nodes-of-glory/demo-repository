@@ -1,8 +1,8 @@
 """Chunked replay of a station CSV into its configured raw Kafka topic.
 
-Expected Amprion files:
-  data/raw/amprion_history.csv : initial 672 observations
-  data/raw/amprion.csv         : observations immediately after history
+Expected station files:
+  configured history_file : initial history window (step count derived from interval)
+  configured input_file   : observations immediately after the history window
 
 The stream file is read in chunks so startup does not require loading and
 sorting the entire file into memory before the first Kafka message is sent.
@@ -138,9 +138,9 @@ def main() -> None:
 
     topic = args.topic or station["raw_topic"]
     bootstrap = args.bootstrap or kafka_config["bootstrap_servers"]
-    interval_minutes = int(model_config.get("interval_minutes", 15))
+    interval_minutes = int(station.get("interval_minutes", model_config.get("interval_minutes", 15)))
     if interval_minutes <= 0:
-        raise ValueError("interval_minutes in config/model.yaml must be positive.")
+        raise ValueError(f"interval_minutes for station '{args.station}' must be positive.")
 
     if not csv_path.exists():
         raise FileNotFoundError(f"Streaming CSV not found: {csv_path}")

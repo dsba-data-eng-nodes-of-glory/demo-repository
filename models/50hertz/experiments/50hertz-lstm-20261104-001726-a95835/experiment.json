@@ -1,0 +1,18 @@
+{
+  "experiment_id": "50hertz-lstm-20261104-001726-a95835",
+  "station": "50hertz",
+  "algorithm": "lstm",
+  "parameters": {
+    "epochs": 8,
+    "batch_size": 10,
+    "hidden_size": 64,
+    "learning_rate": 0.001,
+    "max_train_windows": 400,
+    "max_validation_windows": 80,
+    "patience": 4
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "created_at": "2026-11-03T18:47:26Z"
+}

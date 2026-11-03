@@ -19,6 +19,9 @@ FORECAST_FIELDS = [
     "horizon_step",
     "predicted_demand",
     "model_file",
+    "model_version",
+    "algorithm",
+    "experiment_id",
     "weather_mode",
 ]
 
@@ -44,6 +47,25 @@ def _append_rows(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     needs_header = not path.exists() or path.stat().st_size == 0
+    if not needs_header and fields == FORECAST_FIELDS:
+        # Stream the schema upgrade row by row so a large forecast history is
+        # not copied into RAM when model-lineage columns are introduced.
+        temp_path = path.with_suffix(path.suffix + ".schema.tmp")
+        migrated = False
+        with path.open("r", newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            old_fields = list(reader.fieldnames or [])
+            if not set(fields).issubset(old_fields):
+                migrated = True
+                with temp_path.open("w", newline="", encoding="utf-8") as target:
+                    writer = csv.DictWriter(target, fieldnames=fields, extrasaction="ignore")
+                    writer.writeheader()
+                    for old_row in reader:
+                        writer.writerow(old_row)
+        if migrated:
+            temp_path.replace(path)
+        else:
+            temp_path.unlink(missing_ok=True)
 
     with path.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(

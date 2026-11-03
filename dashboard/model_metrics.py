@@ -87,8 +87,9 @@ def build_evaluation_frame(
         "run_origin_utc", "forecast_timestamp_utc", "forecast_issued_at_utc",
         "horizon_step", "predicted_demand",
     ]
-    if "model_file" in f.columns:
-        columns.append("model_file")
+    for lineage_column in ("model_file", "model_version", "algorithm", "experiment_id"):
+        if lineage_column in f.columns:
+            columns.append(lineage_column)
     f = f[columns].copy()
 
     evaluated = f.merge(
@@ -108,8 +109,9 @@ def build_evaluation_frame(
     # Avoid duplicate forecast records within a run if an output file was
     # appended twice. Keep the last saved copy for each origin/target/model.
     dedupe_keys = ["run_origin_utc", "forecast_timestamp_utc", "horizon_step"]
-    if "model_file" in evaluated.columns:
-        dedupe_keys.append("model_file")
+    for lineage_column in ("model_file", "model_version", "algorithm", "experiment_id"):
+        if lineage_column in evaluated.columns:
+            dedupe_keys.append(lineage_column)
     evaluated = evaluated.drop_duplicates(dedupe_keys, keep="last")
     return evaluated.sort_values(
         ["actual_timestamp_utc", "run_origin_utc", "horizon_step"]
@@ -155,8 +157,9 @@ def metrics_by_run(evaluated: pd.DataFrame, horizon_steps: int) -> pd.DataFrame:
     if evaluated.empty:
         return pd.DataFrame()
     keys = ["run_origin_utc"]
-    if "model_file" in evaluated.columns:
-        keys.append("model_file")
+    for lineage_column in ("model_file", "model_version", "algorithm", "experiment_id"):
+        if lineage_column in evaluated.columns:
+            keys.append(lineage_column)
     rows: list[dict] = []
     for key, group in evaluated.groupby(keys, dropna=False, sort=True):
         if not isinstance(key, tuple):
