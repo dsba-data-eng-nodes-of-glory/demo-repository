@@ -47,7 +47,7 @@ from torch import nn
 
 from src.ingestion.file_loader import load_station_csv
 from src.storage.forecast_store import append_actuals, append_forecasts
-from src.models.tabular_forecasting import build_origin_features
+from src.models.tabular_forecasting import LEGACY_FEATURE_SCHEMA, build_origin_features
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -363,7 +363,10 @@ def generate_forecast(
 
     if algorithm in {"random_forest", "gbt", "xgboost"}:
         history_frame = pd.DataFrame(rows[-history_steps:])
-        features = build_origin_features(history_frame, future_ts, interval_minutes)
+        features = build_origin_features(
+            history_frame, future_ts, interval_minutes,
+            feature_schema=checkpoint.get("feature_schema", LEGACY_FEATURE_SCHEMA),
+        )
         feature_names = checkpoint.get("feature_names", list(features.columns))
         missing = set(feature_names) - set(features.columns)
         if missing:

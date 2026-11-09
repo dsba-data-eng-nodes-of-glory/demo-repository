@@ -12,7 +12,42 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-FEATURE_SCHEMA = "electricity_tabular_v1"
+LEGACY_FEATURE_SCHEMA = "electricity_tabular_v1"
+FEATURE_SCHEMA = "electricity_tabular_v2"
+TARGET_DAY_FEATURE = "demand_target_previous_day"
+TARGET_WEEK_FEATURE = "demand_target_previous_week"
+
+
+def target_demand_references(
+    history: pd.DataFrame, future_timestamps: pd.DatetimeIndex,
+) -> dict[str, np.ndarray]:
+    """Match each target to demand 24h/168h earlier using observed history only.
+
+    These are fixed durations in UTC, not civil-clock matches across daylight
+    saving transitions. Missing references are rejected rather than filled
+    with future actuals or silently shifted to another timestamp.
+    """
+    timestamps = pd.DatetimeIndex(pd.to_datetime(history["utc_timestamp"], utc=True))
+    targets = pd.DatetimeIndex(pd.to_datetime(future_timestamps, utc=True))
+    demand = pd.to_numeric(history["demand"], errors="coerce").to_numpy(dtype=float)
+    if timestamps.empty or timestamps.hasnans or not timestamps.is_unique:
+        raise ValueError("Seasonal references require nonempty, unique, valid history timestamps.")
+    if targets.empty or targets.hasnans or (targets <= timestamps.max()).any():
+        raise ValueError("Forecast targets must be valid timestamps after observed history.")
+    if not np.isfinite(demand).all():
+        raise ValueError("Seasonal references require finite historical demand.")
+    references = {}
+    for name, hours in ((TARGET_DAY_FEATURE, 24), (TARGET_WEEK_FEATURE, 168)):
+        reference_times = targets - pd.Timedelta(hours=hours)
+        positions = timestamps.get_indexer(reference_times)
+        if (positions < 0).any():
+            missing = reference_times[positions < 0][0]
+            raise ValueError(
+                f"{name} needs observed history at {missing}; the reference is unavailable. "
+                "Provide seven days of continuous history and a horizon of at most 24 hours."
+            )
+        references[name] = demand[positions]
+    return references
 
 
 def _steps_for_duration(duration_minutes: int, interval_minutes: int) -> int:
@@ -45,8 +80,12 @@ def build_origin_features(
     history: pd.DataFrame,
     future_timestamps: pd.DatetimeIndex,
     interval_minutes: int = 15,
+    *,
+    feature_schema: str = FEATURE_SCHEMA,
 ) -> pd.DataFrame:
     """Return one feature row for each future timestamp at this forecast origin."""
+    if feature_schema not in {FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA}:
+        raise ValueError(f"Unsupported tabular feature schema: {feature_schema}")
     required = {"utc_timestamp", "demand", "temperature"}
     missing = required - set(history.columns)
     if missing:
@@ -112,6 +151,10 @@ def build_origin_features(
     future_timestamps = pd.DatetimeIndex(pd.to_datetime(future_timestamps, utc=True))
     if len(future_timestamps) == 0:
         raise ValueError("No future timestamps supplied.")
+    references = (
+        target_demand_references(history, future_timestamps)
+        if feature_schema == FEATURE_SCHEMA else {}
+    )
 
     # No future weather feed exists in this POC; use last-observed persistence
     # consistently in both training and serving.
@@ -153,6 +196,8 @@ def build_origin_features(
             "target_year_cos": float(np.cos(year_angle)),
             "target_is_weekend": float(weekday >= 5),
         })
+        for name, values in references.items():
+            row[name] = float(values[index - 1])
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -163,6 +208,8 @@ def build_training_examples(
     history_steps: int,
     horizon_steps: int,
     interval_minutes: int,
+    *,
+    feature_schema: str = FEATURE_SCHEMA,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """Build sampled long-format supervised examples for selected forecast origins."""
     feature_frames: list[pd.DataFrame] = []
@@ -175,7 +222,9 @@ def build_training_examples(
         future_ts = timestamps[origin:origin + horizon_steps]
         if len(future_ts) != horizon_steps:
             continue
-        feature_frames.append(build_origin_features(history, future_ts, interval_minutes))
+        feature_frames.append(build_origin_features(
+            history, future_ts, interval_minutes, feature_schema=feature_schema
+        ))
         targets.append(demand[origin:origin + horizon_steps])
         origin_ids.append(np.full(horizon_steps, origin, dtype=np.int64))
     if not feature_frames:
