@@ -22,6 +22,7 @@ from src.models.model_registry import next_version, upsert_experiment, utc_now
 from src.models.forecast_contract import station_forecast_contract
 from src.models.tabular_forecasting import (
     FEATURE_SCHEMA,
+    LEGACY_FEATURE_SCHEMA,
     build_training_examples,
     json_safe_parameters,
 )
@@ -88,6 +89,9 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     overall_started = time.perf_counter()
     station = str(config["station"])
     algorithm = str(config["algorithm"])
+    # The target-matched demand inputs are a Random Forest improvement.
+    # Other algorithms retain their existing training feature contract.
+    feature_schema = FEATURE_SCHEMA if algorithm == "random_forest" else LEGACY_FEATURE_SCHEMA
     experiment_id = str(config["experiment_id"])
     parameters = json_safe_parameters(dict(config.get("parameters") or {}))
     training_options = dict(config.get("training_options") or {})
@@ -133,10 +137,12 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Not enough train/validation forecast origins after sampling.")
 
     x_train, y_train, train_origin_ids = build_training_examples(
-        frame, train_origins, history_steps, horizon_steps, interval_minutes
+        frame, train_origins, history_steps, horizon_steps, interval_minutes,
+        feature_schema=feature_schema,
     )
     x_valid, y_valid, valid_origin_ids = build_training_examples(
-        frame, validation_origins, history_steps, horizon_steps, interval_minutes
+        frame, validation_origins, history_steps, horizon_steps, interval_minutes,
+        feature_schema=feature_schema,
     )
     feature_names = list(x_train.columns)
     x_valid = x_valid.reindex(columns=feature_names)
@@ -183,7 +189,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "version": version,
         "artifact_path": artifact_path.relative_to(ROOT).as_posix(),
         "metadata_path": metadata_path.relative_to(ROOT).as_posix(),
-        "feature_schema": FEATURE_SCHEMA,
+        "feature_schema": feature_schema,
         "feature_names": feature_names,
         "history_steps": history_steps,
         "horizon_steps": horizon_steps,
@@ -224,7 +230,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "status": "candidate",
         "artifact_path": metadata["artifact_path"],
         "metadata_path": metadata["metadata_path"],
-        "feature_schema": FEATURE_SCHEMA,
+        "feature_schema": feature_schema,
         "history_steps": history_steps,
         "horizon_steps": horizon_steps,
         "interval_minutes": interval_minutes,

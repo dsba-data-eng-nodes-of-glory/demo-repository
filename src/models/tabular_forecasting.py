@@ -81,7 +81,7 @@ def build_origin_features(
     future_timestamps: pd.DatetimeIndex,
     interval_minutes: int = 15,
     *,
-    feature_schema: str = FEATURE_SCHEMA,
+    feature_schema: str = LEGACY_FEATURE_SCHEMA,
 ) -> pd.DataFrame:
     """Return one feature row for each future timestamp at this forecast origin."""
     if feature_schema not in {FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA}:
@@ -209,7 +209,7 @@ def build_training_examples(
     horizon_steps: int,
     interval_minutes: int,
     *,
-    feature_schema: str = FEATURE_SCHEMA,
+    feature_schema: str = LEGACY_FEATURE_SCHEMA,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """Build sampled long-format supervised examples for selected forecast origins."""
     feature_frames: list[pd.DataFrame] = []

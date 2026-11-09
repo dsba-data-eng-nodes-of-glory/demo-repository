@@ -28,7 +28,7 @@ def history_and_targets(interval=15):
 @pytest.mark.parametrize("interval", [15, 30, 60, 90, 120])
 def test_target_features_follow_each_target_timestamp(interval):
     history, targets = history_and_targets(interval)
-    features = build_origin_features(history, targets, interval)
+    features = build_origin_features(history, targets, interval, feature_schema=FEATURE_SCHEMA)
     steps = len(targets)
     np.testing.assert_array_equal(features[TARGET_DAY_FEATURE], history["demand"].iloc[-steps:])
     np.testing.assert_array_equal(features[TARGET_WEEK_FEATURE], history["demand"].iloc[:steps])
@@ -39,7 +39,7 @@ def test_references_reject_horizon_requiring_future_observations():
     history, targets = history_and_targets()
     extended = targets.append(pd.DatetimeIndex([targets[-1] + pd.Timedelta(minutes=15)]))
     with pytest.raises(ValueError, match="reference is unavailable"):
-        build_origin_features(history, extended)
+        build_origin_features(history, extended, feature_schema=FEATURE_SCHEMA)
 
 
 def test_references_do_not_substitute_nearby_timestamps():
@@ -51,7 +51,8 @@ def test_references_do_not_substitute_nearby_timestamps():
 def test_legacy_feature_schema_preserves_existing_model_inputs():
     history, targets = history_and_targets()
     legacy = build_origin_features(history, targets, feature_schema=LEGACY_FEATURE_SCHEMA)
-    updated = build_origin_features(history, targets)
+    updated = build_origin_features(history, targets, feature_schema=FEATURE_SCHEMA)
+    pd.testing.assert_frame_equal(legacy, build_origin_features(history, targets))
     assert TARGET_DAY_FEATURE not in legacy and TARGET_WEEK_FEATURE not in legacy
     pd.testing.assert_frame_equal(legacy, updated[legacy.columns])
     with pytest.raises(ValueError, match="Unsupported"):
@@ -64,8 +65,8 @@ def test_changing_future_labels_cannot_change_features():
     frame = pd.concat([history, future], ignore_index=True)
     changed = frame.copy()
     changed.loc[len(history):, ["demand", "temperature"]] = -123456.0
-    x, y, _ = build_training_examples(frame, np.array([len(history)]), len(history), len(targets), 15)
-    other_x, other_y, _ = build_training_examples(changed, np.array([len(history)]), len(history), len(targets), 15)
+    x, y, _ = build_training_examples(frame, np.array([len(history)]), len(history), len(targets), 15, feature_schema=FEATURE_SCHEMA)
+    other_x, other_y, _ = build_training_examples(changed, np.array([len(history)]), len(history), len(targets), 15, feature_schema=FEATURE_SCHEMA)
     pd.testing.assert_frame_equal(x, other_x)
     assert not np.array_equal(y, other_y)
 
