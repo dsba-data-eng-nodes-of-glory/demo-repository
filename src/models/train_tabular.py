@@ -21,7 +21,7 @@ from src.ingestion.file_loader import load_station_csv
 from src.models.model_registry import next_version, upsert_experiment, utc_now
 from src.models.forecast_contract import station_forecast_contract
 from src.models.tabular_forecasting import (
-    FEATURE_SCHEMA,
+    DAY_ONLY_FEATURE_SCHEMA,
     LEGACY_FEATURE_SCHEMA,
     build_training_examples,
     json_safe_parameters,
@@ -89,9 +89,9 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     overall_started = time.perf_counter()
     station = str(config["station"])
     algorithm = str(config["algorithm"])
-    # The target-matched demand inputs are a Random Forest improvement.
+    # Only the target-matched previous-day input is enabled for new RF models.
     # Other algorithms retain their existing training feature contract.
-    feature_schema = FEATURE_SCHEMA if algorithm == "random_forest" else LEGACY_FEATURE_SCHEMA
+    feature_schema = DAY_ONLY_FEATURE_SCHEMA if algorithm == "random_forest" else LEGACY_FEATURE_SCHEMA
     experiment_id = str(config["experiment_id"])
     parameters = json_safe_parameters(dict(config.get("parameters") or {}))
     training_options = dict(config.get("training_options") or {})

@@ -13,13 +13,15 @@ import numpy as np
 import pandas as pd
 
 LEGACY_FEATURE_SCHEMA = "electricity_tabular_v1"
-FEATURE_SCHEMA = "electricity_tabular_v2"
+FEATURE_SCHEMA = "electricity_tabular_v2"  # Existing day + week models.
+DAY_ONLY_FEATURE_SCHEMA = "electricity_tabular_v3"
 TARGET_DAY_FEATURE = "demand_target_previous_day"
 TARGET_WEEK_FEATURE = "demand_target_previous_week"
 
 
 def target_demand_references(
     history: pd.DataFrame, future_timestamps: pd.DatetimeIndex,
+    *, include_previous_week: bool = True,
 ) -> dict[str, np.ndarray]:
     """Match each target to demand 24h/168h earlier using observed history only.
 
@@ -37,7 +39,10 @@ def target_demand_references(
     if not np.isfinite(demand).all():
         raise ValueError("Seasonal references require finite historical demand.")
     references = {}
-    for name, hours in ((TARGET_DAY_FEATURE, 24), (TARGET_WEEK_FEATURE, 168)):
+    reference_specs = [(TARGET_DAY_FEATURE, 24)]
+    if include_previous_week:
+        reference_specs.append((TARGET_WEEK_FEATURE, 168))
+    for name, hours in reference_specs:
         reference_times = targets - pd.Timedelta(hours=hours)
         positions = timestamps.get_indexer(reference_times)
         if (positions < 0).any():
@@ -84,7 +89,7 @@ def build_origin_features(
     feature_schema: str = LEGACY_FEATURE_SCHEMA,
 ) -> pd.DataFrame:
     """Return one feature row for each future timestamp at this forecast origin."""
-    if feature_schema not in {FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA}:
+    if feature_schema not in {FEATURE_SCHEMA, DAY_ONLY_FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA}:
         raise ValueError(f"Unsupported tabular feature schema: {feature_schema}")
     required = {"utc_timestamp", "demand", "temperature"}
     missing = required - set(history.columns)
@@ -152,8 +157,11 @@ def build_origin_features(
     if len(future_timestamps) == 0:
         raise ValueError("No future timestamps supplied.")
     references = (
-        target_demand_references(history, future_timestamps)
-        if feature_schema == FEATURE_SCHEMA else {}
+        target_demand_references(
+            history, future_timestamps,
+            include_previous_week=feature_schema == FEATURE_SCHEMA,
+        )
+        if feature_schema in {FEATURE_SCHEMA, DAY_ONLY_FEATURE_SCHEMA} else {}
     )
 
     # No future weather feed exists in this POC; use last-observed persistence

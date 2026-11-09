@@ -6,7 +6,7 @@ import pytest
 from sklearn.ensemble import RandomForestRegressor
 
 from src.models.tabular_forecasting import (
-    FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA, TARGET_DAY_FEATURE, TARGET_WEEK_FEATURE,
+    DAY_ONLY_FEATURE_SCHEMA, FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA, TARGET_DAY_FEATURE, TARGET_WEEK_FEATURE,
     build_origin_features, build_training_examples, target_demand_references,
 )
 
@@ -59,19 +59,20 @@ def test_legacy_feature_schema_preserves_existing_model_inputs():
         build_origin_features(history, targets, feature_schema="unknown")
 
 
-def test_changing_future_labels_cannot_change_features():
+@pytest.mark.parametrize("schema", [FEATURE_SCHEMA, DAY_ONLY_FEATURE_SCHEMA])
+def test_changing_future_labels_cannot_change_features(schema):
     history, targets = history_and_targets()
     future = pd.DataFrame({"utc_timestamp": targets, "demand": 2000.0, "temperature": 99.0})
     frame = pd.concat([history, future], ignore_index=True)
     changed = frame.copy()
     changed.loc[len(history):, ["demand", "temperature"]] = -123456.0
-    x, y, _ = build_training_examples(frame, np.array([len(history)]), len(history), len(targets), 15, feature_schema=FEATURE_SCHEMA)
-    other_x, other_y, _ = build_training_examples(changed, np.array([len(history)]), len(history), len(targets), 15, feature_schema=FEATURE_SCHEMA)
+    x, y, _ = build_training_examples(frame, np.array([len(history)]), len(history), len(targets), 15, feature_schema=schema)
+    other_x, other_y, _ = build_training_examples(changed, np.array([len(history)]), len(history), len(targets), 15, feature_schema=schema)
     pd.testing.assert_frame_equal(x, other_x)
     assert not np.array_equal(y, other_y)
 
 
-@pytest.mark.parametrize("schema", [LEGACY_FEATURE_SCHEMA, FEATURE_SCHEMA])
+@pytest.mark.parametrize("schema", [LEGACY_FEATURE_SCHEMA, FEATURE_SCHEMA, DAY_ONLY_FEATURE_SCHEMA])
 def test_serving_uses_saved_schema_and_matches_training_predictions(schema):
     import torch
     from src.models.streaming_predictor import generate_forecast
@@ -90,3 +91,18 @@ def test_serving_uses_saved_schema_and_matches_training_predictions(schema):
         [row["predicted_demand"] for row in rows],
         model.predict(features.to_numpy(dtype=np.float32)),
     )
+
+
+@pytest.mark.parametrize("interval", [15, 30, 60, 90, 120])
+def test_day_only_schema_matches_tested_ablation_and_preserves_original_lags(interval):
+    history, targets = history_and_targets(interval)
+    both = build_origin_features(history, targets, interval, feature_schema=FEATURE_SCHEMA)
+    day_only = build_origin_features(history, targets, interval, feature_schema=DAY_ONLY_FEATURE_SCHEMA)
+    legacy = build_origin_features(history, targets, interval, feature_schema=LEGACY_FEATURE_SCHEMA)
+    pd.testing.assert_frame_equal(day_only, both.drop(columns=TARGET_WEEK_FEATURE))
+    pd.testing.assert_frame_equal(day_only[list(legacy)], legacy)
+    assert TARGET_DAY_FEATURE in day_only and TARGET_WEEK_FEATURE not in day_only
+    assert f"demand_lag_{10080 // interval}" in day_only
+    np.testing.assert_array_equal(day_only[TARGET_DAY_FEATURE], history["demand"].iloc[-len(targets):])
+    if interval == 15:
+        assert day_only.shape == (96, 37)

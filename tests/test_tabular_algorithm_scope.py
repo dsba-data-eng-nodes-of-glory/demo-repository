@@ -9,13 +9,13 @@ from sklearn.dummy import DummyRegressor
 
 from src.models import model_registry, train_tabular
 from src.models.tabular_forecasting import (
-    FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA, TARGET_DAY_FEATURE, TARGET_WEEK_FEATURE,
+    DAY_ONLY_FEATURE_SCHEMA, LEGACY_FEATURE_SCHEMA, TARGET_DAY_FEATURE, TARGET_WEEK_FEATURE,
     build_training_examples,
 )
 
 
 @pytest.mark.parametrize("algorithm,expected_schema,feature_count", [
-    ("random_forest", FEATURE_SCHEMA, 38),
+    ("random_forest", DAY_ONLY_FEATURE_SCHEMA, 37),
     ("gbt", LEGACY_FEATURE_SCHEMA, 36),
     ("xgboost", LEGACY_FEATURE_SCHEMA, 36),
 ])
@@ -64,7 +64,8 @@ def test_training_selects_new_features_only_for_random_forest(
         assert TARGET_WEEK_FEATURE not in metadata["feature_names"]
     else:
         assert TARGET_DAY_FEATURE in metadata["feature_names"]
-        assert TARGET_WEEK_FEATURE in metadata["feature_names"]
+        assert TARGET_WEEK_FEATURE not in metadata["feature_names"]
+        assert "demand_lag_672" in metadata["feature_names"]
     saved = json.loads((tmp_path / metadata["metadata_path"]).read_text())
     assert saved["feature_schema"] == expected_schema
     assert model_registry.get_experiment(experiment_id)["feature_schema"] == expected_schema
