@@ -1,0 +1,1402 @@
+--- a/dashboard/ui.py
++++ b/dashboard/ui.py
+@@ -154,6 +154,45 @@
+ .stApp [data-testid="stAlert"] div[data-testid="stMarkdownContainer"] { color:#eef6ff !important; }
+ .stApp [data-testid="stAlert"] svg { color:#f8cf77 !important; }
+ .stApp [data-testid="stSidebar"] [data-testid="stExpander"] summary {color:#f3f7ff !important;}
++
++/* Streamlit info/warning banners use the dark shell color scheme too. */
++.stApp [data-testid="stAlert"] {
++  background:rgba(18,47,80,.95) !important;
++  border:1px solid rgba(129,188,243,.35) !important;
++  padding:9px 12px !important;
++}
++.stApp [data-testid="stAlert"] p,
++.stApp [data-testid="stAlert"] span {color:#eaf4ff !important;}
++/* Smaller headings keep the working chart visible above the fold. */
++.stApp h1 {font-size:clamp(1.6rem,2.4vw,2.1rem) !important; line-height:1.2 !important;}
++.stApp h2 {font-size:1.26rem !important; margin-top:.65rem !important;}
++/* Compact operational layout: space goes to charts, not repeated state tiles. */
++.stApp [data-testid="stMetric"] {
++  min-height: 71px;
++  border-radius: 10px;
++  padding: 8px 12px !important;
++}
++.stApp [data-testid="stMetricLabel"] p {font-size:.75rem !important; line-height:1.18 !important;}
++.stApp [data-testid="stMetricValue"] {line-height:1.18 !important;}
++.stApp [data-testid="stMetricValue"] div {font-size:clamp(1.1rem,1.7vw,1.55rem) !important; line-height:1.22 !important;}
++.ef-status-strip {display:flex; flex-wrap:wrap; align-items:center; gap:7px 10px; margin:6px 0 12px;}
++.ef-status-chip {display:inline-flex; align-items:center; gap:6px; border:1px solid rgba(126,169,222,.26); background:rgba(12,33,57,.85); color:#e7f0fc; padding:5px 9px; border-radius:8px; font-size:.79rem; line-height:1.2;}
++.ef-status-chip .label {color:#b9cce4;}
++.ef-status-chip .value {font-weight:700; color:#edf6ff;}
++.ef-status-chip.good .value {color:#7ce0ba;}
++.ef-status-chip.bad .value {color:#ff9e9e;}
++.ef-status-chip.warn .value {color:#ffd08a;}
++.ef-status-chip .dot {font-size:.8rem;}
++.ef-section-help {cursor:help; font-size:.72rem; border:1px solid #577395; color:#b3cae7; border-radius:999px; padding:0 6px; vertical-align:middle; margin-left:6px; font-weight:500;}
++.ef-hero {padding:19px 22px 16px; border-radius:16px;}
++.ef-hero h1 {font-size:clamp(1.75rem,3vw,2.6rem); margin-bottom:8px;}
++.ef-hero p {font-size:.88rem; line-height:1.42;}
++.ef-eyebrow {margin-bottom:7px; padding:4px 9px;}
++.ef-hero-visual {min-height:140px;}
++.ef-wave {height:62px;}
++.ef-card {min-height:135px; padding:13px;}
++.ef-card .icon {height:28px; width:28px; margin-bottom:8px; font-size:1rem;}
++@media(max-width:768px) { .ef-status-chip {font-size:.75rem;} .ef-hero {padding:15px;} }
+ </style>
+ """
+ 
+@@ -210,6 +249,30 @@
+ 
+ 
+ def section_title(title: str, subtitle: str | None = None) -> None:
+-    st.markdown(f'<div class="ef-section-title">{escape(title)}</div>', unsafe_allow_html=True)
+-    if subtitle:
+-        st.markdown(f'<div class="ef-muted">{escape(subtitle)}</div>', unsafe_allow_html=True)
++    """Keep guidance accessible on hover without permanently consuming a full row."""
++    help_icon = (
++        f'<span class="ef-section-help" title="{escape(subtitle, quote=True)}" '
++        f'aria-label="More about {escape(title, quote=True)}">?</span>'
++        if subtitle else ""
++    )
++    st.markdown(
++        f'<div class="ef-section-title">{escape(title)}{help_icon}</div>',
++        unsafe_allow_html=True,
++    )
++
++
++def render_status_strip(items: list[tuple[str, str, str]]) -> None:
++    """Small, readable status indicators. Tone: good, warn, bad or neutral."""
++    allowed = {"good", "warn", "bad", "neutral"}
++    parts = []
++    for label, value, tone in items:
++        safe_tone = tone if tone in allowed else "neutral"
++        dot = "●" if safe_tone in {"good", "warn", "bad"} else "·"
++        parts.append(
++            f'<span class="ef-status-chip {safe_tone}">'
++            f'<span class="dot" aria-hidden="true">{dot}</span>'
++            f'<span class="label">{escape(str(label))}</span>'
++            f'<span class="value">{escape(str(value))}</span>'
++            f'</span>'
++        )
++    st.markdown('<div class="ef-status-strip">' + "".join(parts) + '</div>', unsafe_allow_html=True)
+--- a/dashboard/app.py
++++ b/dashboard/app.py
+@@ -8,12 +8,12 @@
+ import streamlit as st
+ 
+ try:
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+ except ModuleNotFoundError:
+     import sys
+     from pathlib import Path
+     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+ 
+ api = setup_page("Platform Overview", "home")
+ 
+@@ -146,20 +146,17 @@
+ if not backend_ok:
+     st.error(f"FastAPI is not reachable at {api}. Start the backend to load live platform information.\n\n{backend_error}")
+ 
+-section_title("Get started", "The recommended path for a new customer or a new station.")
+-quick1, quick2, quick3 = st.columns(3, gap="small")
+-with quick1:
+-    st.markdown("**1. Register your station**")
+-    st.caption("Download the Excel template, upload history and choose your models.")
+-    st.page_link("pages/station_management.py", label="Add a station", icon="📡", use_container_width=True)
+-with quick2:
+-    st.markdown("**2. Train and approve models**")
+-    st.caption("Review validation results and deploy approved model versions.")
+-    st.page_link("pages/model_management.py", label="Open Model Lab", icon="🧠", use_container_width=True)
+-with quick3:
+-    st.markdown("**3. Start and monitor**")
+-    st.caption("Check Kafka readiness, activate the station and view forecast risk.")
+-    st.page_link("pages/pipeline_control.py", label="Open Pipeline", icon="⚙️", use_container_width=True)
++with st.expander("New station? Quick setup", expanded=not bool(station_ids)):
++    quick1, quick2, quick3 = st.columns(3, gap="small")
++    with quick1:
++        st.markdown("**1. Add station**")
++        st.page_link("pages/station_management.py", label="Register", icon="📡", use_container_width=True)
++    with quick2:
++        st.markdown("**2. Train model**")
++        st.page_link("pages/model_management.py", label="Model Lab", icon="🧠", use_container_width=True)
++    with quick3:
++        st.markdown("**3. Monitor**")
++        st.page_link("pages/pipeline_control.py", label="Pipeline", icon="⚙️", use_container_width=True)
+ 
+ # ---------------------------------------------------------------------
+ # Registered station cards and independent lifecycle controls
+@@ -199,22 +196,16 @@
+                     f'</div>',
+                     unsafe_allow_html=True,
+                 )
+-                st.caption(f"Station ID: `{station_id}`")
+-                m1, m2, m3 = st.columns(3)
+-                m1.markdown(
+-                    f'<div style="border:1px solid {state_color}55;background:{state_color}12;'
+-                    f'border-radius:12px;padding:10px 12px;min-height:86px;">'
+-                    f'<div style="font-size:13px;color:#9db3cd;">State</div>'
+-                    f'<div style="font-size:21px;line-height:1.35;font-weight:700;color:{state_color};">'
+-                    f'{state_label.title()}</div></div>',
+-                    unsafe_allow_html=True,
+-                )
+-                m2.metric("Demand model", "Ready" if model_ready else "Not trained")
+-                m3.metric("Kafka topics", "Ready" if topics_ready else "Check")
+-                st.caption(
+-                    f"Raw: `{entry.get('raw_topic', station_id + '-raw')}`  ·  "
+-                    f"Featured: `{entry.get('featured_topic', station_id + '-featured')}`"
+-                )
++                render_status_strip([
++                    ("Demand", "Ready" if model_ready else "Needs training", "good" if model_ready else "warn"),
++                    ("Kafka topics", "Ready" if topics_ready else "Check", "good" if topics_ready else "warn"),
++                ])
++                with st.expander("Station details", expanded=False):
++                    st.code(station_id, language="text")
++                    st.caption(
++                        f"Raw: `{entry.get('raw_topic', station_id + '-raw')}` · "
++                        f"Featured: `{entry.get('featured_topic', station_id + '-featured')}`"
++                    )
+                 b1, b2, b3 = st.columns(3)
+                 with b1:
+                     if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=(is_active or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
+@@ -322,17 +313,17 @@
+ # ---------------------------------------------------------------------
+ # Architecture strip
+ # ---------------------------------------------------------------------
+-section_title("End-to-end workflow", "A single operational path from incoming records to decision-ready forecasts.")
+-flow = [
+-    ("▤", "Data ingestion", "CSV source"),
+-    ("◉", "Kafka", "Event streaming"),
+-    ("✳", "Spark", "Feature engineering"),
+-    ("⌁", "LSTM", "24-hour forecast"),
+-    ("▣", "Dashboard", "Monitoring & analysis"),
+-]
+-flow_cols = st.columns(5, gap="small")
+-for col, (icon, title, sub) in zip(flow_cols, flow):
+-    with col:
+-        st.markdown(f'<div class="ef-flow"><div style="font-size:1.35rem;margin-bottom:5px">{icon}</div><b>{title}</b><span>{sub}</span></div>', unsafe_allow_html=True)
+-
+-st.markdown('<div style="text-align:center;color:#7088a8;font-size:.74rem;padding:24px 0 0">E-DF Platform · Local research and demonstration workspace</div>', unsafe_allow_html=True)
++with st.expander("How the platform works", expanded=False):
++    flow = [
++        ("▤", "Data ingestion", "CSV source"),
++        ("◉", "Kafka", "Event streaming"),
++        ("✳", "Spark", "Feature engineering"),
++        ("⌁", "Models", "Forecasts & risk"),
++        ("▣", "Dashboard", "Monitoring & analysis"),
++    ]
++    flow_cols = st.columns(5, gap="small")
++    for col, (icon, title, sub) in zip(flow_cols, flow):
++        with col:
++            st.markdown(f'<div class="ef-flow"><div style="font-size:1.35rem;margin-bottom:5px">{icon}</div><b>{title}</b><span>{sub}</span></div>', unsafe_allow_html=True)
++
++st.markdown('<div style="text-align:center;color:#7088a8;font-size:.74rem;padding:24px 0 0">E-DF Platform · Forecasting analytics</div>', unsafe_allow_html=True)
+--- a/dashboard/pages/monitoring.py
++++ b/dashboard/pages/monitoring.py
+@@ -9,8 +9,9 @@
+ import streamlit as st
+ 
+ try:
+-    from dashboard.ui import setup_page
++    from dashboard.ui import setup_page, render_status_strip
+     from dashboard.renewable_plot import build_renewable_figure
++    from dashboard.renewable_summary import build_renewable_summaries
+     from dashboard.anomaly_strips import add_forecast_anomaly_overlays
+     from dashboard.forecast_selection import select_latest_complete_forecast_run
+     from dashboard.replay_display import filter_actuals_to_cutoff, read_last_acked_timestamp, resolve_actuals_display_cutoff
+@@ -18,8 +19,9 @@
+     import sys
+     from pathlib import Path
+     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+-    from dashboard.ui import setup_page
++    from dashboard.ui import setup_page, render_status_strip
+     from dashboard.renewable_plot import build_renewable_figure
++    from dashboard.renewable_summary import build_renewable_summaries
+     from dashboard.anomaly_strips import add_forecast_anomaly_overlays
+     from dashboard.forecast_selection import select_latest_complete_forecast_run
+     from dashboard.replay_display import filter_actuals_to_cutoff, read_last_acked_timestamp, resolve_actuals_display_cutoff
+@@ -119,11 +121,7 @@
+ # ---------------------------------------------------------------------
+ api = setup_page("Live Monitoring", "monitoring")
+ 
+-st.title("⚡ Electricity Demand — Live Monitoring")
+-st.caption(
+-    "Actual demand transitions into the latest configured forecast · "
+-    "Data loaded through FastAPI · All timestamps in UTC · Forecast spike risk is not a confirmed grid incident"
+-)
++st.title("⚡ Live Monitoring")
+ 
+ # ---------------------------------------------------------------------
+ # Sidebar
+@@ -153,6 +151,10 @@
+         format_func=lambda hours: f"Previous {hours} hours",
+     )
+     show_forecast_table = st.checkbox("Show forecast table", value=False)
++    show_diagnostics = st.checkbox(
++        "Show technical details", value=False, key="monitor_tech_details",
++        help="Show API row counts, storage, quality events and replay diagnostics.",
++    )
+     with st.expander("Spike alert sensitivity", expanded=False):
+         alert_min_consecutive_intervals = st.selectbox(
+             "Minimum consecutive forecast points", [1, 2, 3], index=1,
+@@ -200,28 +202,32 @@
+     refresh_seconds: int,
+     alert_min_consecutive_intervals: int = 2,
+     alert_min_excess_pct: float = 1.0,
++    show_diagnostics: bool = False,
+ ) -> None:
+     """Render the live monitoring panel in isolation from the app shell.
+ 
+     Streamlit's fragment scheduler reruns only this function, not the complete
+     page, navigation, sidebar controls, and unrelated UI.
+     """
+-    # Operational readiness and recent data-quality events are surfaced alongside
+-    # the forecast view so failures are visible to the dashboard operator.
+-    readiness = {}
+-    try:
+-        readiness = api_get_readiness(api)
+-        quality_payload = api_get_quality_events(api, station, 100)
+-        quality_records = quality_payload.get("records", [])
+-        q1, q2, q3 = st.columns(3)
+-        q1.metric("Pipeline API readiness", "Ready" if readiness.get("ready") else "Degraded")
+-        q2.metric("Storage backend", readiness.get("storage", {}).get("backend", "unknown"))
+-        q3.metric("Recent quality events", len(quality_records))
+-        if quality_records:
+-            with st.expander("Recent data-quality events"):
+-                st.dataframe(pd.DataFrame(quality_records), use_container_width=True, hide_index=True)
+-    except requests.RequestException as exc:
+-        st.warning(f"Operational health/quality information is temporarily unavailable: {exc}")
++    # Health and data-quality details are operator diagnostics, not recurring
++    # customer-facing KPIs. Avoid two extra API calls on every chart refresh.
++    readiness: dict = {}
++    quality_records: list[dict] = []
++    if show_diagnostics:
++        with st.expander("Advanced: API health and data quality", expanded=False):
++            try:
++                readiness = api_get_readiness(api)
++                quality_payload = api_get_quality_events(api, station, 100)
++                quality_records = quality_payload.get("records", [])
++                health_text = "Ready" if readiness.get("ready") else "Check backend"
++                st.caption(
++                    f"API: {health_text} · Storage: {(readiness.get('storage') or {}).get('backend', 'unknown')} "
++                    f"· Data-quality events: {len(quality_records)}"
++                )
++                if quality_records:
++                    st.dataframe(pd.DataFrame(quality_records), use_container_width=True, hide_index=True)
++            except requests.RequestException as exc:
++                st.warning(f"Operational diagnostics unavailable: {exc}")
+ 
+     station_interval_minutes = int(stations[station].get("interval_minutes", 15))
+     station_horizon_steps = int(stations[station].get("horizon_steps", 96))
+@@ -422,30 +428,21 @@
+         if not latest_run.empty else None
+     )
+ 
+-    st.subheader("Demand Overview")
+-    k1, k2, k3, k4 = st.columns(4)
+-    k1.metric("Latest Stored Actual", fmt_mw(latest_actual))
+-    k2.metric("First Forecast Step", fmt_mw(first_forecast))
+-    k3.metric("24h Peak Forecast", fmt_mw(peak_forecast))
+-    k4.metric("24h Average Forecast", fmt_mw(average_forecast))
+-
++    st.subheader("Demand · current forecast")
++    k1, k2, k3, k4 = st.columns(4, gap="small")
++    k1.metric("Latest actual", fmt_mw(latest_actual))
++    k2.metric("Next forecast", fmt_mw(first_forecast))
++    k3.metric("24h peak", fmt_mw(peak_forecast))
++    k4.metric("24h average", fmt_mw(average_forecast))
+     if forecast_origin is not None:
+-        st.caption(f"Forecast origin (Now): {fmt_utc(forecast_origin)}")
+-    if not latest_run.empty and "forecast_issued_at_utc" in latest_run.columns:
+-        st.caption(
+-            "Latest forecast run issued: "
+-            + fmt_utc(latest_run["forecast_issued_at_utc"].iloc[0])
+-        )
++        st.caption(f"Forecast origin · {fmt_utc(forecast_origin)}")
++    if show_diagnostics and not latest_run.empty and "forecast_issued_at_utc" in latest_run.columns:
++        st.caption("Forecast processing time: " + fmt_utc(latest_run["forecast_issued_at_utc"].iloc[0]))
+ 
+     # ---------------------------------------------------------------------
+     # Main graph: solid actual line -> dashed forecast line
+     # ---------------------------------------------------------------------
+-    st.divider()
+-    st.subheader("Live Demand Monitoring")
+-    st.caption(
+-        "Solid line: actual demand · Dashed line: latest configured forecast · "
+-        "Vertical marker: forecast origin (Now)"
+-    )
++    st.subheader("Demand · actual vs forecast")
+ 
+     fig = go.Figure()
+     chart_start = None
+@@ -560,19 +557,20 @@
+     else:
+         st.info("Neither actual-demand observations nor forecast records were returned by the results API.")
+ 
+-    # Surface retrieval sizes and the selected forecast boundary so a blank/stale
+-    # chart can be diagnosed from the dashboard without opening server logs.
+-    st.caption(
+-        f"Demand API rows: {len(actuals):,} actuals · {len(forecasts):,} forecast points · "
+-        f"selected run: {len(latest_run):,} points · "
+-        f"origin: {fmt_utc(forecast_origin) if forecast_origin is not None else '—'}"
+-    )
+-    st.caption(
+-        f"Actual-data display cutoff: {fmt_utc(actuals_display_cutoff) if actuals_display_cutoff is not None else 'not configured'} "
+-        f"({actuals_cutoff_source.replace('_', ' ')}). "
+-        "Before the replay reaches 1 October, the graph shows only pre-stream history; "
+-        "replay actuals are revealed up to the producer's acknowledged timestamp."
+-    )
++    if show_diagnostics:
++        # Surface retrieval sizes and the selected forecast boundary so a blank/stale
++        # chart can be diagnosed from the dashboard without opening server logs.
++        st.caption(
++            f"Demand API rows: {len(actuals):,} actuals · {len(forecasts):,} forecast points · "
++            f"selected run: {len(latest_run):,} points · "
++            f"origin: {fmt_utc(forecast_origin) if forecast_origin is not None else '—'}"
++        )
++        st.caption(
++            f"Actual-data display cutoff: {fmt_utc(actuals_display_cutoff) if actuals_display_cutoff is not None else 'not configured'} "
++            f"({actuals_cutoff_source.replace('_', ' ')}). "
++            "Before the replay reaches 1 October, the graph shows only pre-stream history; "
++            "replay actuals are revealed up to the producer's acknowledged timestamp."
++        )
+ 
+     # Exactly two forecast-only anomaly marker types, using the supplied AE component
+     # classifications. They sit on the forecast curve; actual demand is never labelled.
+@@ -589,19 +587,12 @@
+             strip["context_valid"].fillna(False).astype(bool).sum()
+             if "context_valid" in strip.columns else len(strip)
+         )
+-        st.caption(
+-            "Forecast-path anomaly markers only: "
+-            f"{strip_counts['demand_level']:,} demand-high flags · "
+-            f"{strip_counts['ramp_up']:,} ramp-up flags · "
+-            f"{valid_scores:,} of {len(strip):,} forecast steps scored. "
+-            "Orange circles mark demand-high events; red diamonds mark ramp-up events. Downward-demand anomalies remain uncoloured. "
+-            "No anomaly labels are assigned to the actual-demand curve. "
+-            + (
+-                f"Threshold: {float(anomaly_threshold):.3f} (station config)."
+-                if anomaly_model_path and anomaly_threshold is not None
+-                else "Threshold: checkpoint-calibrated."
+-            )
+-        )
++        if show_diagnostics:
++            st.caption(
++                f"Demand-high: {strip_counts['demand_level']:,} · Ramp-up: {strip_counts['ramp_up']:,} · "
++                f"Scored: {valid_scores:,}/{len(strip):,} · "
++                + (f"AE threshold: {float(anomaly_threshold):.3f}" if anomaly_threshold is not None else "AE threshold: calibrated")
++            )
+     elif anomaly_model_path and not latest_run.empty:
+         st.caption(
+             "Demand-high and ramp-up markers are waiting for a complete historical context "
+@@ -619,7 +610,8 @@
+         if not alerts.empty:
+             st.warning(f"{len(alerts)} forecast high-demand event(s) meet the selected review criteria. These are model risk signals, not confirmed outages or balancing events.")
+         else:
+-            st.info("No elevated demand event meets the alert-review criteria in this forecast. Single-point model signals remain visible on the chart.")
++            if show_diagnostics:
++                st.caption("No forecast events pass the current alert-review criteria.")
+         with st.expander("Review spike-event evidence", expanded=False):
+             st.caption(
+                 "Forecast-only grouping. AE scores are robust-z reconstruction scores, not event probabilities. "
+@@ -641,10 +633,8 @@
+             current_fingerprint=anomaly_fingerprint,
+         )
+         if previous_count:
+-            st.caption(
+-                f"{previous_count} hollow grey marker(s) show earlier, superseded spike-risk forecasts "
+-                "that the latest prediction no longer flags. They are NOT current alerts."
+-            )
++            if show_diagnostics:
++                st.caption(f"{previous_count} previous-origin risk markers retained in grey (not current alerts).")
+ 
+     # Explain legitimate rolling forecast revisions and show earlier risk
+     # snapshots, so a past signal does not silently vanish from the customer's
+@@ -653,12 +643,8 @@
+         historical_risk = pd.DataFrame(anomaly_history)
+         older = historical_risk.iloc[1:] if len(historical_risk) > 1 else pd.DataFrame()
+         previously_flagged = older[older["signals"].gt(0)] if not older.empty else pd.DataFrame()
+-        if not previously_flagged.empty:
+-            st.caption(
+-                f"{len(previously_flagged)} earlier forecast origin(s) flagged anomaly risk. "
+-                "They remain in the forecast history even if the latest rolling prediction no longer flags those targets. "
+-                "A previous prediction is not a confirmed grid event."
+-            )
++        if show_diagnostics and not previously_flagged.empty:
++            st.caption(f"{len(previously_flagged)} earlier origins flagged forecast risk; retained for audit.")
+         with st.expander("Past forecast anomaly assessments (saved across refreshes)", expanded=False):
+             st.dataframe(
+                 historical_risk[["origin_utc", "signals", "max_score", "assessed_at_utc"]].rename(
+@@ -673,7 +659,7 @@
+ 
+     if fig.data:
+         fig.update_layout(
+-            height=560,
++            height=480,
+             template="plotly_dark",
+             hovermode="x unified",
+             legend=dict(
+@@ -707,12 +693,7 @@
+     # ---------------------------------------------------------------------
+     # Renewable generation monitoring (solar + onshore wind)
+     # ---------------------------------------------------------------------
+-    st.divider()
+-    st.subheader("Renewable Energy Monitoring — Solar + Wind")
+-    st.caption(
+-        "Per-station combined generation view · Solid lines: realised generation · "
+-        "Dashed lines: latest stored model forecasts · Values in MWh per 15-minute interval"
+-    )
++    st.subheader("Solar & Wind · generation")
+     renewable_params = {"station": station, "limit": 5000}
+     if forecast_origin is not None:
+         renewable_params["end_time"] = forecast_origin.isoformat()
+@@ -738,6 +719,18 @@
+             renewable_actuals, actuals_display_cutoff, "utc_timestamp"
+         )
+ 
++        renewable_summary = build_renewable_summaries(renewable_actuals, renewable_forecasts)
++        for kind, label in (("solar", "Solar"), ("wind", "Wind")):
++            stats = renewable_summary[kind]
++            st.markdown(f"**{label}** · MWh per {station_interval_minutes}-minute interval")
++            r1, r2, r3, r4 = st.columns(4, gap="small")
++            def fmt_mwh(value):
++                return f"{value:,.0f} MWh" if value is not None else "—"
++            r1.metric("Latest actual", fmt_mwh(stats["latest_actual"]))
++            r2.metric("Next forecast", fmt_mwh(stats["first_forecast"]))
++            r3.metric("Forecast peak", fmt_mwh(stats["peak_forecast"]))
++            r4.metric("Forecast average", fmt_mwh(stats["average_forecast"]))
++
+         renewable_fig, renewable_counts = build_renewable_figure(
+             renewable_actuals, renewable_forecasts,
+             chart_start=chart_start, chart_end=chart_end,
+@@ -763,24 +756,25 @@
+                 details["rows"] = 0
+                 details["latest_actual_utc"] = None
+ 
+-        coverage_bits = []
+-        for kind in ("solar", "wind"):
+-            details = coverage.get(kind, {}) or {}
+-            latest = details.get("latest_actual_utc")
+-            coverage_bits.append(
+-                f"{kind.title()}: {details.get('rows', 0):,} actual rows, latest {fmt_utc(latest) if latest else '—'}, "
+-                f"test file {'available' if details.get('test_file_available') else 'not supplied'}"
+-            )
+-        if coverage_bits:
+-            st.caption(" · ".join(coverage_bits))
+-        actual_count = len(renewable_actuals) if not renewable_actuals.empty else 0
+-        st.caption(
+-            f"Renewable API rows: {actual_count:,} historical timestamps · "
+-            f"displayed in chart: Solar actual {renewable_counts['solar_actual']:,}, "
+-            f"Solar forecast {renewable_counts['solar_forecast']:,}, "
+-            f"Wind actual {renewable_counts['wind_actual']:,}, "
+-            f"Wind forecast {renewable_counts['wind_forecast']:,}."
+-        )
++        if show_diagnostics:
++            coverage_bits = []
++            for kind in ("solar", "wind"):
++                details = coverage.get(kind, {}) or {}
++                latest = details.get("latest_actual_utc")
++                coverage_bits.append(
++                    f"{kind.title()}: {details.get('rows', 0):,} actual rows, latest {fmt_utc(latest) if latest else '—'}, "
++                    f"test file {'available' if details.get('test_file_available') else 'not supplied'}"
++                )
++            if coverage_bits:
++                st.caption(" · ".join(coverage_bits))
++            actual_count = len(renewable_actuals) if not renewable_actuals.empty else 0
++            st.caption(
++                f"Renewable API rows: {actual_count:,} historical timestamps · "
++                f"displayed in chart: Solar actual {renewable_counts['solar_actual']:,}, "
++                f"Solar forecast {renewable_counts['solar_forecast']:,}, "
++                f"Wind actual {renewable_counts['wind_actual']:,}, "
++                f"Wind forecast {renewable_counts['wind_forecast']:,}."
++            )
+         if forecast_origin is not None:
+             stale_kinds = []
+             for kind in ("solar", "wind"):
+@@ -790,105 +784,101 @@
+                     if pd.notna(latest_ts) and (forecast_origin - latest_ts) > pd.Timedelta(minutes=station_interval_minutes):
+                         stale_kinds.append(f"{kind} actuals end at {fmt_utc(latest_ts)}")
+             if stale_kinds:
+-                st.warning(
+-                    "Renewable actual data is stale relative to the demand forecast origin: "
+-                    + "; ".join(stale_kinds)
+-                    + ". Add updated solar_test.csv and wind_test.csv data to extend actuals and forecast-weather coverage."
+-                )
++                render_status_strip([
++                    ("Renewable observations delayed", "; ".join(stale_kinds), "warn")
++                ])
+     except requests.RequestException as exc:
+         st.warning(f"Renewable monitoring data is temporarily unavailable from FastAPI: {exc}")
+ 
+-    # ---------------------------------------------------------------------
+-    # Latest forecast run details
+-    # ---------------------------------------------------------------------
+-    st.divider()
+-    st.subheader("Latest Forecast Run")
+-
+-    if not latest_run.empty:
+-        display_columns = [
+-            col for col in [
+-                "forecast_issued_at_utc",
+-                "forecast_origin_utc",
+-                "forecast_timestamp_utc",
+-                "horizon_step",
+-                "predicted_demand",
+-                "weather_mode",
+-                "model_file",
++    if show_diagnostics:
++        # ---------------------------------------------------------------------
++        # Latest forecast run details
++        # ---------------------------------------------------------------------
++        st.divider()
++        st.subheader("Latest Forecast Run")
++
++        if not latest_run.empty:
++            display_columns = [
++                col for col in [
++                    "forecast_issued_at_utc",
++                    "forecast_origin_utc",
++                    "forecast_timestamp_utc",
++                    "horizon_step",
++                    "predicted_demand",
++                    "weather_mode",
++                    "model_file",
++                ]
++                if col in latest_run.columns
+             ]
+-            if col in latest_run.columns
+-        ]
+-
+-        st.dataframe(
+-            latest_run[display_columns],
+-            use_container_width=True,
+-            hide_index=True,
+-        )
+-
+-        st.download_button(
+-            "Download Latest Forecast Run",
+-            data=latest_run[display_columns].to_csv(index=False).encode("utf-8"),
+-            file_name=f"{station}_latest_forecast.csv",
+-            mime="text/csv",
+-        )
+-    else:
+-        st.info("No saved forecast run is available yet.")
+-
+-    # ---------------------------------------------------------------------
+-    # Forecast history
+-    # ---------------------------------------------------------------------
+-    st.subheader("Forecast History")
+-
+-    if (
+-        not forecasts.empty
+-        and "forecast_issued_at_utc" in forecasts.columns
+-    ):
+-        run_times = sorted(
+-            forecasts["forecast_issued_at_utc"].dropna().unique(),
+-            reverse=True,
+-        )
+-
+-        if run_times:
+-            run_labels = [
+-                pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S UTC")
+-                for value in run_times
+-            ]
+-            selected_label = st.selectbox(
+-                "Select a saved forecast run", run_labels
+-            )
+-            selected_run_time = pd.Timestamp(
+-                run_times[run_labels.index(selected_label)]
+-            )
+-            selected_run = forecasts[
+-                forecasts["forecast_issued_at_utc"] == selected_run_time
+-            ].sort_values("forecast_timestamp_utc")
+-
+-            history_fig = go.Figure()
+-            history_fig.add_trace(
+-                go.Scatter(
+-                    x=selected_run["forecast_timestamp_utc"],
+-                    y=selected_run["predicted_demand"],
+-                    mode="lines+markers",
+-                    name="Saved Demand Forecast",
+-                    line=dict(color="#F57C00", width=3, dash="dot"),
+-                    marker=dict(size=4),
+-                )
+-            )
+-            history_fig.update_layout(
+-                title=f"Forecast run generated {selected_label}",
+-                xaxis_title="Target timestamp (UTC)",
+-                yaxis_title="Predicted demand (MW)",
+-                hovermode="x unified",
+-                height=380,
+-                template="plotly_dark",
+-            )
+-            st.plotly_chart(history_fig, use_container_width=True)
+-            st.caption(f"Saved forecast runs available: {len(run_times):,}")
+-    else:
+-        st.info("Forecast history will appear after the predictor saves its first run.")
+-
+-    # ---------------------------------------------------------------------
+-    # Optional forecast table (step count is station-specific)
+-    # ---------------------------------------------------------------------
++
++            st.dataframe(
++                latest_run[display_columns],
++                use_container_width=True,
++                hide_index=True,
++            )
++
++            st.download_button(
++                "Download Latest Forecast Run",
++                data=latest_run[display_columns].to_csv(index=False).encode("utf-8"),
++                file_name=f"{station}_latest_forecast.csv",
++                mime="text/csv",
++            )
++        else:
++            st.info("No saved forecast run is available yet.")
++
++        # ---------------------------------------------------------------------
++        # Forecast history
++        # ---------------------------------------------------------------------
++        st.subheader("Forecast History")
++
++        if (
++            not forecasts.empty
++            and "forecast_issued_at_utc" in forecasts.columns
++        ):
++            run_times = sorted(
++                forecasts["forecast_issued_at_utc"].dropna().unique(),
++                reverse=True,
++            )
++
++            if run_times:
++                run_labels = [
++                    pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S UTC")
++                    for value in run_times
++                ]
++                selected_label = st.selectbox(
++                    "Select a saved forecast run", run_labels
++                )
++                selected_run_time = pd.Timestamp(
++                    run_times[run_labels.index(selected_label)]
++                )
++                selected_run = forecasts[
++                    forecasts["forecast_issued_at_utc"] == selected_run_time
++                ].sort_values("forecast_timestamp_utc")
++
++                history_fig = go.Figure()
++                history_fig.add_trace(
++                    go.Scatter(
++                        x=selected_run["forecast_timestamp_utc"],
++                        y=selected_run["predicted_demand"],
++                        mode="lines+markers",
++                        name="Saved Demand Forecast",
++                        line=dict(color="#F57C00", width=3, dash="dot"),
++                        marker=dict(size=4),
++                    )
++                )
++                history_fig.update_layout(
++                    title=f"Forecast run generated {selected_label}",
++                    xaxis_title="Target timestamp (UTC)",
++                    yaxis_title="Predicted demand (MW)",
++                    hovermode="x unified",
++                    height=380,
++                    template="plotly_dark",
++                )
++                st.plotly_chart(history_fig, use_container_width=True)
++                st.caption(f"Saved forecast runs available: {len(run_times):,}")
++        else:
++            st.info("Forecast history will appear after the predictor saves its first run.")
++
+     if show_forecast_table:
+         st.subheader(
+             f"Current Forecast — {station_horizon_steps:,} Steps "
+@@ -906,38 +896,40 @@
+     # ---------------------------------------------------------------------
+     # Storage status
+     # ---------------------------------------------------------------------
+-    with st.expander("Storage and data status", expanded=False):
+-        active_storage_backend = (readiness.get("storage") or {}).get("backend", "unknown")
+-        st.write(f"**Storage backend:** {active_storage_backend} (accessed through FastAPI).")
+-        st.write("**Forecast storage:** `data/processed/forecasts.csv`")
+-        st.write("**Actual demand storage:** `data/processed/actuals.csv`")
+-        st.write(f"**Forecast rows returned by API:** {len(forecasts):,}")
+-        st.write(f"**Unique actual timestamps returned by API:** {len(actuals):,}")
+-        st.write(
+-            "**Actual source:** "
+-            + (
+-                actual_payload.get(
+-                    "message", "Streaming observations stored by the predictor."
+-                )
+-                if actuals.empty
+-                else "Kafka → Spark → predictor → actuals.csv"
+-            )
+-        )
+-        st.write(
+-            "**Forecast source:** Kafka → Spark → selected model predictor → station forecasts file"
+-        )
++    if show_diagnostics:
++        with st.expander("Storage and data status", expanded=False):
++            active_storage_backend = (readiness.get("storage") or {}).get("backend", "unknown")
++            st.write(f"**Storage backend:** {active_storage_backend} (accessed through FastAPI).")
++            st.write("**Forecast storage:** `data/processed/forecasts.csv`")
++            st.write("**Actual demand storage:** `data/processed/actuals.csv`")
++            st.write(f"**Forecast rows returned by API:** {len(forecasts):,}")
++            st.write(f"**Unique actual timestamps returned by API:** {len(actuals):,}")
++            st.write(
++                "**Actual source:** "
++                + (
++                    actual_payload.get(
++                        "message", "Streaming observations stored by the predictor."
++                    )
++                    if actuals.empty
++                    else "Kafka → Spark → predictor → actuals.csv"
++                )
++            )
++            st.write(
++                "**Forecast source:** Kafka → Spark → selected model predictor → station forecasts file"
++            )
++            st.caption(
++                "The main chart uses the latest saved forecast run and its forecast "
++                "origin. It does not mix predictions from older forecast runs."
++            )
++
++    if show_diagnostics:
++        st.divider()
+         st.caption(
+-            "The main chart uses the latest saved forecast run and its forecast "
+-            "origin. It does not mix predictions from older forecast runs."
+-        )
+-
+-    st.divider()
+-    st.caption(
+-        f"Auto-refresh: "
+-        f"{'On (live panel only)' if auto_refresh else 'Off'}"
+-        f" · Refresh interval: {refresh_seconds}s"
+-        f" · Last render: {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S UTC}"
+-    )
++            f"Auto-refresh: "
++            f"{'On (live panel only)' if auto_refresh else 'Off'}"
++            f" · Refresh interval: {refresh_seconds}s"
++            f" · Last render: {pd.Timestamp.now(tz='UTC'):%Y-%m-%d %H:%M:%S UTC}"
++        )
+ 
+ 
+ # Streamlit >=1.38 (the project's declared minimum) supports fragments.
+@@ -954,4 +946,5 @@
+     run_every=float(refresh_seconds) if auto_refresh else None
+ )(render_live_monitoring_panel)
+ fragment_runner(api, station, stations, history_hours, show_forecast_table, auto_refresh,
+-                refresh_seconds, alert_min_consecutive_intervals, alert_min_excess_pct)
++                refresh_seconds, alert_min_consecutive_intervals, alert_min_excess_pct,
++                show_diagnostics)
+--- a/dashboard/pages/pipeline_control.py
++++ b/dashboard/pages/pipeline_control.py
+@@ -5,12 +5,12 @@
+ import streamlit as st
+ 
+ try:
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+ except ModuleNotFoundError:
+     import sys
+     from pathlib import Path
+     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+ 
+ api = setup_page("Pipeline Control", "pipeline")
+ 
+@@ -65,17 +65,17 @@
+     "Check service readiness before starting. Stopping also resets this station's replay output and Spark checkpoint.",
+ )
+ services = status.get("services", {})
+-cols = st.columns(4)
+-for col, name in zip(cols, ("training", "spark", "predictor", "producer")):
+-    details = services.get(name, {})
+-    col.metric(name.title(), "Running" if details.get("running") else "Stopped")
+-
+ kafka_ok = status.get("kafka_tcp_available", False)
+ model_ready = status.get("model_ready", False)
+-a, b, c = st.columns(3)
+-a.metric("Kafka broker", "Reachable" if kafka_ok else "Unavailable")
+-b.metric("Demand model", "Ready" if model_ready else "Missing")
+-c.metric("Station state", status.get("lifecycle_status", "unknown").replace("_", " ").title())
++render_status_strip([
++    ("Station", str(status.get("lifecycle_status", "unknown")).replace("_", " ").title(),
++     "good" if status.get("lifecycle_status") == "active" else "neutral"),
++    ("Kafka", "Connected" if kafka_ok else "Offline", "good" if kafka_ok else "bad"),
++    ("Demand model", "Ready" if model_ready else "Missing", "good" if model_ready else "warn"),
++    *[(name.title(), "Running" if services.get(name, {}).get("running") else "Stopped",
++       "good" if services.get(name, {}).get("running") else "neutral")
++      for name in ("training", "spark", "predictor", "producer")],
++])
+ 
+ if not kafka_ok:
+     st.warning("Kafka is not reachable at 127.0.0.1:9092. Start Kafka before resetting or activating this station.")
+@@ -84,33 +84,30 @@
+ 
+ # Show the same model components as Model Management. Legacy station records
+ # receive inferred component statuses from /models/components.
+-section_title(
+-    "Station model components",
+-    "Separate model readiness and training-data availability; deployment is managed in Model Management.",
+-)
+-try:
+-    component_data = get_json("/models/components", {"station": station})
+-    details = component_data.get("sources") or {}
+-    labels = {
+-        "demand_forecast": "Demand forecasting",
+-        "solar_forecast": "Solar forecasting",
+-        "wind_forecast": "Wind forecasting",
+-        "demand_anomaly": "Demand anomaly encoder",
+-    }
+-    rows = []
+-    for key, label in labels.items():
+-        component = details.get(key, {})
+-        rows.append({
+-            "Model component": label,
+-            "Selected": "Yes" if component.get("enabled") else "No",
+-            "Training dataset": "Available" if component.get("registered_file_exists") else "Not configured",
+-            "Deployment": "Artifact ready" if component.get("deployment_exists") else "Missing",
+-            "Checkpoint": component.get("deployment_file") or "—",
+-        })
+-    st.dataframe(rows, hide_index=True, use_container_width=True)
+-    st.caption("Solar/Wind checkpoint readiness is independent of demand. Live prediction is demand-driven; the existing station activation still requires a demand model.")
+-except requests.RequestException as exc:
+-    st.warning(f"Model component details are unavailable: {exc}")
++if st.toggle("Station model components · details", value=False, key=f"pipeline_components_{station}"):
++    try:
++        component_data = get_json("/models/components", {"station": station})
++        details = component_data.get("sources") or {}
++        labels = {
++            "demand_forecast": "Demand forecasting",
++            "solar_forecast": "Solar forecasting",
++            "wind_forecast": "Wind forecasting",
++            "demand_anomaly": "Demand anomaly encoder",
++        }
++        rows = []
++        for key, label in labels.items():
++            component = details.get(key, {})
++            rows.append({
++                "Model component": label,
++                "Selected": "Yes" if component.get("enabled") else "No",
++                "Training dataset": "Available" if component.get("registered_file_exists") else "Not configured",
++                "Deployment": "Artifact ready" if component.get("deployment_exists") else "Missing",
++                "Checkpoint": component.get("deployment_file") or "—",
++            })
++        st.dataframe(rows, hide_index=True, use_container_width=True)
++        st.caption("Solar/Wind checkpoint readiness is independent of demand. Live prediction is demand-driven; the existing station activation still requires a demand model.")
++    except requests.RequestException as exc:
++        st.warning(f"Model component details are unavailable: {exc}")
+ 
+ station_services_running = any(
+     services.get(name, {}).get("running", False)
+@@ -149,26 +146,22 @@
+     if st.button("↻ Refresh", use_container_width=True):
+         st.rerun()
+ 
+-section_title(
+-    "Station Kafka topics",
+-    "Kafka topics are provisioned automatically during station registration and retried during activation. Stopping a station clears its retained records but keeps topic definitions.",
+-)
+-topics = status.get("topics", {})
+-t1, t2 = st.columns(2)
+-t1.markdown(f"**Raw topic**  \n`{topics.get('raw') or entry.get('raw_topic', '—')}`")
+-t2.markdown(f"**Featured topic**  \n`{topics.get('featured') or entry.get('featured_topic', '—')}`")
+-section_title("Service logs", "Recent output from the selected station's individual service processes.")
+-log_service = st.selectbox("Log stream", ["spark", "predictor", "producer", "training"], key="pipeline_log_service")
+-if st.button("Load latest log lines"):
+-    try:
+-        result = get_json(f"/pipeline/logs/{log_service}", {"station": station})
+-        st.code(result.get("content") or "No log output is available yet.", language="text")
+-    except requests.RequestException as exc:
+-        detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
+-        st.error(f"Could not retrieve log: {detail}")
++with st.expander("Advanced: Kafka topics and service logs", expanded=False):
++    section_title(
++        "Station Kafka topics",
++        "Kafka topics are provisioned automatically during station registration and retried during activation. Stopping a station clears its retained records but keeps topic definitions.",
++    )
++    topics = status.get("topics", {})
++    t1, t2 = st.columns(2)
++    t1.markdown(f"**Raw topic**  \n`{topics.get('raw') or entry.get('raw_topic', '—')}`")
++    t2.markdown(f"**Featured topic**  \n`{topics.get('featured') or entry.get('featured_topic', '—')}`")
++    section_title("Service logs", "Recent output from the selected station's individual service processes.")
++    log_service = st.selectbox("Log stream", ["spark", "predictor", "producer", "training"], key="pipeline_log_service")
++    if st.button("Load latest log lines"):
++        try:
++            result = get_json(f"/pipeline/logs/{log_service}", {"station": station})
++            st.code(result.get("content") or "No log output is available yet.", language="text")
++        except requests.RequestException as exc:
++            detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
++            st.error(f"Could not retrieve log: {detail}")
+ 
+-st.caption(
+-    "Kafka must be started separately. Stopping a station automatically resets its "
+-    "Kafka records, Spark checkpoint and station-scoped result files; source data and "
+-    "the trained model are retained."
+-)
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -4,12 +4,12 @@
+ import streamlit as st
+ 
+ try:
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+ except ModuleNotFoundError:
+     import sys
+     from pathlib import Path
+     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+ 
+ def rerun_page():
+     rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+@@ -18,7 +18,7 @@
+ 
+ api = setup_page("Station Management", "stations")
+ st.title("Station Management")
+-st.caption("Register station data, configure timestamp interpretation and manage registered station records.")
++
+ 
+ 
+ def api_get(path: str):
+@@ -51,11 +51,11 @@
+ # Register new station
+ # ---------------------------------------------------------------------
+ st.subheader("Add a station")
+-st.markdown(
+-    "Upload one Excel workbook containing **Demand**, **Solar** and **Wind** sheets. "
+-    "The Demand sheet also trains the anomaly autoencoder. All four model components "
+-    "are selected by default; deselect any that this station will not use."
+-)
++with st.expander("Excel upload guidance", expanded=False):
++    st.markdown(
++        "Upload one workbook with **Demand**, **Solar** and **Wind** sheets. "
++        "Demand also supplies anomaly training. All four models are selected by default."
++    )
+ st.link_button("Download station training Excel template", f"{api}/stations/template", use_container_width=False)
+ model_labels = {
+     "demand_forecast": "Demand forecasting",
+@@ -188,9 +188,15 @@
+     component_summary = api_get(f"/models/components?station={selected}")
+     inferred_enabled = component_summary.get("enabled") or {}
+     sources = component_summary.get("sources") or {}
+-    with st.expander("Registered model components", expanded=True):
++    selected_count = sum(bool(value) for value in inferred_enabled.values())
++    ready_count = sum(bool(source.get("deployment_exists")) for source in sources.values())
++    render_status_strip([
++        ("Model components", f"{selected_count} selected", "neutral"),
++        ("Deployed", f"{ready_count} artifacts", "neutral"),
++    ])
++    with st.expander("Registered model components", expanded=False):
+         if component_summary.get("legacy_station"):
+-            st.caption("Legacy station: components detected from the existing dataset/checkpoint paths; no re-registration is needed.")
++            st.caption("Legacy station: components detected from existing datasets and checkpoints.")
+         component_rows = []
+         for model_id, label in model_labels.items():
+             selected_for_station = bool(inferred_enabled.get(model_id, False))
+@@ -225,58 +231,46 @@
+     st.error(f"Could not load station status: {exc}")
+     st.stop()
+ 
+-k1, k2, k3, k4 = st.columns(4)
+-k1.metric("Registered rows", f"{entry.get('registered_rows', '—'):,}" if isinstance(entry.get("registered_rows"), int) else "—")
+-k2.metric("Model ready", "Yes" if model.get("checkpoint_exists") else "No")
+-k3.metric("Kafka", "Available" if status.get("kafka_tcp_available") else "Unavailable")
+-k4.metric("Station state", str(status.get("lifecycle_status", entry.get("status", "registered"))).replace("_", " ").title())
+-
+-with st.expander("Station configuration", expanded=False):
++rows_registered = entry.get("registered_rows")
++render_status_strip([
++    ("History", f"{rows_registered:,} rows" if isinstance(rows_registered, int) else "—", "neutral"),
++    ("Demand", "Ready" if model.get("checkpoint_exists") else "Needs training",
++     "good" if model.get("checkpoint_exists") else "warn"),
++    ("Kafka", "Connected" if status.get("kafka_tcp_available") else "Offline",
++     "good" if status.get("kafka_tcp_available") else "bad"),
++    ("Station", str(status.get("lifecycle_status", entry.get("status", "registered"))).replace("_", " ").title(), "neutral"),
++])
++with st.expander("Technical station details", expanded=False):
+     st.json({k: v for k, v in entry.items() if k not in {"registered_source_file"}})
+-
+-# Lifecycle operations are controlled from Home so registered stations can be
+-# independently activated and stopped/reset without duplicating controls here.
+-st.info("Use the station cards on Home to activate a station, open its monitoring page, or stop + reset it. Kafka topics are provisioned automatically during registration and retried during activation. Model training is managed separately in Model Management.")
+-
+-# ---------------------------------------------------------------------
+-# Service and model status
+-# ---------------------------------------------------------------------
+-st.markdown("#### Connected pipeline services")
+-services = status.get("services", {})
+-service_cols = st.columns(4)
+-for col, service_name in zip(service_cols, ("training", "spark", "predictor", "producer")):
+-    details = services.get(service_name, {})
+-    running = details.get("running", False)
+-    col.metric(service_name.title(), "Running" if running else "Stopped")
+-
+-st.markdown("#### Model information")
+-if model.get("checkpoint_exists"):
+-    metadata = model.get("metadata") or {}
+-    m1, m2, m3 = st.columns(3)
+-    m1.metric("Model version", str(model.get("model_version") or "v1"))
+-    metric = metadata.get("best_validation_rmse_scaled")
+-    m2.metric("Validation RMSE (scaled)", f"{metric:.4f}" if isinstance(metric, (float, int)) else "Not available")
+-    m3.metric("Best epoch", str(metadata.get("best_epoch", "Not available")))
+-    st.caption(f"Checkpoint: {model.get('checkpoint_path')}")
+-else:
+-    st.info("No trained model exists yet. Train a model from Model Management before activating this station from Home.")
++    services = status.get("services", {})
++    render_status_strip([
++        (name.title(), "Running" if services.get(name, {}).get("running") else "Stopped",
++         "good" if services.get(name, {}).get("running") else "neutral")
++        for name in ("training", "spark", "predictor", "producer")
++    ])
++    if model.get("checkpoint_exists"):
++        metadata = model.get("metadata") or {}
++        st.write(f"Model version: {model.get('model_version') or 'v1'}")
++        rmse = metadata.get("best_validation_rmse_scaled")
++        st.write(f"Validation RMSE (scaled): {rmse:.4f}" if isinstance(rmse, (int, float)) else "Validation RMSE: —")
++        st.write(f"Checkpoint: `{model.get('checkpoint_path')}`")
+ 
+ # ---------------------------------------------------------------------
+ # Logs
+ # ---------------------------------------------------------------------
+-st.markdown("#### Station process logs")
+-log_service = st.selectbox("Log source", ["training", "spark", "predictor", "producer"], key="station_log_service")
+-if st.button("Refresh selected log"):
+-    try:
+-        log_data = api_get(f"/pipeline/logs/{log_service}?station={selected}")
+-        st.code(log_data.get("content", "No log output yet."), language="text")
+-    except requests.RequestException as exc:
+-        st.error(f"Could not load log: {exc}")
++with st.expander("Advanced: service logs", expanded=False):
++    st.markdown("#### Station process logs")
++    log_service = st.selectbox("Log source", ["training", "spark", "predictor", "producer"], key="station_log_service")
++    if st.button("Refresh selected log"):
++        try:
++            log_data = api_get(f"/pipeline/logs/{log_service}?station={selected}")
++            st.code(log_data.get("content", "No log output yet."), language="text")
++        except requests.RequestException as exc:
++            st.error(f"Could not load log: {exc}")
+ 
+ if st.button("Refresh station status"):
+     rerun_page()
+ 
+-st.caption("Kafka topics are created automatically during registration when the broker is available. If Kafka is temporarily unavailable, activation retries topic creation automatically.")
+ 
+ 
+ # ---------------------------------------------------------------------
+--- a/dashboard/pages/model_management.py
++++ b/dashboard/pages/model_management.py
+@@ -16,7 +16,7 @@
+     st_autorefresh = None
+ 
+ try:
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+     from dashboard.model_metrics import (
+         build_evaluation_frame, calculate_metrics, metrics_by_horizon, metrics_by_run,
+     )
+@@ -24,7 +24,7 @@
+     import sys
+     from pathlib import Path
+     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+-    from dashboard.ui import setup_page, section_title
++    from dashboard.ui import setup_page, section_title, render_status_strip
+     from dashboard.model_metrics import (
+         build_evaluation_frame, calculate_metrics, metrics_by_horizon, metrics_by_run,
+     )
+@@ -567,7 +567,7 @@
+     k1.metric("Risk-flagged forecast points", int(signals.sum()))
+     k2.metric("High-demand spike points", int(high.sum()))
+     k3.metric("Scored forecast steps", f"{int(valid.sum())}/{len(scored)}")
+-    st.caption(f"Current forecast origin: {origin.strftime('%Y-%m-%d %H:%M UTC')} · Model signature {payload.get('model_fingerprint', '—')}. Forecast-risk marks may change on later forecast origins; the earlier assessments remain recorded below.")
++    st.caption(f"Forecast origin · {origin.strftime('%Y-%m-%d %H:%M UTC')}")
+ 
+     # Graph 1: historic actuals -> future demand with detected anomaly types.
+     fig = go.Figure()
+@@ -603,7 +603,7 @@
+     dark_layout(sfig, 345).update_layout(title="Dense Autoencoder anomaly score vs active threshold",
+                                          xaxis_title="Forecast target time (UTC)", yaxis_title="Combined reconstruction score (robust-z)")
+     st.plotly_chart(sfig, use_container_width=True, config={"displayModeBar": False})
+-    st.caption("Both charts describe predicted future demand only. Actual observations at the future forecast targets are deliberately excluded from anomaly scoring.")
++
+     archived = pd.DataFrame(payload.get("history") or [])
+     with st.expander("Past forecast risk assessments (retained across refreshes)", expanded=False):
+         if archived.empty:
+@@ -629,12 +629,17 @@
+     except requests.RequestException as exc:
+         st.error(f"Could not load model component analysis: {readable_http_error(exc)}")
+         return
+-    c1, c2, c3 = st.columns(3)
+-    c1.metric("Component", "Enabled" if info.get("enabled") else "Disabled")
+-    c2.metric("Registered data", "Found" if info.get("registered_file_exists") else "Missing")
+-    c3.metric("Deployment", "Artifact ready" if info.get("deployment_exists") else "Not ready")
++    render_status_strip([
++        ("Component", "Enabled" if info.get("enabled") else "Disabled",
++         "good" if info.get("enabled") else "bad"),
++        ("Training data", "Found" if info.get("registered_file_exists") else "Missing",
++         "good" if info.get("registered_file_exists") else "warn"),
++        ("Deployment", "Ready" if info.get("deployment_exists") else "Not ready",
++         "good" if info.get("deployment_exists") else "warn"),
++    ])
+     if info.get("deployment_file"):
+-        st.caption(f"Deployment path: `{info['deployment_file']}`")
++        with st.expander("Deployment details", expanded=False):
++            st.code(info["deployment_file"], language="text")
+     complete = [item for item in records if item.get("status") in ("candidate", "deployed", "previous")]
+     if complete:
+         rows = []
+@@ -657,9 +662,10 @@
+             frame = frame.drop(columns=["Validation reconstruction loss"])
+         st.dataframe(frame, hide_index=True, use_container_width=True)
+     else:
+-        st.info("No new experiments are registered yet. Existing Amprion checkpoints can remain deployed without a Model Lab experiment entry.")
++        st.caption("No candidate experiments yet. Existing deployed checkpoints remain available.")
+     if component == "demand_anomaly":
+-        st.info("The autoencoder is unsupervised. Reconstruction loss and calibrated thresholds are model diagnostics, not a verified anomaly detection precision/recall score.")
++        with st.expander("About autoencoder metrics", expanded=False):
++            st.caption("Reconstruction loss and thresholds are model diagnostics, not validated incident-detection precision or recall.")
+         _render_anomaly_operational_performance(station)
+     else:
+         _render_renewable_operational_performance(station, component)
+@@ -867,7 +873,7 @@
+ 
+ 
+ st.title("🧠 Model Management & Model Lab")
+-st.caption("Configure algorithms, run forecasting experiments, compare results, register versions and deploy an approved model.")
++
+ 
+ try:
+     station_registry = get_json(api, "/stations")
+@@ -903,8 +909,6 @@
+     ),
+     key=f"training_component_{station}",
+ )
+-if component_payload.get("legacy_station"):
+-    st.caption("Legacy station detected: model choices were recovered from its existing demand, renewable and anomaly configuration. No re-registration is needed.")
+ 
+ # Streamlit executes *every* st.tabs body even if hidden. The old UI fetched
+ # large monitoring histories and experiment registries while users were simply
+--- a/dashboard/renewable_plot.py
++++ b/dashboard/renewable_plot.py
+@@ -105,7 +105,7 @@
+         if start is not None and pd.notna(start) and end is not None and pd.notna(end):
+             fig.update_xaxes(range=[start, end])
+         fig.update_layout(
+-            height=620, template="plotly_dark", hovermode="x unified",
++            height=500, template="plotly_dark", hovermode="x unified",
+             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(7,20,39,.55)",
+             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+             margin=dict(l=45, r=25, t=80, b=45),
+--- /dev/null
++++ b/dashboard/renewable_summary.py
+@@ -0,0 +1,67 @@
++"""Pure, replay-safe KPI summaries for the existing Solar and Wind forecast feeds.
++
++Use actuals *after* the monitoring replay watermark filter, and only the most
++recent forecast origin for each component. Do not conflate MWh interval energy
++with MW instantaneous demand; the former is MWh per source interval.
++"""
++from __future__ import annotations
++
++from typing import Any
++import math
++import pandas as pd
++
++
++def _valid_number(value: Any) -> float | None:
++    try:
++        number = float(value)
++    except (ValueError, TypeError):
++        return None
++    return number if math.isfinite(number) else None
++
++
++def _series_summary(actual: pd.DataFrame, forecast_rows: Any, actual_column: str) -> dict[str, float | None]:
++    latest_actual = None
++    if not actual.empty and {"utc_timestamp", actual_column}.issubset(actual.columns):
++        observed = actual[["utc_timestamp", actual_column]].copy()
++        observed["utc_timestamp"] = pd.to_datetime(observed["utc_timestamp"], utc=True, errors="coerce")
++        observed[actual_column] = pd.to_numeric(observed[actual_column], errors="coerce")
++        observed = observed.dropna().sort_values("utc_timestamp")
++        if not observed.empty:
++            latest_actual = _valid_number(observed[actual_column].iloc[-1])
++
++    result = {"latest_actual": latest_actual, "first_forecast": None, "peak_forecast": None,
++              "average_forecast": None, "forecast_steps": 0}
++    future = pd.DataFrame(forecast_rows or [])
++    if future.empty or "predicted_generation_mwh" not in future.columns:
++        return result
++    if "forecast_origin_utc" in future.columns:
++        future["forecast_origin_utc"] = pd.to_datetime(future["forecast_origin_utc"], utc=True, errors="coerce")
++        if future["forecast_origin_utc"].notna().any():
++            origin = future["forecast_origin_utc"].max()
++            future = future[future["forecast_origin_utc"].eq(origin)]
++    if "forecast_timestamp_utc" in future.columns:
++        future["forecast_timestamp_utc"] = pd.to_datetime(future["forecast_timestamp_utc"], utc=True, errors="coerce")
++        future = (future.dropna(subset=["forecast_timestamp_utc"])
++                        .sort_values("forecast_timestamp_utc")
++                        .drop_duplicates("forecast_timestamp_utc", keep="last"))
++    elif "horizon_step" in future.columns:
++        future["horizon_step"] = pd.to_numeric(future["horizon_step"], errors="coerce")
++        future = future.dropna(subset=["horizon_step"]).sort_values("horizon_step")
++    values = pd.to_numeric(future["predicted_generation_mwh"], errors="coerce").replace([float("inf"), -float("inf")], float("nan")).dropna()
++    if values.empty:
++        return result
++    result.update(first_forecast=float(values.iloc[0]), peak_forecast=float(values.max()),
++                  average_forecast=float(values.mean()), forecast_steps=int(len(values)))
++    return result
++
++
++def build_renewable_summaries(
++    visible_actuals: pd.DataFrame,
++    forecast_records: dict[str, list[dict[str, Any]]] | None,
++) -> dict[str, dict[str, float | None]]:
++    """Return Solar and Wind KPIs without generating more API requests."""
++    forecast_records = forecast_records or {}
++    return {
++        "solar": _series_summary(visible_actuals, forecast_records.get("solar"), "solar_actual_mwh"),
++        "wind": _series_summary(visible_actuals, forecast_records.get("wind"), "wind_actual_mwh"),
++    }
+--- /dev/null
++++ b/tests/test_compact_dashboard_ui.py
+@@ -0,0 +1,65 @@
++"""Compact dashboard contracts: meaningful renewables KPIs with replay-safe actuals."""
++from __future__ import annotations
++
++import pandas as pd
++
++from dashboard.renewable_summary import build_renewable_summaries
++
++
++def test_solar_wind_summary_uses_latest_origin_and_separate_units():
++    actual = pd.DataFrame({
++        "utc_timestamp": ["2026-10-01T00:15:00Z", "2026-10-01T00:30:00Z"],
++        "solar_actual_mwh": [1, 2], "wind_actual_mwh": [70, 80],
++    })
++    forecasts = {
++        "solar": [
++            {"forecast_origin_utc": "2026-10-01T00:00:00Z", "forecast_timestamp_utc": "2026-10-01T00:15:00Z", "predicted_generation_mwh": 1000},
++            {"forecast_origin_utc": "2026-10-01T00:30:00Z", "forecast_timestamp_utc": "2026-10-01T00:45:00Z", "predicted_generation_mwh": 3},
++            {"forecast_origin_utc": "2026-10-01T00:30:00Z", "forecast_timestamp_utc": "2026-10-01T01:00:00Z", "predicted_generation_mwh": 5},
++        ],
++        "wind": [
++            {"forecast_origin_utc": "2026-10-01T00:30:00Z", "forecast_timestamp_utc": "2026-10-01T00:45:00Z", "predicted_generation_mwh": 110},
++            {"forecast_origin_utc": "2026-10-01T00:30:00Z", "forecast_timestamp_utc": "2026-10-01T01:00:00Z", "predicted_generation_mwh": 130},
++        ],
++    }
++    result = build_renewable_summaries(actual, forecasts)
++    assert result["solar"] == {"latest_actual": 2.0, "first_forecast": 3.0, "peak_forecast": 5.0,
++                               "average_forecast": 4.0, "forecast_steps": 2}
++    assert result["wind"]["latest_actual"] == 80
++    assert result["wind"]["average_forecast"] == 120
++
++
++def test_renewable_summary_missing_or_malformed_values_are_blank_not_fake_zero():
++    partial = pd.DataFrame({"utc_timestamp": ["2026-10-01T00:00:00Z"],
++                            "solar_actual_mwh": [float("nan")]})
++    result = build_renewable_summaries(partial, {"solar": [{"predicted_generation_mwh": "bad"}]})
++    assert result["solar"]["latest_actual"] is None
++    assert result["solar"]["first_forecast"] is None
++    assert result["wind"]["latest_actual"] is None
++    assert result["wind"]["forecast_steps"] == 0
++
++
++def test_replay_watermark_is_respected_by_caller_before_summarizing():
++    from dashboard.replay_display import filter_actuals_to_cutoff
++    records = pd.DataFrame({"utc_timestamp": pd.date_range("2026-10-01T00:00:00Z", periods=3, freq="15min"),
++                            "solar_actual_mwh": [1, 2, 999], "wind_actual_mwh": [2, 3, 999]})
++    visible = filter_actuals_to_cutoff(records, pd.Timestamp("2026-10-01T00:15:00Z"), "utc_timestamp")
++    result = build_renewable_summaries(visible, {})
++    assert result["solar"]["latest_actual"] == 2
++    assert result["wind"]["latest_actual"] == 3
++
++
++def test_compact_status_markup_escapes_user_supplied_station_name(monkeypatch):
++    import types, sys
++    # The theme imports Streamlit; don't require Streamlit in this pure unit test.
++    import importlib.util
++    source = importlib.util.spec_from_file_location("compact_ui_theme_test", "dashboard/ui.py")
++    fake = types.SimpleNamespace(markdown=lambda body, unsafe_allow_html=None: captured.append(body))
++    captured = []
++    monkeypatch.setitem(sys.modules, "streamlit", fake)
++    module = importlib.util.module_from_spec(source)
++    source.loader.exec_module(module)
++    module.render_status_strip([('<script>alert(1)</script>', 'Running', 'good')])
++    assert '<script>' not in captured[0]
++    assert '&lt;script&gt;' in captured[0]
++    assert 'Running' in captured[0]
+--- /dev/null
++++ b/docs/COMPACT_CUSTOMER_DASHBOARD_PATCH.md
+@@ -0,0 +1,66 @@
++# Compact Customer Dashboard — Layout Patch
++
++## Source baseline
++Apply over Version 2 **after both** Version 2 Customer Dashboard Patch and
++Version 2 Live Model Analysis Patch. The archive preserves the original project
++structure. This patch updates dashboard UI only; it does not replace data,
++station configuration, models, backend code or checkpoints.
++
++## Changes
++
++- Monitoring: demand KPIs use smaller cards; Solar/Wind now each display latest
++  replay-visible actual, first forecast step, forecast peak and forecast average.
++  Solar/Wind values are interval energy (MWh); demand values are power (MW).
++- Monitoring: API readiness, quality-event counts, storage, raw API row counts,
++  replay details, saved-run charts and debug captions move behind sidebar
++  **Show technical details**, default OFF. The explicit **Show forecast table**
++  setting still displays the table independently.
++- Monitoring: anomalies are **not** disabled; forecast markers, saved origin
++  history, risk review and their calibrated threshold remain unchanged.
++  Data delay remains visible as a compact warning indicator.
++- Station Management: model-component inventory is collapsed initially and
++  station/pipeline status uses compact indicators rather than tall metric cards.
++- Pipeline: service status, Kafka and model readiness share one status strip.
++  Component inventory is on-demand; Kafka topics and logs are in Advanced.
++  Stop/reset and activation safety warnings remain visible.
++- Model Analysis: replace the three large configuration/deployment cards with
++  compact status indicators; keep graphs visible and place technical paths
++  inside an optional details expander.
++- Home: station state is shown once, compactly; new-customer setup steps and
++  architecture explanation are collapsed when not needed. Remove incorrect
++  LSTM-only architecture label.
++- Shared theme: tighter metric-card padding, improved informational-alert
++  contrast, slightly smaller headings, help text accessible via `?` tooltips.
++- Renewable figure height reduces from 620 to 500 while retaining two plots.
++
++## Apply (Windows)
++
++1. Stop Streamlit. Back up the project folder before overwriting any source.
++2. Extract this ZIP into the project root, retaining paths such as
++   `dashboard/pages/monitoring.py`.
++3. Restart: `streamlit run dashboard/app.py` (from the project root).
++4. On Monitoring open the sidebar to find **Show technical details**.
++   Leave unchecked for the customer-facing view.
++5. Check Demand, Solar, Wind cards against the latest 96-step forecasts and
++   verify monitoring still shows anomaly markers and two renewable plots.
++
++## Verification
++
++- Python `compileall` passed on the dashboard package.
++- 140 pytest tests passed and 5 failed in the last full suite. The five failures
++  reproduce older tests expecting pre-existing anomaly-marker labels, removed
++  graph cutoff logic, or the earlier 2-second refresh default. No new failures.
++- Focused data-summary, replay-cutoff, analysis and component UI tests passed.
++- Browser-level Streamlit rendering and Windows Kafka/Spark lifecycle were not
++  tested in this environment (Streamlit is not installed here).
++- The implementation reduces **visible** clutter and skips health/quality API
++  requests unless diagnostics is enabled. It is not a measured latency benchmark.
++
++## Data correctness
++
++Solar/Wind actual values are taken from the preexisting replay-filtered
++`/results/renewables` response, never from future observations that the replay
++has not acknowledged. The forecast summaries choose each component's latest
++forecast origin and avoid combining overlapping saved runs. When no records are
++available, the card shows an em dash, not a fabricated zero. A partial run is
++labelled `Forecast peak / Forecast average` rather than `24h peak / 24h average`.

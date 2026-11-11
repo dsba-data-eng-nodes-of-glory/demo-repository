@@ -1,0 +1,12 @@
+Version 4 Cassandra + CSV selectable operational storage patch
+
+STOP FastAPI + Streamlit + all station services first. Back up data/models/checkpoints/config.
+Extract this ZIP at the existing project root (the folder containing backend/, src/, dashboard/, config/).
+The patch changes only code files, config/storage.yaml and docs/tests. Existing config/stations.yaml and all datasets/checkpoints remain untouched.
+
+Run: python -m scripts.init_cassandra
+Optionally import existing CSV/SQLite operational history: python -m scripts.migrate_csv_to_cassandra --station amprion [--apply]
+Set backend: cassandra in config/storage.yaml; or leave backend: csv.
+Restart API, producer/Spark/predictor/quality consumer and Streamlit.
+
+See docs/CASSANDRA_ALL_COMPONENTS_V4.md before activation, especially the reset limitations and need for a live Cassandra integration test.

@@ -1,0 +1,37 @@
+# Keep CSV as the default until Cassandra has been started and verified.
+# Change backend to cassandra to activate the Cassandra implementation.
+backend: csv
+
+cassandra:
+  hosts:
+    - 127.0.0.1
+  port: 9042
+  keyspace: electricity
+  local_datacenter: datacenter1
+  username: null
+  password: null
+  connect_timeout_seconds: 10
+  request_timeout_seconds: 15
+  consistency_level: ONE
+  replication:
+    # Development only. For a real multi-node cluster use NetworkTopologyStrategy.
+    class: SimpleStrategy
+    replication_factor: 1
+  create_schema_on_start: true
+
+  # Query bounds for API reads.
+  forecast_history_days: 14
+  actual_history_months: 12
+  renewable_forecast_history_days: 14
+  renewable_actual_history_months: 12
+  anomaly_history_days: 30
+  anomaly_ttl_days: 30
+
+quality:
+  dead_letter_topic: electricity-dlq
+  max_future_skew_minutes: 5
+  enforce_non_negative_demand: true
+
+observability:
+  enabled: true
+  predictor_metrics_port: 9102

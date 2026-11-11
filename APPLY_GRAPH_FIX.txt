@@ -1,0 +1,24 @@
+ELECTRICITY DASHBOARD GRAPH FIX
+
+Scope: targeted correction for demand graph run selection and empty-actual fallback.
+This patch does not change Kafka topics, checkpoints, model files, or forecast values.
+
+FILES
+- dashboard/pages/monitoring.py
+- dashboard/forecast_selection.py
+- tests/test_forecast_selection.py
+
+APPLY
+1. Stop Streamlit and FastAPI.
+2. Back up the three matching files.
+3. Copy the files under electricity_mlop_final/ over the matching project paths.
+   Alternatively, from the electricity_mlop_final project root run:
+       patch -p1 < electricity_graph_display_fix.patch
+4. Start FastAPI, then Streamlit.
+5. Confirm the Monitoring page caption reports actual rows, forecast rows, selected run size, and forecast origin.
+
+VALIDATION
+Run from the project root:
+    pytest -q tests/test_forecast_selection.py tests/test_forecast_anomaly_strips.py
+
+The forecast selector prefers the newest complete forecast origin. Issue time is only a tie-breaker, because a restarted predictor can append an initial forecast from an older replay boundary with a later issued-at time. The dashboard now draws the forecast by itself when actual history is absent or cannot be anchored.

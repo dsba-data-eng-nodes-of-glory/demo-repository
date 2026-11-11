@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -42,12 +43,17 @@ import joblib
 import pandas as pd
 import torch
 import yaml
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
+from kafka.structs import OffsetAndMetadata, TopicPartition
 from torch import nn
 
 from src.ingestion.file_loader import load_station_csv
-from src.storage.forecast_store import append_actuals, append_forecasts
-from src.models.tabular_forecasting import LEGACY_FEATURE_SCHEMA, build_origin_features
+from src.storage.forecast_store import append_actuals, append_forecasts, storage_health
+from src.quality.validator import validate_event, quality_event
+from src.quality.event_store import record_quality_event
+from src.observability import metrics
+from src.models.tabular_forecasting import build_origin_features
+from src.models.forecast_weather import ForecastWeatherUnavailable
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -171,7 +177,7 @@ def load_model(
     device = torch.device(model_cfg.get("device", "cpu"))
     torch.set_num_threads(max(1, int(model_cfg.get("torch_num_threads", 2))))
 
-    if algorithm in {"random_forest", "gbt", "xgboost", "kmeans"} or checkpoint_path.suffix.lower() in {".joblib", ".pkl"}:
+    if algorithm in {"random_forest", "gbt", "xgboost"} or checkpoint_path.suffix.lower() in {".joblib", ".pkl"}:
         metadata_value = active.get("metadata_path")
         metadata_path = Path(metadata_value) if metadata_value else checkpoint_path.parent / "metadata.json"
         if not metadata_path.is_absolute():
@@ -184,14 +190,6 @@ def load_model(
         if checkpoint.get("algorithm") != algorithm:
             raise ValueError("Deployed algorithm and model metadata do not match.")
         model = joblib.load(checkpoint_path)
-        classifier_value = checkpoint.get("classification_artifact_path")
-        if classifier_value:
-            classifier_path = Path(classifier_value)
-            if not classifier_path.is_absolute():
-                classifier_path = ROOT / classifier_path
-            if not classifier_path.is_file():
-                raise FileNotFoundError(f"Demand classifier artifact not found: {classifier_path}")
-            checkpoint["classification_model"] = joblib.load(classifier_path)
         checkpoint["region_name"] = station_id
         checkpoint["history"] = int(checkpoint.get("history_steps", 672))
         checkpoint["horizon"] = int(checkpoint.get("horizon_steps", 96))
@@ -203,6 +201,19 @@ def load_model(
             algorithm, checkpoint_path, station_id, checkpoint["history"], checkpoint["horizon"],
         )
         return model, checkpoint, torch.device("cpu")
+
+    if algorithm in {"dense_nn", "dense", "dense_multioutput"}:
+        from src.models.demand_dense_forecaster import load_demand_dense_model
+        model, checkpoint = load_demand_dense_model(checkpoint_path, station_id, device)
+        checkpoint["algorithm"] = "dense_nn"
+        checkpoint["model_version"] = active.get("version") or station_entry.get("model_version", "dense-v1")
+        checkpoint["weather_mode"] = checkpoint.get("weather_mode", station_entry.get("forecast_weather_mode", "forecast"))
+        log.info(
+            "Loaded Dense demand model: %s | history=%d | horizon=%d | interval=%d | future weather=%s",
+            checkpoint_path, int(checkpoint["history"]), int(checkpoint["horizon"]),
+            int(checkpoint["interval_minutes"]), checkpoint["weather_mode"],
+        )
+        return model, checkpoint, device
 
     # Legacy and newly trained LSTM checkpoints retain their original feature contract.
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -273,7 +284,7 @@ def build_model_inputs(
     history_ts = pd.DatetimeIndex(
         pd.to_datetime([row["utc_timestamp"] for row in rows], utc=True)
     )
-    if len(history_ts) > 1 and not np.all(history_ts[1:] - history_ts[:-1] == interval):
+    if len(history_ts) > 1 and not np.all(np.diff(history_ts.asi8) == interval.value):
         raise ValueError(f"Historical input window is not continuous at the configured {interval_minutes}-minute interval.")
 
     demand = np.asarray([row["demand"] for row in rows], dtype=np.float32)
@@ -353,9 +364,11 @@ def generate_forecast(
     checkpoint: dict[str, Any],
     device: torch.device,
     checkpoint_path: Path,
+    forecast_weather_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     algorithm = str(checkpoint.get("algorithm", "lstm")).lower()
     region = str(checkpoint.get("region_name", checkpoint.get("station", "unknown")))
+    station_key = str(checkpoint.get("station_id", checkpoint.get("station", region)))
     history_steps = int(checkpoint["history"])
     horizon_steps = int(checkpoint["horizon"])
     interval_minutes = int(checkpoint["interval_minutes"])
@@ -369,25 +382,21 @@ def generate_forecast(
         tz="UTC",
     )
 
-    forecast_clusters = None
-    forecast_classes = None
-    if algorithm in {"random_forest", "gbt", "xgboost", "kmeans"}:
+    if algorithm in {"random_forest", "gbt", "xgboost"} or (algorithm == "dense_nn" and checkpoint.get("feature_schema") == "electricity_tabular_v1"):
         history_frame = pd.DataFrame(rows[-history_steps:])
-        features = build_origin_features(
-            history_frame, future_ts, interval_minutes,
-            feature_schema=checkpoint.get("feature_schema", LEGACY_FEATURE_SCHEMA),
-        )
+        features = build_origin_features(history_frame, future_ts, interval_minutes)
         feature_names = checkpoint.get("feature_names", list(features.columns))
         missing = set(feature_names) - set(features.columns)
         if missing:
             raise ValueError(f"Serving feature builder is missing model features: {sorted(missing)}")
-        serving_features = features.reindex(columns=feature_names)
-        predictions = np.asarray(model.predict(serving_features), dtype=float).reshape(-1)
-        if callable(getattr(model, "predict_cluster", None)):
-            forecast_clusters = model.predict_cluster(serving_features)
-        classification_model = checkpoint.get("classification_model")
-        if classification_model is not None:
-            forecast_classes = classification_model.predict(serving_features)
+        predictions = np.asarray(model.predict(features.reindex(columns=feature_names)), dtype=float).reshape(-1)
+    elif algorithm in {"dense_nn", "dense", "dense_multioutput"}:
+        if forecast_weather_path is None:
+            raise ForecastWeatherUnavailable("No forecast_weather_file is configured for the Dense demand model")
+        from src.models.demand_dense_forecaster import predict_demand
+        predictions = predict_demand(
+            rows[-history_steps:], model, checkpoint, device, forecast_weather_path, future_ts
+        )
     else:
         x_history, x_future, future_ts = build_model_inputs(rows, checkpoint)
         region = checkpoint["region_name"]
@@ -405,27 +414,28 @@ def generate_forecast(
         )
     issued_at = datetime.now(timezone.utc).isoformat()
     origin_at = pd.Timestamp(rows[-1]["utc_timestamp"]).isoformat()
-    records = []
-    for step, (timestamp, value) in enumerate(zip(future_ts, predictions), start=1):
-        record = {
-            "station_id": region,
+    model_version = str(checkpoint.get("model_version", "legacy"))
+    experiment_id = str(checkpoint.get("experiment_id", ""))
+    # Stable identity for retrying the same origin/model after a crash. A new
+    # model version or experiment produces a distinct forecast run.
+    forecast_run_id = f"{station_key}|{origin_at}|{algorithm}|{model_version}|{experiment_id}"
+    return [
+        {
+            "station_id": station_key,
             "forecast_issued_at_utc": issued_at,
             "forecast_origin_utc": origin_at,
+            "forecast_run_id": forecast_run_id,
             "forecast_timestamp_utc": timestamp.isoformat(),
             "horizon_step": step,
             "predicted_demand": float(value),
             "model_file": checkpoint_path.name,
-            "model_version": checkpoint.get("model_version", "legacy"),
+            "model_version": model_version,
             "algorithm": algorithm,
-            "experiment_id": checkpoint.get("experiment_id", ""),
+            "experiment_id": experiment_id,
             "weather_mode": checkpoint.get("weather_mode", "last_observed_temperature_persistence"),
         }
-        if forecast_clusters is not None:
-            record["predicted_cluster"] = int(forecast_clusters[step - 1])
-        if forecast_classes is not None:
-            record["predicted_demand_class"] = str(forecast_classes[step - 1])
-        records.append(record)
-    return records
+        for step, (timestamp, value) in enumerate(zip(future_ts, predictions), start=1)
+    ]
 
 
 def parse_event(payload: dict[str, Any]) -> dict[str, Any]:
@@ -489,6 +499,12 @@ def main() -> None:
             f"Unknown station '{args.station}'. Configured stations: {list(stations)}"
         )
     station = stations[args.station]
+    forecast_weather_value = station.get("forecast_weather_file")
+    forecast_weather_path = Path(forecast_weather_value) if forecast_weather_value else None
+    if forecast_weather_path is not None and not forecast_weather_path.is_absolute():
+        forecast_weather_path = ROOT / forecast_weather_path
+    if str(station.get("model_algorithm", "")).lower() in {"dense_nn", "dense", "dense_multioutput"}:
+        log.info("Demand future-weather source: %s", forecast_weather_path)
 
     # ------------------------------------------------------------------
     # 1. LOAD MODEL AND INITIAL HISTORY
@@ -527,7 +543,7 @@ def main() -> None:
     seed_timestamps = pd.DatetimeIndex(seed_frame["utc_timestamp"])
     if len(seed_timestamps) != history_steps or (
         len(seed_timestamps) > 1
-        and not np.all(seed_timestamps[1:] - seed_timestamps[:-1] == interval)
+        and not np.all(np.diff(seed_timestamps.asi8) == interval.value)
     ):
         raise ValueError(
             f"The last {history_steps} rows in {history_path} are not a continuous "
@@ -572,179 +588,360 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Forecast cadence is counted in station observations, not wall-clock minutes.
-    forecast_every = int(model_config.get("forecast_every_steps", 1))
+    forecast_every = int(
+        station.get("forecast_every_steps", model_config.get("forecast_every_steps", 4))
+    )
     if forecast_every <= 0:
         raise ValueError("forecast_every_steps in config/model.yaml must be positive.")
 
     # ------------------------------------------------------------------
     # 3. INITIAL FORECAST FROM THE CONFIGURED HISTORY WINDOW
     # ------------------------------------------------------------------
-    initial_records = generate_forecast(
-        list(buffer), model, checkpoint, device, checkpoint_path
-    )
-    initial_saved = append_forecasts(output_path, initial_records)
-    log.info(
-        "Initial forecast saved: rows=%d (storage reported %d) | origin=%s | "
-        "first target=%s | final target=%s",
-        len(initial_records),
-        initial_saved,
-        initial_records[0]["forecast_origin_utc"],
-        initial_records[0]["forecast_timestamp_utc"],
-        initial_records[-1]["forecast_timestamp_utc"],
-    )
+    renewable_runner = None
+    renewable_cfg = station.get("renewables") or {}
+    try:
+        if renewable_cfg.get("enabled"):
+            from src.models.renewable_forecaster import AmprionRenewableForecaster
+            renewable_runner = AmprionRenewableForecaster(ROOT, args.station, renewable_cfg, device=torch.device("cpu"))
+    except Exception as exc:
+        # Demand forecasting remains available if optional renewable assets/data are not ready.
+        log.exception("Renewable forecaster could not be initialized; demand pipeline will continue: %s", exc)
+        renewable_runner = None
 
-    # valid_count tracks accepted Kafka observations only. The startup forecast
-    # is the baseline, so the first subsequent Kafka event can trigger a new run.
+    latest_demand_for_residual: list[dict[str, Any]] = []
+
+    def score_residual_when_aligned(origin_timestamp: pd.Timestamp, renewable_records: list[dict]) -> None:
+        """Persist residual risk after all three independent model forecasts exist.
+
+        Optional anomaly scoring cannot hold Kafka offsets hostage: the three
+        primary forecasts remain valid even if residual scoring needs data.
+        """
+        if not station.get('residual_model_checkpoint') or not latest_demand_for_residual:
+            return
+        try:
+            from src.models.residual.service import score_and_store
+            # Read calibration at each forecast origin. The dashboard can change
+            # per-station thresholds while the predictor is already running.
+            runtime_station = dict(station)
+            try:
+                live_station = (load_yaml('config/stations.yaml').get('stations') or {}).get(args.station, {})
+                for key in ('residual_detection_settings', 'residual_alert_settings'):
+                    if key in live_station:
+                        runtime_station[key] = live_station[key]
+                    else:
+                        runtime_station.pop(key, None)
+            except (OSError, ValueError, yaml.YAMLError) as exc:
+                log.warning('Using previous station calibration; settings reload failed: %s', exc)
+            result = score_and_store(
+                root=ROOT, station=args.station, cfg=runtime_station,
+                demand_forecasts=latest_demand_for_residual,
+                renewable_forecasts=renewable_records,
+                demand_history=list(buffer),
+                origin_utc=origin_timestamp.isoformat(), history_runs=1,
+            )
+            if result.get('available'):
+                log.info('Residual spike detector scored %s steps for %s | flagged intervals=%s',
+                         len(result.get('records', [])), origin_timestamp,
+                         sum(bool(r.get('upward_highlight')) for r in result.get('records', [])))
+            else:
+                log.debug('Residual anomaly waiting: %s', result.get('message'))
+        except Exception as exc:
+            log.warning('Residual scoring is unavailable for origin %s: %s', origin_timestamp, exc)
+
+    def persist_renewable_forecast(origin_timestamp: pd.Timestamp) -> int:
+        if renewable_runner is None:
+            return 0
+        records = renewable_runner.forecast_at(origin_timestamp)
+        if not records:
+            log.warning(
+                "No solar/wind forecast records generated at origin=%s. "
+                "Check renewable model logs, 672-step history continuity, and all 96 future "
+                "forecast-weather rows in solar_test.csv/wind_test.csv.",
+                pd.Timestamp(origin_timestamp).isoformat(),
+            )
+            return 0
+        from src.storage.renewable_store import append_renewable_forecasts
+        renewable_value = station.get("renewable_forecasts_file") or f"data/processed/stations/{args.station}/renewable_forecasts.csv"
+        renewable_path = Path(renewable_value)
+        if not renewable_path.is_absolute():
+            renewable_path = ROOT / renewable_path
+        saved_count = append_renewable_forecasts(renewable_path, records)
+        log.info("Persisted renewable forecast rows=%d | origin=%s", saved_count, origin_timestamp.isoformat())
+        score_residual_when_aligned(origin_timestamp, records)
+        return saved_count
+
+    try:
+        initial_records = generate_forecast(
+            list(buffer), model, checkpoint, device, checkpoint_path, forecast_weather_path
+        )
+    except ForecastWeatherUnavailable as exc:
+        initial_records = []
+        log.warning("Initial demand forecast skipped: %s", exc)
+    if initial_records:
+        initial_saved = append_forecasts(output_path, initial_records)
+        log.info(
+            "Initial forecast saved: rows=%d (storage reported %d) | origin=%s | first target=%s | final target=%s",
+            len(initial_records), initial_saved, initial_records[0]["forecast_origin_utc"],
+            initial_records[0]["forecast_timestamp_utc"], initial_records[-1]["forecast_timestamp_utc"],
+        )
+    latest_demand_for_residual = initial_records if initial_records else []
+    persist_renewable_forecast(pd.Timestamp(buffer[-1]["utc_timestamp"]))
+
+
+    # Offsets are committed only after actuals/forecasts are durably written or
+    # an invalid event has been acknowledged by the DLQ (at-least-once delivery).
     received_count = 0
     valid_count = 0
     last_forecast_valid_count: int | None = 0
+    last_renewable_valid_count: int | None = 0
+    renewable_every = max(1, int(renewable_cfg.get("forecast_every_steps", 4)))
     actual_batch: list[dict[str, Any]] = []
+    renewable_actual_batch: list[dict[str, Any]] = []
+    from src.storage.renewable_store import append_renewable_actuals
+    generation_actual_path = ROOT / "data" / "processed" / "stations" / args.station / "renewable_actuals.csv"
     last_actual_flush = time.monotonic()
     last_progress_log = 0
+    processing_failed = False
+
+    storage_cfg = load_yaml("config/storage.yaml") if (ROOT / "config/storage.yaml").exists() else {}
+    observability_cfg = storage_cfg.get("observability", {})
+    quality_cfg = storage_cfg.get("quality", {})
+    station_order = list(stations).index(args.station) if args.station in stations else 0
+    metrics_port = int(observability_cfg.get("predictor_metrics_port", 9102)) + station_order
+    metrics.start_metrics_server(
+        metrics_port,
+        bool(observability_cfg.get("enabled", True)),
+    )
+    health = storage_health()
+    if metrics.STORAGE_UP is not None:
+        metrics.STORAGE_UP.set(1 if health.get("available") else 0)
+    log.info("Operational storage: %s", health)
 
     def flush_actuals() -> None:
         nonlocal last_actual_flush
         if actual_batch:
+            # Keep records in memory until the backend confirms persistence.
             saved = append_actuals(actual_output_path, actual_batch)
-            log.info("Saved %d actual observations to %s", saved, actual_output_path)
+            log.info("Persisted %d actual observations using %s storage", saved, health.get("backend"))
+            # Write generation before releasing demand batch / committing offsets.
+            # Duplicate retries use deterministic (station,kind,timestamp) keys.
+            if renewable_actual_batch:
+                append_renewable_actuals(generation_actual_path, renewable_actual_batch)
+                renewable_actual_batch.clear()
             actual_batch.clear()
         last_actual_flush = time.monotonic()
 
     # ------------------------------------------------------------------
-    # 4. KAFKA CONSUMER
+    # 4. KAFKA CONSUMER + DEAD-LETTER PRODUCER
     # ------------------------------------------------------------------
     configured_group = f"{kafka_config['consumer_group']}-{args.station}"
     if args.replay:
         consumer_group = f"{configured_group}-replay-{uuid.uuid4().hex[:10]}"
         offset_policy = "earliest"
-        log.info(
-            "Replay mode: fresh group '%s' starts at the earliest available featured offset.",
-            consumer_group,
-        )
+        log.info("Replay mode: fresh group '%s' starts at earliest featured offset.", consumer_group)
     else:
         consumer_group = configured_group
         offset_policy = "earliest"
-        log.info(
-            "Normal mode: using group '%s' (resumes its committed offset when present).",
-            consumer_group,
-        )
+        log.info("Normal mode: using group '%s' and its committed offset.", consumer_group)
 
+    kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS") or kafka_config["bootstrap_servers"]
     consumer = KafkaConsumer(
         station["featured_topic"],
-        bootstrap_servers=kafka_config["bootstrap_servers"],
+        bootstrap_servers=kafka_bootstrap,
         group_id=consumer_group,
         auto_offset_reset=offset_policy,
-        enable_auto_commit=True,
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
+        enable_auto_commit=False,
+        value_deserializer=lambda value: value,
+        max_poll_records=int(kafka_config.get("max_poll_records", 100)),
+    )
+    dlq_topic = str(storage_cfg.get("quality", {}).get("dead_letter_topic")
+                    or kafka_config.get("dead_letter_topic", "electricity-dlq"))
+    dlq_producer = KafkaProducer(
+        bootstrap_servers=kafka_bootstrap,
+        key_serializer=lambda value: value.encode("utf-8"),
+        value_serializer=lambda value: json.dumps(value, default=str).encode("utf-8"),
+        acks="all",
+        retries=10,
+        max_in_flight_requests_per_connection=1,
     )
 
-    log.info(
-        "Listening to featured topic '%s' for station '%s'.",
-        station["featured_topic"],
-        args.station,
-    )
-    log.info(
-        "History=%d | horizon=%d | interval=%d minutes | forecast cadence=%d observation(s)",
-        history_steps,
-        horizon_steps,
-        interval_minutes,
-        forecast_every,
-    )
-    log.info("Actual output: %s", actual_output_path)
-    log.info("Forecast output: %s", output_path)
+    last_safe_message = None
+
+    def commit_message(message: Any) -> None:
+        nonlocal last_safe_message
+        tp = TopicPartition(message.topic, message.partition)
+        consumer.commit({tp: OffsetAndMetadata(message.offset + 1, None)})
+        last_safe_message = message
+
+    def send_to_dlq(raw_value: bytes, issue: dict[str, str], message: Any) -> None:
+        dlq_record = {
+            "station_id": args.station,
+            "error": issue["message"],
+            "rule_name": issue["rule_name"],
+            "severity": issue["severity"],
+            "source_topic": message.topic,
+            "source_partition": message.partition,
+            "source_offset": message.offset,
+            "received_at_utc": datetime.now(timezone.utc).isoformat(),
+            "raw_value": raw_value.decode("utf-8", errors="replace"),
+        }
+        # Wait for Kafka acknowledgement before committing the source offset.
+        dlq_producer.send(dlq_topic, key=args.station, value=dlq_record).get(timeout=30)
+        # A separate shared DLQ consumer persists the quality event. The DLQ
+        # acknowledgement is sufficient to commit the source event here.
+        if metrics.EVENTS_REJECTED is not None:
+            metrics.EVENTS_REJECTED.labels(args.station, issue["rule_name"]).inc()
+        log.warning("Routed invalid event to DLQ topic=%s partition=%s offset=%s rule=%s",
+                    dlq_topic, message.partition, message.offset, issue["rule_name"])
+
+    log.info("Listening to featured topic '%s' for station '%s'.", station["featured_topic"], args.station)
+    log.info("History=%d | horizon=%d | interval=%d minutes | forecast cadence=%d observation(s)",
+             history_steps, horizon_steps, interval_minutes, forecast_every)
+    log.info("Metrics endpoint: :%s/metrics", metrics_port)
 
     try:
         for message in consumer:
             received_count += 1
+            if metrics.EVENTS_RECEIVED is not None:
+                metrics.EVENTS_RECEIVED.labels(args.station).inc()
+            started_at = time.perf_counter()
+            raw_value = message.value or b""
             try:
-                payload = message.value
-                if payload.get("station_id") not in (None, args.station):
-                    continue
+                payload = json.loads(raw_value.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                send_to_dlq(raw_value, {
+                    "rule_name": "invalid_json", "severity": "error",
+                    "message": "Kafka value is not valid UTF-8 JSON.",
+                }, message)
+                flush_actuals()
+                commit_message(message)
+                continue
 
-                event = parse_event(payload)
-                event_ts = event["utc_timestamp"]
-                last_buffer_ts = buffer[-1]["utc_timestamp"] if buffer else None
+            previous_ts = buffer[-1]["utc_timestamp"] if buffer else None
+            event, issues = validate_event(
+                payload, args.station, interval_minutes, previous_timestamp=previous_ts,
+                max_future_skew_minutes=int(quality_cfg.get("max_future_skew_minutes", 5)),
+            )
+            if event is None:
+                # Invalid records are recoverable from DLQ. Storage/model failures
+                # below stop the consumer without committing the current offset.
+                send_to_dlq(raw_value, issues[0], message)
+                flush_actuals()
+                commit_message(message)
+                continue
 
-                # Ignore old/duplicate messages that may already exist in Kafka
-                # from an earlier run. The stream must begin after the seed file.
-                if last_buffer_ts is not None and event_ts <= last_buffer_ts:
-                    log.debug(
-                        "Skipping duplicate/old Kafka timestamp %s (history ends at %s).",
-                        event_ts,
-                        last_buffer_ts,
-                    )
-                    continue
+            event_ts = event["utc_timestamp"]
+            last_buffer_ts = buffer[-1]["utc_timestamp"] if buffer else None
+            if last_buffer_ts is not None and event_ts <= last_buffer_ts:
+                # Duplicate/replayed observation already represented by history.
+                # Flush preceding accepted events before committing past them.
+                flush_actuals()
+                commit_message(message)
+                continue
 
-                # The first incoming message should be exactly one interval after
-                # the seed. Any later gap resets the buffer to avoid forecasting
-                # from a non-contiguous sequence.
-                if last_buffer_ts is not None and event_ts - last_buffer_ts != interval:
-                    log.error(
-                        "Timestamp gap detected: %s -> %s. Resetting history buffer; "
-                        "forecasting resumes after %d contiguous observations.",
-                        last_buffer_ts,
-                        event_ts,
-                        history_steps,
-                    )
-                    buffer.clear()
-                    last_forecast_valid_count = None
+            if last_buffer_ts is not None and event_ts - last_buffer_ts != interval:
+                gap_issue = {
+                    "rule_name": "interval_gap", "severity": "warning",
+                    "message": f"Expected {interval}; observed {event_ts - last_buffer_ts}.",
+                }
+                message_time = (datetime.fromtimestamp(message.timestamp / 1000, tz=timezone.utc)
+                                if message.timestamp is not None and message.timestamp >= 0
+                                else datetime.now(timezone.utc))
+                record_quality_event(quality_event(
+                    args.station, gap_issue, message.topic, message.partition, message.offset,
+                    event_timestamp=message_time,
+                ))
+                log.warning("Timestamp gap detected %s -> %s; rebuilding contiguous history.",
+                            last_buffer_ts, event_ts)
+                buffer.clear()
+                last_forecast_valid_count = None
+                last_renewable_valid_count = None
 
-                buffer.append(event)
-                valid_count += 1
+            buffer.append(event)
+            valid_count += 1
+            if metrics.EVENTS_ACCEPTED is not None:
+                metrics.EVENTS_ACCEPTED.labels(args.station).inc()
+            if metrics.LAST_EVENT_TIMESTAMP is not None:
+                metrics.LAST_EVENT_TIMESTAMP.labels(args.station).set(event_ts.timestamp())
 
-                actual_batch.append(
-                    {
-                        "station_id": args.station,
-                        "utc_timestamp": event_ts.isoformat(),
-                        "actual_demand": event["demand"],
-                        "temperature": event["temperature"],
-                    }
-                )
-                if len(actual_batch) >= 100 or time.monotonic() - last_actual_flush >= 5:
-                    flush_actuals()
+            actual_batch.append({
+                "station_id": args.station,
+                "utc_timestamp": event_ts.isoformat(),
+                "actual_demand": event["demand"],
+                "temperature": event["temperature"],
+            })
+            if renewable_runner is not None:
+                renewable_actual_batch.extend(renewable_runner.observations_at(event_ts))
 
-                should_forecast = (
-                    len(buffer) >= history_steps
-                    and (
-                        last_forecast_valid_count is None
-                        or valid_count - last_forecast_valid_count >= forecast_every
-                    )
-                )
-                if should_forecast:
+            should_forecast = (
+                len(buffer) >= history_steps
+                and (last_forecast_valid_count is None
+                     or valid_count - last_forecast_valid_count >= forecast_every)
+            )
+            should_flush = (
+                len(actual_batch) >= int(kafka_config.get("storage_batch_size", 100))
+                or time.monotonic() - last_actual_flush >= float(kafka_config.get("storage_flush_seconds", 5))
+                or should_forecast
+            )
+
+            if should_forecast:
+                flush_actuals()
+                try:
                     records = generate_forecast(
-                        list(buffer), model, checkpoint, device, checkpoint_path
+                        list(buffer), model, checkpoint, device, checkpoint_path, forecast_weather_path
                     )
+                except ForecastWeatherUnavailable as exc:
+                    # Missing forecasts are not imputed from future observations. Persist actuals and keep consuming.
+                    records = []
+                    log.warning("Demand forecast skipped at %s: %s", event_ts.isoformat(), exc)
+                if records:
                     saved = append_forecasts(output_path, records)
-                    log.info(
-                        "Saved %d forecast rows (storage reported %d); origin=%s; "
-                        "first target=%s; final target=%s",
-                        len(records),
-                        saved,
-                        records[0]["forecast_origin_utc"],
-                        records[0]["forecast_timestamp_utc"],
-                        records[-1]["forecast_timestamp_utc"],
-                    )
-                    last_forecast_valid_count = valid_count
+                    log.info("Persisted forecast points=%d | origin=%s | target=%s..%s",
+                             saved, records[0]["forecast_origin_utc"],
+                             records[0]["forecast_timestamp_utc"], records[-1]["forecast_timestamp_utc"])
+                    if metrics.FORECAST_RUNS is not None:
+                        metrics.FORECAST_RUNS.labels(args.station, str(records[0].get("algorithm", "unknown"))).inc()
+                        metrics.FORECAST_POINTS.labels(args.station).inc(saved)
+                latest_demand_for_residual = records if records else []
+                last_forecast_valid_count = valid_count
+                if renewable_runner is not None and (
+                    last_renewable_valid_count is None
+                    or valid_count - last_renewable_valid_count >= renewable_every
+                ):
+                    persist_renewable_forecast(event_ts)
+                    last_renewable_valid_count = valid_count
+                commit_message(message)
+            elif should_flush:
+                flush_actuals()
+                commit_message(message)
 
-                if valid_count - last_progress_log >= 100:
-                    log.info(
-                        "Kafka received=%s | valid=%s | history buffer=%s/%s",
-                        f"{received_count:,}",
-                        f"{valid_count:,}",
-                        len(buffer),
-                        history_steps,
-                    )
-                    last_progress_log = valid_count
-
-            except Exception:
-                log.exception("Failed to process Kafka offset %s", message.offset)
+            if metrics.PROCESSING_SECONDS is not None:
+                metrics.PROCESSING_SECONDS.labels(args.station).observe(time.perf_counter() - started_at)
+            if valid_count - last_progress_log >= 100:
+                log.info("Kafka received=%s | valid=%s | history buffer=%s/%s",
+                         f"{received_count:,}", f"{valid_count:,}", len(buffer), history_steps)
+                last_progress_log = valid_count
 
     except KeyboardInterrupt:
-        log.info("Stopping predictor.")
+        log.info("Stopping predictor after graceful interrupt.")
+    except Exception:
+        processing_failed = True
+        log.exception("Predictor stopped because processing/persistence failed; current Kafka offset is not committed.")
+        raise
     finally:
-        flush_actuals()
-        consumer.close()
-        log.info("Kafka consumer closed.")
+        try:
+            flush_actuals()
+            if not processing_failed and last_safe_message is not None:
+                tp = TopicPartition(last_safe_message.topic, last_safe_message.partition)
+                consumer.commit({tp: OffsetAndMetadata(last_safe_message.offset + 1, None)})
+        finally:
+            consumer.close()
+            dlq_producer.flush()
+            dlq_producer.close()
+            if health.get("backend") == "cassandra":
+                from src.storage.cassandra_store import close as close_cassandra
+                close_cassandra()
+            log.info("Kafka consumer and DLQ producer closed.")
 
 
 if __name__ == "__main__":

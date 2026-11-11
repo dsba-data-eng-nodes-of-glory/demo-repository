@@ -1,2 +1,14 @@
 bootstrap_servers: "127.0.0.1:9092"
 consumer_group: "amprion-lstm-consumer"
+
+# Single-broker local defaults. In a multi-broker cluster set replication_factor: 3
+# and min_insync_replicas: 2. For per-station topics, one partition preserves
+# total station ordering; scale across stations first.
+topic_partitions: 1
+replication_factor: 1
+min_insync_replicas: 1
+dead_letter_topic: electricity-dlq
+storage_batch_size: 50
+storage_flush_seconds: 5
+max_poll_records: 100
+producer_retries: 10

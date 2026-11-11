@@ -74,10 +74,10 @@ def upsert_experiment(record: dict[str, Any]) -> dict[str, Any]:
     return get_experiment(str(record["experiment_id"])) or record
 
 
-def next_version(station: str, algorithm: str) -> str:
+def next_version(station: str, algorithm: str, component: str = "demand_forecast") -> str:
     versions = []
     for item in list_experiments(station):
-        if item.get("algorithm") == algorithm:
+        if item.get("algorithm") == algorithm and item.get("component", "demand_forecast") == component:
             value = str(item.get("version", "v0")).lstrip("v")
             try:
                 versions.append(int(value))

@@ -1,0 +1,12 @@
+AMPRION FASTAPI RENEWABLES TIMEOUT HOTFIX
+
+1. Stop FastAPI and Streamlit.
+2. Extract this ZIP into the electricity_mlop_final project root and replace files.
+3. Restart FastAPI:
+   python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+4. Restart Streamlit:
+   python -m streamlit run dashboard/app.py
+5. Verify:
+   python -m scripts.diagnose_monitoring_api --api http://127.0.0.1:8000 --station amprion --end-time 2026-10-02T11:00:00Z
+
+No model retraining, Kafka reset, Spark reset, or forecast-data deletion is required.

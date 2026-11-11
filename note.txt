@@ -1,0 +1,38 @@
+#haddop Configuration 
+The project uses:
+              C:\hadoop\bin\winutils.exe
+Current CMD:
+             set HADOOP_HOME=C:\hadoop
+             set PATH=C:\hadoop\bin;%PATH%
+Verify:
+             echo %HADOOP_HOME%
+             where winutils
+
+#Kafta Configuration
+open Directory
+            cd C:\kafka_2.13-4.3.1
+Generate Cluster ID     
+            bin\windows\kafka-storage.bat random-uuid   
+Format Custer ID
+            bin\windows\kafka-storage.bat format -t YOUR_CLUSTER_ID -c config\server.properties 
+Start the Broker
+            bin\windows\kafka-server-start.bat config\server.properties
+Kafta Error resolution
+            attrib -R "C:\tmp\kraft-combined-logs\*.*" /S
+
+# Conda Envionment (note u need to configure hadoop in every environment)
+            conda create -n electricity-spark python=3.10 -y
+            conda activate electricity-spark
+           python -m pip install pyspark==3.5.6 pandas kafka-python
+
+ python -m streamlit run dashboard.py       
+
+ #Setting up Githun
+
+            git clone https://github.com/YOUR_USERNAME/electricity-demand-forecasting.git
+            cd electricity-demand-forecasting
+            conda env create -f environment.yml
+            python -c "import pyspark, streamlit, pandas, plotly; print('Environment ready')"
+
+            python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --workers 1
+            

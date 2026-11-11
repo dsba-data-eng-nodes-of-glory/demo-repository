@@ -1,0 +1,11 @@
+# Use this when running application processes on the host against the Compose Kafka cluster.
+# The three listener ports are exposed on localhost by docker-compose.scale.yml.
+bootstrap_servers: "localhost:19092,localhost:29092,localhost:39092"
+consumer_group: electricity-forecast-consumer
+topic_partitions: 1
+replication_factor: 3
+min_insync_replicas: 2
+dead_letter_topic: electricity-dlq
+storage_batch_size: 1
+storage_flush_seconds: 5
+max_poll_records: 100

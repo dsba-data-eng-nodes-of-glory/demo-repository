@@ -8,12 +8,12 @@ import requests
 import streamlit as st
 
 try:
-    from dashboard.ui import setup_page, section_title
+    from dashboard.ui import setup_page, section_title, render_status_strip
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from dashboard.ui import setup_page, section_title
+    from dashboard.ui import setup_page, section_title, render_status_strip
 
 api = setup_page("Platform Overview", "home")
 
@@ -41,20 +41,35 @@ model_statuses: dict[str, dict] = {}
 backend_error = None
 
 try:
-    registry = api_get("/stations")
-    pipeline = api_get("/pipeline/status")
+    # One batched endpoint replaces 2N+2 requests for N stations. Fall back to
+    # the old endpoints for compatibility with users updating only the UI.
+    try:
+        overview = api_get("/stations/overview", timeout=12)
+        registry = {"stations": overview.get("stations", {}), "active_station": overview.get("active_station")}
+        station_statuses = overview.get("statuses", {})
+        station_components = overview.get("components", {})
+        pipeline = {"kafka_tcp_available": overview.get("kafka_tcp_available")}
+        model_statuses = {
+            key: {"checkpoint_exists": details.get("model_ready", False)}
+            for key, details in station_statuses.items()
+        }
+    except requests.HTTPError as missing_endpoint:
+        if missing_endpoint.response is None or missing_endpoint.response.status_code != 404:
+            raise
+        registry = api_get("/stations")
+        pipeline = api_get("/pipeline/status")
+        station_components = {}
+        for station_id in registry.get("stations", {}):
+            try:
+                station_statuses[station_id] = api_get(f"/stations/{station_id}/status", timeout=5)
+                model_statuses[station_id] = api_get("/models/status", {"station": station_id}, timeout=5)
+            except requests.RequestException:
+                station_statuses[station_id] = {}
+                model_statuses[station_id] = {}
     backend_ok = True
-    for station_id in registry.get("stations", {}):
-        try:
-            station_statuses[station_id] = api_get(f"/stations/{station_id}/status", timeout=5)
-        except requests.RequestException:
-            station_statuses[station_id] = {}
-        try:
-            model_statuses[station_id] = api_get("/models/status", {"station": station_id}, timeout=5)
-        except requests.RequestException:
-            model_statuses[station_id] = {}
 except requests.RequestException as exc:
     backend_error = str(exc)
+    station_components = {}
 
 stations = registry.get("stations", {}) if backend_ok else {}
 station_ids = list(stations.keys())
@@ -69,7 +84,10 @@ running_services = sum(
     for service in status.get("services", {}).values()
     if service.get("running")
 )
-model_count = sum(1 for model in model_statuses.values() if model.get("checkpoint_exists"))
+model_count = sum(
+    sum(bool(component.get("checkpoint_exists")) for component in parts.values())
+    for parts in station_components.values()
+) if station_components else sum(1 for model in model_statuses.values() if model.get("checkpoint_exists"))
 active_count = sum(
     1 for status in station_statuses.values()
     if status.get("lifecycle_status") == "active"
@@ -84,8 +102,8 @@ with hero_left:
         '<div class="ef-hero">'
         '<div class="ef-eyebrow">● &nbsp; DATA ENGINEERING&nbsp; · &nbsp; STREAMING ANALYTICS</div>'
         '<h1>Electricity Demand<br><span class="ef-gradient">Forecasting Platform</span></h1>'
-        '<p>A scalable, end-to-end workspace for multi-station electricity demand forecasting. '
-        'Connect data ingestion, Kafka streaming, Spark feature engineering and station-specific LSTM models.</p>'
+        '<p>Configure stations, compare trained models and monitor demand forecasts. '
+        'Review forecast spike risk and renewable generation before operational decisions.</p>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -119,14 +137,56 @@ with hero_right:
 # Summary metrics
 # ---------------------------------------------------------------------
 section_title("Live platform overview", "A quick view of registered stations, deployed models and running services.")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Registered stations", len(station_ids) if backend_ok else "—")
-k2.metric("Active stations", active_count if backend_ok else "—")
-k3.metric("Models available", model_count if backend_ok else "—")
-k4.metric("Running services", running_services if backend_ok else "—")
+@st.fragment(run_every=2.0)
+def render_live_overview_metrics() -> None:
+    # One batched call per refresh; do not rerender station controls/cards.
+    try:
+        current = api_get("/stations/overview", timeout=5)
+    except requests.RequestException:
+        # Initial values remain useful if the endpoint temporarily stalls or
+        # a legacy backend does not support the batched endpoint.
+        current = None
+    if current is None:
+        counts = (len(station_ids) if backend_ok else "—",
+                  active_count if backend_ok else "—",
+                  model_count if backend_ok else "—",
+                  running_services if backend_ok else "—")
+    else:
+        current_stations = current.get("stations") or {}
+        current_statuses = current.get("statuses") or {}
+        current_components = current.get("components") or {}
+        counts = (
+            len(current_stations),
+            sum(1 for item in current_statuses.values() if item.get("lifecycle_status") == "active"),
+            (sum(sum(bool(comp.get("checkpoint_exists")) for comp in comps.values())
+                 for comps in current_components.values())
+             if current_components else sum(bool(item.get("model_ready"))
+                                            for item in current_statuses.values())),
+            sum(1 for item in current_statuses.values()
+                for service in (item.get("services") or {}).values() if service.get("running")),
+        )
+    k1, k2, k3, k4 = st.columns(4)
+    for column, label, value in zip((k1, k2, k3, k4),
+                                   ("Registered stations", "Active stations", "Deployed model components", "Running services"), counts):
+        column.metric(label, value)
+
+
+render_live_overview_metrics()
 
 if not backend_ok:
     st.error(f"FastAPI is not reachable at {api}. Start the backend to load live platform information.\n\n{backend_error}")
+
+with st.expander("New station? Quick setup", expanded=not bool(station_ids)):
+    quick1, quick2, quick3 = st.columns(3, gap="small")
+    with quick1:
+        st.markdown("**1. Add station**")
+        st.page_link("pages/station_management.py", label="Register", icon="📡", use_container_width=True)
+    with quick2:
+        st.markdown("**2. Train model**")
+        st.page_link("pages/model_management.py", label="Model Lab", icon="🧠", use_container_width=True)
+    with quick3:
+        st.markdown("**3. Monitor**")
+        st.page_link("pages/pipeline_control.py", label="Pipeline", icon="⚙️", use_container_width=True)
 
 # ---------------------------------------------------------------------
 # Registered station cards and independent lifecycle controls
@@ -166,22 +226,16 @@ if backend_ok and station_ids:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-                st.caption(f"Station ID: `{station_id}`")
-                m1, m2, m3 = st.columns(3)
-                m1.markdown(
-                    f'<div style="border:1px solid {state_color}55;background:{state_color}12;'
-                    f'border-radius:12px;padding:10px 12px;min-height:86px;">'
-                    f'<div style="font-size:13px;color:#9db3cd;">State</div>'
-                    f'<div style="font-size:21px;line-height:1.35;font-weight:700;color:{state_color};">'
-                    f'{state_label.title()}</div></div>',
-                    unsafe_allow_html=True,
-                )
-                m2.metric("Model", "Ready" if model_ready else "Not trained")
-                m3.metric("Kafka topics", "Ready" if topics_ready else "Check")
-                st.caption(
-                    f"Raw: `{entry.get('raw_topic', station_id + '-raw')}`  ·  "
-                    f"Featured: `{entry.get('featured_topic', station_id + '-featured')}`"
-                )
+                render_status_strip([
+                    ("Demand", "Ready" if model_ready else "Needs training", "good" if model_ready else "warn"),
+                    ("Kafka topics", "Ready" if topics_ready else "Check", "good" if topics_ready else "warn"),
+                ])
+                with st.expander("Station details", expanded=False):
+                    st.code(station_id, language="text")
+                    st.caption(
+                        f"Raw: `{entry.get('raw_topic', station_id + '-raw')}` · "
+                        f"Featured: `{entry.get('featured_topic', station_id + '-featured')}`"
+                    )
                 b1, b2, b3 = st.columns(3)
                 with b1:
                     if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=(is_active or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
@@ -194,7 +248,11 @@ if backend_ok and station_ids:
                             detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
                             st.error(f"Activation failed: {detail}")
                 with b2:
-                    if st.button("Stop + reset", key=f"home_stop_{station_id}", disabled=not is_active, use_container_width=True, help="Stops this station and automatically clears its Kafka records, Spark checkpoint and station result files. Source CSVs and trained model are retained."):
+                    with st.popover("Stop / reset", use_container_width=True, disabled=not is_active):
+                        st.warning("This clears this station's Kafka replay records, Spark checkpoint and forecast results. Trained models and source data are retained.")
+                        confirm_stop = st.checkbox("I understand the station's replay results will be cleared", key=f"home_confirm_stop_{station_id}")
+                        stop_requested = st.button("Confirm stop and reset", key=f"home_stop_{station_id}", disabled=not confirm_stop, use_container_width=True)
+                    if is_active and stop_requested:
                         try:
                             response = requests.post(f"{api}/stations/{station_id}/stop", timeout=300)
                             response.raise_for_status()
@@ -285,17 +343,17 @@ else:
 # ---------------------------------------------------------------------
 # Architecture strip
 # ---------------------------------------------------------------------
-section_title("End-to-end workflow", "A single operational path from incoming records to decision-ready forecasts.")
-flow = [
-    ("▤", "Data ingestion", "CSV source"),
-    ("◉", "Kafka", "Event streaming"),
-    ("✳", "Spark", "Feature engineering"),
-    ("⌁", "LSTM", "24-hour forecast"),
-    ("▣", "Dashboard", "Monitoring & analysis"),
-]
-flow_cols = st.columns(5, gap="small")
-for col, (icon, title, sub) in zip(flow_cols, flow):
-    with col:
-        st.markdown(f'<div class="ef-flow"><div style="font-size:1.35rem;margin-bottom:5px">{icon}</div><b>{title}</b><span>{sub}</span></div>', unsafe_allow_html=True)
+with st.expander("How the platform works", expanded=False):
+    flow = [
+        ("▤", "Data ingestion", "CSV source"),
+        ("◉", "Kafka", "Event streaming"),
+        ("✳", "Spark", "Feature engineering"),
+        ("⌁", "Models", "Forecasts & risk"),
+        ("▣", "Dashboard", "Monitoring & analysis"),
+    ]
+    flow_cols = st.columns(5, gap="small")
+    for col, (icon, title, sub) in zip(flow_cols, flow):
+        with col:
+            st.markdown(f'<div class="ef-flow"><div style="font-size:1.35rem;margin-bottom:5px">{icon}</div><b>{title}</b><span>{sub}</span></div>', unsafe_allow_html=True)
 
-st.markdown('<div style="text-align:center;color:#7088a8;font-size:.74rem;padding:24px 0 0">E-DF Platform · Local research and demonstration workspace</div>', unsafe_allow_html=True)
+st.markdown('<div style="text-align:center;color:#7088a8;font-size:.74rem;padding:24px 0 0">E-DF Platform · Forecasting analytics</div>', unsafe_allow_html=True)

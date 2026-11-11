@@ -1,0 +1,18 @@
+# Environment-based equivalent used by docker-compose.scale.yml.
+# Set STORAGE_BACKEND=cassandra
+# Set CASSANDRA_CONTACT_POINTS=cassandra-1,cassandra-2,cassandra-3
+# Set CASSANDRA_LOCAL_DATACENTER=dc1
+# Set CASSANDRA_REPLICATION_STRATEGY=NetworkTopologyStrategy
+# Set CASSANDRA_REPLICATION_RF=3
+# Set CASSANDRA_CONSISTENCY_LEVEL=LOCAL_QUORUM
+backend: cassandra
+cassandra:
+  hosts: [cassandra-1, cassandra-2, cassandra-3]
+  port: 9042
+  keyspace: electricity
+  local_datacenter: dc1
+  consistency_level: LOCAL_QUORUM
+  replication:
+    class: NetworkTopologyStrategy
+    datacenters:
+      dc1: 3

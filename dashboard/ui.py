@@ -1,9 +1,12 @@
-"""Shared visual system and navigation for the Electricity Forecasting POC."""
+"""Accessible shared visual system and navigation for the electricity platform."""
 from __future__ import annotations
 
+import os
+import requests
+from html import escape
 import streamlit as st
 
-API_DEFAULT = "http://127.0.0.1:8000"
+API_DEFAULT = os.getenv("ELECTRICITY_API_URL", "http://127.0.0.1:8000")
 
 PAGES = [
     ("Home", "app.py", "🏠"),
@@ -70,6 +73,147 @@ CSS = r"""
 hr { border-color:rgba(119,166,224,.18); }
 h1,h2,h3 { color:#f3f7ff; }
 [data-testid="stDataFrame"] { border:1px solid rgba(119,166,224,.20); border-radius:12px; }
+/* Accessibility: Streamlit may use its light theme while the app shell is dark.
+   Force legible widget labels on the dark shell, but keep text DARK inside the
+   light input fields. Shared across Home, Stations, Models, Pipeline and Monitoring. */
+.stApp [data-testid="stWidgetLabel"],
+.stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-testid="stWidgetLabel"] span,
+.stApp [data-testid="stFileUploader"] label,
+.stApp [data-testid="stFileUploader"] label p,
+.stApp [data-testid="stCheckbox"] label p,
+.stApp [data-testid="stRadio"] label p,
+.stApp [data-testid="stSlider"] label p { color:#e8f2ff !important; opacity:1 !important; }
+.stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stCaptionContainer"] p,
+.stApp .stCaption { color:#b9cce4 !important; opacity:1 !important; }
+.stApp [data-testid="stExpander"] details {
+  border:1px solid rgba(125,179,238,.33) !important;
+  border-radius:12px !important;
+  background:rgba(9,30,56,.85) !important;
+}
+.stApp [data-testid="stExpander"] details > summary {
+  background:#163354 !important;
+  color:#f3f8ff !important;
+  border-radius:11px !important;
+}
+.stApp [data-testid="stExpander"] details > summary p,
+.stApp [data-testid="stExpander"] details > summary span,
+.stApp [data-testid="stExpander"] details > summary svg { color:#f3f8ff !important; opacity:1 !important; }
+.stApp [data-testid="stExpander"] details[open] > summary {
+  border-bottom:1px solid rgba(125,179,238,.28);
+  border-radius:11px 11px 0 0 !important;
+}
+/* Light-valued select, number and text inputs remain readable. */
+.stApp [data-testid="stTextInput"] input,
+.stApp [data-testid="stNumberInput"] input,
+.stApp [data-testid="stTextArea"] textarea,
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] [role="combobox"],
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"] input { color:#172e48 !important; }
+.stApp [data-testid="stFileUploaderDropzone"] {
+  background:rgba(20,49,85,.70) !important;
+  border:1px dashed rgba(133,190,248,.55) !important;
+}
+.stApp [data-testid="stFileUploaderDropzone"] p,
+.stApp [data-testid="stFileUploaderDropzone"] small { color:#e3eeff !important; }
+.stApp [data-baseweb="tab-list"] [role="tab"] { color:#b9cce4 !important; }
+.stApp [data-baseweb="tab-list"] [role="tab"][aria-selected="true"] { color:#ffffff !important; }
+.stApp [data-testid="stAlert"] p { opacity:1; }
+
+/* Customer-facing accessibility: minimum contrast for every page and nested widget. */
+.stApp [data-testid="stWidgetLabel"] *,
+.stApp [data-testid="stMarkdownContainer"] > p,
+.stApp [data-testid="stMarkdownContainer"] > ul,
+.stApp [data-testid="stMarkdownContainer"] > ol { color:#e7f0fc; }
+.stApp [data-testid="stExpander"] details > summary,
+.stApp [data-testid="stExpander"] details > summary * {color:#f2f8ff !important;}
+.stApp [data-testid="stExpander"] details[open] {background:#102843 !important;}
+.stApp [data-testid="stExpander"] details[open] div[data-testid="stMarkdownContainer"] > p {color:#e7f0fc !important;}
+.stApp [data-baseweb="tab-list"] { gap:4px; border-bottom:1px solid #35577d; }
+.stApp [data-baseweb="tab-list"] [role="tab"] { color:#dce9fa !important; font-weight:650; min-height:44px; border-radius:8px 8px 0 0; }
+.stApp [data-baseweb="tab-list"] [role="tab"][aria-selected="true"] {color:#ffffff !important; background:#17456e !important; border-bottom:3px solid #5bc4ff;}
+.stApp [data-testid="stAlert"] {border-radius:12px;}
+.stApp [data-testid="stAlert"] p, .stApp [data-testid="stAlert"] span {color:inherit !important; opacity:1 !important;}
+.stApp [data-testid="stSelectbox"] [data-baseweb="select"],
+.stApp [data-testid="stMultiSelect"] [data-baseweb="select"],
+.stApp [data-testid="stTextInput"] input,
+.stApp [data-testid="stNumberInput"] input,
+.stApp [data-testid="stTextArea"] textarea,
+.stApp [data-testid="stDateInput"] input {background:#f5f8fc !important; color:#152b44 !important; border-radius:9px;}
+.stApp [data-baseweb="select"] [role="combobox"] *,
+.stApp [data-baseweb="select"] [role="combobox"] input {color:#152b44 !important;}
+.stApp [data-testid="stWidgetLabel"] {font-weight:650; margin-bottom:2px;}
+.stApp button:focus-visible, .stApp input:focus-visible, .stApp a:focus-visible {outline:3px solid #70c7ff !important; outline-offset:2px;}
+.stApp [data-testid="stToast"] {color:#f6faff;}
+.stApp [data-testid="stMetricLabel"] *, .stApp [data-testid="stMetricValue"] * {color:inherit !important;}
+@media (max-width:768px) { .block-container {padding:1rem .7rem 2rem;} .ef-hero{padding:18px;} .ef-hero h1{font-size:2.2rem;} .ef-brand-row{margin-bottom:6px;} }
+/* Alerts and help copy must be readable against this dark custom shell. */
+.stApp [data-testid="stAlert"] { background:#14304d !important; border:1px solid #42688e !important; }
+.stApp [data-testid="stAlert"] p,
+.stApp [data-testid="stAlert"] span,
+.stApp [data-testid="stAlert"] li,
+.stApp [data-testid="stAlert"] div[data-testid="stMarkdownContainer"] { color:#eef6ff !important; }
+.stApp [data-testid="stAlert"] svg { color:#f8cf77 !important; }
+.stApp [data-testid="stSidebar"] [data-testid="stExpander"] summary {color:#f3f7ff !important;}
+
+/* Streamlit info/warning banners use the dark shell color scheme too. */
+.stApp [data-testid="stAlert"] {
+  background:rgba(18,47,80,.95) !important;
+  border:1px solid rgba(129,188,243,.35) !important;
+  padding:9px 12px !important;
+}
+.stApp [data-testid="stAlert"] p,
+.stApp [data-testid="stAlert"] span {color:#eaf4ff !important;}
+/* Smaller headings keep the working chart visible above the fold. */
+.stApp h1 {font-size:clamp(1.6rem,2.4vw,2.1rem) !important; line-height:1.2 !important;}
+.stApp h2 {font-size:1.26rem !important; margin-top:.65rem !important;}
+/* Compact operational layout: space goes to charts, not repeated state tiles. */
+.stApp [data-testid="stMetric"] {
+  min-height: 71px;
+  border-radius: 10px;
+  padding: 8px 12px !important;
+}
+.stApp [data-testid="stMetricLabel"] p {font-size:.75rem !important; line-height:1.18 !important;}
+.stApp [data-testid="stMetricValue"] {line-height:1.18 !important;}
+.stApp [data-testid="stMetricValue"] div {font-size:clamp(1.1rem,1.7vw,1.55rem) !important; line-height:1.22 !important;}
+.ef-status-strip {display:flex; flex-wrap:wrap; align-items:center; gap:7px 10px; margin:6px 0 12px;}
+.ef-status-chip {display:inline-flex; align-items:center; gap:6px; border:1px solid rgba(126,169,222,.26); background:rgba(12,33,57,.85); color:#e7f0fc; padding:5px 9px; border-radius:8px; font-size:.79rem; line-height:1.2;}
+.ef-status-chip .label {color:#b9cce4;}
+.ef-status-chip .value {font-weight:700; color:#edf6ff;}
+.ef-status-chip.good .value {color:#7ce0ba;}
+.ef-status-chip.bad .value {color:#ff9e9e;}
+.ef-status-chip.warn .value {color:#ffd08a;}
+.ef-status-chip .dot {font-size:.8rem;}
+.ef-section-help {cursor:help; font-size:.72rem; border:1px solid #577395; color:#b3cae7; border-radius:999px; padding:0 6px; vertical-align:middle; margin-left:6px; font-weight:500;}
+.ef-hero {padding:19px 22px 16px; border-radius:16px;}
+.ef-hero h1 {font-size:clamp(1.75rem,3vw,2.6rem); margin-bottom:8px;}
+.ef-hero p {font-size:.88rem; line-height:1.42;}
+.ef-eyebrow {margin-bottom:7px; padding:4px 9px;}
+.ef-hero-visual {min-height:140px;}
+.ef-wave {height:62px;}
+.ef-card {min-height:135px; padding:13px;}
+.ef-card .icon {height:28px; width:28px; margin-bottom:8px; font-size:1rem;}
+@media(max-width:768px) { .ef-status-chip {font-size:.75rem;} .ef-hero {padding:15px;} }
+
+
+/* Global high-contrast labels and Plotly titles for the dark dashboard shell. */
+.stApp [data-testid="stMarkdownContainer"] h1,
+.stApp [data-testid="stMarkdownContainer"] h2,
+.stApp [data-testid="stMarkdownContainer"] h3,
+.stApp [data-testid="stMarkdownContainer"] h4,
+.stApp [data-testid="stMarkdownContainer"] h5,
+.stApp [data-testid="stMarkdownContainer"] h6,
+.stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-testid="stMetricLabel"] p,
+.stApp [data-testid="stCaptionContainer"] p {color:#e9f3ff !important; opacity:1 !important;}
+.stApp [data-testid="stPlotlyChart"] .main-svg text {fill:#e8f2ff !important;}
+.stApp [data-testid="stPlotlyChart"] .gtitle {fill:#f3f8ff !important;}
+.stApp [data-testid="stPlotlyChart"] .xtitle,
+.stApp [data-testid="stPlotlyChart"] .ytitle {fill:#d8e8ff !important;}
+.stApp [data-testid="stForm"] {border-color:#35557a !important;}
+.stApp [data-testid="stToggle"] label p,
+.stApp [data-testid="stRadio"] label p,
+.stApp [data-testid="stCheckbox"] label p {color:#e9f3ff !important;}
 </style>
 """
 
@@ -80,7 +224,7 @@ def setup_page(page_title: str, active_page: str) -> str:
         page_title=f"{page_title} · E-DF Platform",
         page_icon="⚡",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
     st.markdown(CSS, unsafe_allow_html=True)
 
@@ -95,31 +239,106 @@ def setup_page(page_title: str, active_page: str) -> str:
     with health_col:
         st.markdown('<div class="ef-health">●&nbsp; Analytics Workspace</div>', unsafe_allow_html=True)
 
+    page_for_section = {
+        "home": "app.py",
+        "stations": "pages/station_management.py",
+        "models": "pages/model_management.py",
+        "pipeline": "pages/pipeline_control.py",
+        "monitoring": "pages/monitoring.py",
+    }
+    current_page = page_for_section.get(active_page)
     nav_cols = st.columns([0.8, 1.35, 1.35, 1.15, 1.15], gap="small")
     for col, (label, page, icon) in zip(nav_cols, PAGES):
         with col:
             try:
-                st.page_link(page, label=label, icon=icon, use_container_width=True)
+                active_label = f"{label} ·" if page == current_page else label
+                st.page_link(page, label=active_label, icon=icon, use_container_width=True)
             except Exception:
                 # Keep the page usable on Streamlit versions without page_link.
                 if st.button(f"{icon} {label}", key=f"ef_nav_{active_page}_{label}", use_container_width=True):
                     if hasattr(st, "switch_page"):
                         st.switch_page(page)
 
+    # Keep operator settings out of the default dashboard view. Streamlit's
+    # standard sidebar toggle exposes this area only when the user opens it.
     with st.sidebar:
-        st.markdown("### Workspace settings")
-        api_url = st.text_input("FastAPI URL", value=API_DEFAULT, key="ef_api_url")
-        st.caption("Backend connection used by all modules.")
-        st.divider()
-        st.markdown("**Platform modules**")
-        st.caption("Home · Stations · Models · Pipeline · Monitoring")
-        st.markdown("---")
-        st.caption("Local POC · Kafka + Spark + LSTM")
+        with st.expander("⚙️ Workspace settings", expanded=False):
+            api_url = st.text_input("FastAPI URL", value=API_DEFAULT, key="ef_api_url")
+            st.caption("Advanced setting · Backend address shared by all pages")
+
+            if st.checkbox('Edit residual spike thresholds',value=False,
+                           key='ef_edit_residual_thresholds'):
+                _residual_spike_calibration((api_url or API_DEFAULT).rstrip('/'))
 
     return (api_url or API_DEFAULT).rstrip("/")
 
 
 def section_title(title: str, subtitle: str | None = None) -> None:
-    st.markdown(f'<div class="ef-section-title">{title}</div>', unsafe_allow_html=True)
-    if subtitle:
-        st.markdown(f'<div class="ef-muted">{subtitle}</div>', unsafe_allow_html=True)
+    """Keep guidance accessible on hover without permanently consuming a full row."""
+    help_icon = (
+        f'<span class="ef-section-help" title="{escape(subtitle, quote=True)}" '
+        f'aria-label="More about {escape(title, quote=True)}">?</span>'
+        if subtitle else ""
+    )
+    st.markdown(
+        f'<div class="ef-section-title">{escape(title)}{help_icon}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_status_strip(items: list[tuple[str, str, str]]) -> None:
+    """Small, readable status indicators. Tone: good, warn, bad or neutral."""
+    allowed = {"good", "warn", "bad", "neutral"}
+    parts = []
+    for label, value, tone in items:
+        safe_tone = tone if tone in allowed else "neutral"
+        dot = "●" if safe_tone in {"good", "warn", "bad"} else "·"
+        parts.append(
+            f'<span class="ef-status-chip {safe_tone}">'
+            f'<span class="dot" aria-hidden="true">{dot}</span>'
+            f'<span class="label">{escape(str(label))}</span>'
+            f'<span class="value">{escape(str(value))}</span>'
+            f'</span>'
+        )
+    st.markdown('<div class="ef-status-strip">' + "".join(parts) + '</div>', unsafe_allow_html=True)
+
+
+def _residual_spike_calibration(api_url: str) -> None:
+    """Edit station-specific thresholds only on demand, not at every page refresh."""
+    try:
+        response=requests.get(f'{api_url}/stations',timeout=(2,8))
+        response.raise_for_status()
+        stations=response.json().get('stations') or {}
+        if not stations:
+            st.info('Register a station before editing residual thresholds.')
+            return
+        station=st.selectbox('Station for spike calibration',sorted(stations),
+                             key='ef_residual_setting_station')
+        result=requests.get(f'{api_url}/stations/{station}/residual-settings',timeout=(2,8))
+        result.raise_for_status()
+        current=result.json().get('settings') or {}
+    except (requests.RequestException,ValueError) as exc:
+        st.warning(f'Cannot load station spike thresholds: {exc}')
+        return
+    with st.form(f'ef_spike_thresholds_{station}'):
+        rule=st.selectbox('Detector agreement', ['both','either'],
+                          index=0 if current.get('decision_rule','both')=='both' else 1,
+                          help='Both: statistical and autoencoder scores must exceed thresholds. Either: one score is enough.')
+        stat=st.number_input('Statistical score threshold (0 = model calibration)',
+                             min_value=0.,max_value=10000.,step=.1,
+                             value=float(current.get('stat_threshold') or 0.))
+        ae=st.number_input('Autoencoder score threshold (0 = model calibration)',
+                           min_value=0.,max_value=10000.,step=.1,
+                           value=float(current.get('ae_threshold') or 0.))
+        up=st.checkbox('Highlight upward spikes only',
+                       value=bool(current.get('upward_only',True)))
+        save=st.form_submit_button('Save spike thresholds',use_container_width=True)
+    if save:
+        try:
+            response=requests.put(f'{api_url}/stations/{station}/residual-settings',
+                                  json={'decision_rule':rule,'stat_threshold':stat or None,
+                                        'ae_threshold':ae or None,'upward_only':up},timeout=(2,12))
+            response.raise_for_status()
+            st.success(f'Spike thresholds saved for {station}. New forecasts use this calibration.')
+        except requests.RequestException as exc:
+            st.error(f'Could not save calibration: {exc}')

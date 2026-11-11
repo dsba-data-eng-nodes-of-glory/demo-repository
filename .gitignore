@@ -17,10 +17,31 @@ checkpoints/
 logs/
 *.log
 
-# Model binaries
+# Model binaries and generated datasets (keep source fixtures explicitly if needed)
 *.pt
 *.pth
 *.pkl
+*.joblib
+data/raw/
+data/processed/
 
 # Temporary files
 .DS_Store
+# Operational quality output
+data/quality/
+
+# Cassandra and monitoring local state
+.cassandra/
+prometheus_data/
+grafana_data/
+
+# Docker/local overrides
+__pycache__/
+*.pyc
+.pytest_cache/
+checkpoints/
+*.log
+data/state/
+data/training/
+*.lnk
+.env

@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: electricity-api
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: electricity-predictors
+    static_configs:
+      - targets: ["api:9102", "api:9103", "api:9104", "api:9105"]

@@ -1,0 +1,411 @@
+--- a/electricity_mlop_final/backend/results_api.py
++++ b/electricity_mlop_final/backend/results_api.py
+@@ -32,6 +32,14 @@
+ _RENEWABLE_BASE_CACHE: OrderedDict[tuple, tuple[pd.DataFrame, dict]] = OrderedDict()
+ _RENEWABLE_CACHE_MAX_ITEMS = 8
+ _RENEWABLE_CACHE_LOCK = RLock()
++
++# Normalised historical demand is static during replay. Cache the prepared
++# frame (UTC timestamp + numeric demand + sorted/deduplicated rows), not only
++# the raw CSV, so dashboard refreshes do not re-parse ~168k source rows.
++_HISTORICAL_ACTUALS_CACHE: OrderedDict[tuple, pd.DataFrame] = OrderedDict()
++_HISTORICAL_ACTUALS_CACHE_LOCK = RLock()
++_HISTORICAL_ACTUALS_CACHE_MAX_ITEMS = 8
++
+ _LOG = logging.getLogger(__name__)
+ 
+ 
+@@ -178,13 +186,12 @@
+ 
+ 
+ def _read_historical_actuals(station: str) -> pd.DataFrame:
+-    """Read the configured history seed and stream source actuals.
+-
+-    Prefer ``history_file`` from the station registry.  Some stations keep the
+-    initial training window in a separately named file (for example,
+-    ``demand_train.csv``) rather than a predictable sibling of ``input_file``.
+-    Deriving ``*_history.csv`` from ``input_file`` silently omitted that history
+-    and left the first forecast origins without enough chart/anomaly context.
++    """Return cached, normalised static actuals for one station.
++
++    The training and test CSVs are immutable during a replay. Their file
++    signatures key this cache, so a changed/replaced source is automatically
++    reloaded. The returned frame is treated as read-only by callers; merging
++    creates a copy only of the small, requested tail.
+     """
+     if not STATION_CONFIG_FILE.exists():
+         return pd.DataFrame()
+@@ -202,9 +209,8 @@
+             return path if path.is_absolute() else ROOT / path
+ 
+         sources: list[Path] = []
+-        # The configured seed is the authoritative source for pre-stream
+-        # history.  Keep the legacy sibling convention only for older station
+-        # entries that do not define history_file.
++        # Keep the configured history seed authoritative. Older station
++        # entries can still use the legacy *_history.csv sibling convention.
+         if history_file:
+             sources.append(configured_path(history_file))
+         elif input_file:
+@@ -214,12 +220,9 @@
+             )
+             if derived_history.exists():
+                 sources.append(derived_history)
+-
+         if input_file:
+             sources.append(configured_path(input_file))
+ 
+-        # Avoid rereading the same file when a station intentionally points
+-        # history_file and input_file at one source.
+         unique_sources: list[Path] = []
+         seen_paths: set[Path] = set()
+         for source_path in sources:
+@@ -228,21 +231,76 @@
+                 unique_sources.append(resolved)
+                 seen_paths.add(resolved)
+ 
+-        frames = []
++        # Include mtime_ns and size so replacing or appending a source creates
++        # a new cache key. Missing paths also participate in invalidation.
++        signatures = []
+         for source_path in unique_sources:
+-            frame = _read_csv_cached(source_path)
+-            if frame.empty or "utc_timestamp" not in frame.columns:
+-                continue
+-            if "actual_demand" not in frame.columns and "demand" in frame.columns:
+-                frame = frame.rename(columns={"demand": "actual_demand"})
+-            if "actual_demand" not in frame.columns:
+-                continue
+-            frame = frame.copy()
+-            frame["station_id"] = station
+-            frames.append(frame)
+-        if not frames:
+-            return pd.DataFrame()
+-        return pd.concat(frames, ignore_index=True, sort=False)
++            try:
++                stat = source_path.stat()
++                signatures.append((str(source_path), stat.st_mtime_ns, stat.st_size))
++            except OSError:
++                signatures.append((str(source_path), None, None))
++        cache_key = (str(station), tuple(signatures))
++
++        # Serialise cache misses: concurrent first page loads should not parse
++        # the same large CSVs multiple times.
++        with _HISTORICAL_ACTUALS_CACHE_LOCK:
++            cached = _HISTORICAL_ACTUALS_CACHE.get(cache_key)
++            if cached is not None:
++                _HISTORICAL_ACTUALS_CACHE.move_to_end(cache_key)
++                return cached
++
++            frames = []
++            for source_path in unique_sources:
++                if not source_path.exists() or source_path.stat().st_size == 0:
++                    continue
++                # Do not also retain a second raw copy in the generic CSV
++                # cache: this station-level cache owns the prepared frame.
++                frame = pd.read_csv(source_path)
++                if frame.empty or "utc_timestamp" not in frame.columns:
++                    continue
++                if "actual_demand" not in frame.columns and "demand" in frame.columns:
++                    frame = frame.rename(columns={"demand": "actual_demand"})
++                if "actual_demand" not in frame.columns:
++                    continue
++                frame = frame.copy()
++                frame["station_id"] = station
++                # Source files use day-first timestamps (for example,
++                # 30-09-2026 23:45); keep the mixed parser used by this project.
++                frame["_timestamp_key"] = pd.to_datetime(
++                    frame["utc_timestamp"].astype("string").str.strip(),
++                    format="mixed",
++                    dayfirst=True,
++                    utc=True,
++                    errors="coerce",
++                )
++                frame["actual_demand"] = pd.to_numeric(
++                    frame["actual_demand"], errors="coerce"
++                )
++                frame = frame.dropna(subset=["_timestamp_key", "actual_demand"])
++                if not frame.empty:
++                    frames.append(frame)
++
++            if not frames:
++                prepared = pd.DataFrame()
++            else:
++                prepared = pd.concat(frames, ignore_index=True, sort=False)
++                # Stable sorting preserves source order for duplicate times;
++                # the later configured source continues to win, as before.
++                prepared = prepared.sort_values("_timestamp_key", kind="mergesort")
++                prepared = prepared.drop_duplicates(
++                    ["station_id", "_timestamp_key"], keep="last"
++                )
++                prepared["utc_timestamp"] = prepared["_timestamp_key"].dt.strftime(
++                    "%Y-%m-%dT%H:%M:%SZ"
++                )
++                prepared = prepared.reset_index(drop=True)
++
++            _HISTORICAL_ACTUALS_CACHE[cache_key] = prepared
++            _HISTORICAL_ACTUALS_CACHE.move_to_end(cache_key)
++            while len(_HISTORICAL_ACTUALS_CACHE) > _HISTORICAL_ACTUALS_CACHE_MAX_ITEMS:
++                _HISTORICAL_ACTUALS_CACHE.popitem(last=False)
++            return prepared
+     except (OSError, ValueError, yaml.YAMLError, pd.errors.ParserError):
+         return pd.DataFrame()
+ 
+@@ -254,70 +312,121 @@
+     limit: int,
+     end_time: str | None = None,
+ ) -> pd.DataFrame:
+-    """Merge source and live actuals, preferring live values at duplicate times.
+-
+-    When end_time is omitted, the latest timestamp received by the live
+-    predictor is the replay watermark. This prevents future rows that happen
+-    to exist in the source CSV from pushing the current replay window out.
++    """Merge static and live actuals, preferring live values at duplicate times.
++
++    Cached historical frames already carry a parsed, sorted ``_timestamp_key``.
++    Only their final ``limit`` rows are copied for each request; this is enough
++    to calculate the final top-N rows after adding live observations. Raw
++    DataFrames passed by tests/other callers remain supported.
+     """
+-    frames = []
+-    for priority, source_frame in ((0, historical), (1, live)):
+-        if source_frame.empty:
+-            continue
+-        frame = source_frame.copy()
+-        if "utc_timestamp" not in frame.columns:
+-            continue
+-        if "actual_demand" not in frame.columns and "demand" in frame.columns:
+-            frame = frame.rename(columns={"demand": "actual_demand"})
+-        if "actual_demand" not in frame.columns:
+-            continue
+-        frame["station_id"] = station
+-        # Station source CSVs may use European day-first strings
+-        # (``30-09-2026 23:45``), while live Kafka rows are ISO timestamps.
+-        # ``format='mixed'`` with dayfirst handles both representations; the
+-        # default parser silently coerced dates after day 12 to NaT and clipped
+-        # historical chart context around the middle of each month.
+-        frame["_timestamp_key"] = pd.to_datetime(
+-            frame["utc_timestamp"].astype("string").str.strip(),
+-            format="mixed",
+-            dayfirst=True,
+-            utc=True,
+-            errors="coerce",
+-        )
+-        frame["actual_demand"] = pd.to_numeric(frame["actual_demand"], errors="coerce")
+-        frame = frame.dropna(subset=["_timestamp_key", "actual_demand"])
+-        frame["_priority"] = priority
+-        frames.append(frame)
+-
+-    if not frames:
+-        return pd.DataFrame()
+-
+-    combined = pd.concat(frames, ignore_index=True, sort=False)
++    limit = max(1, min(int(limit), 20000))
++
++    cutoff = None
+     if end_time:
+-        cutoff = pd.to_datetime(end_time, utc=True, errors="coerce")
+-        if pd.notna(cutoff):
+-            combined = combined[combined["_timestamp_key"] <= cutoff]
++        parsed_cutoff = pd.to_datetime(end_time, utc=True, errors="coerce")
++        if pd.notna(parsed_cutoff):
++            cutoff = parsed_cutoff
+     elif not live.empty and "utc_timestamp" in live.columns:
+-        # On replay, the newest live timestamp is the point-in-time cutoff.
+         live_times = pd.to_datetime(
+             live["utc_timestamp"].astype("string").str.strip(),
+             format="mixed",
+             dayfirst=True,
+             utc=True,
+             errors="coerce",
+-        )
+-        live_times = live_times.dropna()
++        ).dropna()
+         if not live_times.empty:
+-            combined = combined[combined["_timestamp_key"] <= live_times.max()]
+-
++            # On replay, the newest live timestamp is the point-in-time cutoff.
++            cutoff = live_times.max()
++
++    frames = []
++
++    if not historical.empty:
++        if "_timestamp_key" in historical.columns:
++            # This is the prepared immutable cache. Filter before copying and
++            # do not parse the historical timestamp strings again.
++            hist = historical
++            if cutoff is not None:
++                hist = hist.loc[hist["_timestamp_key"] <= cutoff]
++            hist = hist.tail(limit).copy()
++        else:
++            # Backwards-compatible path for raw DataFrames supplied directly.
++            hist = historical.copy()
++            if "utc_timestamp" not in hist.columns:
++                hist = pd.DataFrame()
++            else:
++                if "actual_demand" not in hist.columns and "demand" in hist.columns:
++                    hist = hist.rename(columns={"demand": "actual_demand"})
++                if "actual_demand" in hist.columns:
++                    hist["_timestamp_key"] = pd.to_datetime(
++                        hist["utc_timestamp"].astype("string").str.strip(),
++                        format="mixed",
++                        dayfirst=True,
++                        utc=True,
++                        errors="coerce",
++                    )
++                    hist["actual_demand"] = pd.to_numeric(
++                        hist["actual_demand"], errors="coerce"
++                    )
++                    hist = hist.dropna(subset=["_timestamp_key", "actual_demand"])
++                    if cutoff is not None:
++                        hist = hist.loc[hist["_timestamp_key"] <= cutoff]
++                    hist = hist.sort_values("_timestamp_key", kind="mergesort").tail(limit)
++                else:
++                    hist = pd.DataFrame()
++        if not hist.empty:
++            hist["station_id"] = station
++            hist["_priority"] = 0
++            frames.append(hist)
++
++    if not live.empty:
++        live_frame = live.copy()
++        if "utc_timestamp" in live_frame.columns:
++            if "actual_demand" not in live_frame.columns and "demand" in live_frame.columns:
++                live_frame = live_frame.rename(columns={"demand": "actual_demand"})
++            if "actual_demand" in live_frame.columns:
++                live_frame["station_id"] = station
++                live_frame["_timestamp_key"] = pd.to_datetime(
++                    live_frame["utc_timestamp"].astype("string").str.strip(),
++                    format="mixed",
++                    dayfirst=True,
++                    utc=True,
++                    errors="coerce",
++                )
++                live_frame["actual_demand"] = pd.to_numeric(
++                    live_frame["actual_demand"], errors="coerce"
++                )
++                live_frame = live_frame.dropna(
++                    subset=["_timestamp_key", "actual_demand"]
++                )
++                if cutoff is not None:
++                    live_frame = live_frame.loc[live_frame["_timestamp_key"] <= cutoff]
++                live_frame = live_frame.sort_values(
++                    "_timestamp_key", kind="mergesort"
++                ).tail(limit)
++                if not live_frame.empty:
++                    live_frame["_priority"] = 1
++                    frames.append(live_frame)
++
++    if not frames:
++        return pd.DataFrame()
++
++    combined = pd.concat(frames, ignore_index=True, sort=False)
+     if combined.empty:
+         return pd.DataFrame()
+ 
+-    combined = combined.sort_values(["_timestamp_key", "_priority"], kind="mergesort")
+-    combined = combined.drop_duplicates(["station_id", "_timestamp_key"], keep="last")
+-    combined["utc_timestamp"] = combined["_timestamp_key"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+-    combined = combined.sort_values("_timestamp_key").tail(max(1, min(int(limit), 20000)))
+-    combined = combined.drop(columns=["_timestamp_key", "_priority"], errors="ignore")
++    combined = combined.sort_values(
++        ["_timestamp_key", "_priority"], kind="mergesort"
++    )
++    combined = combined.drop_duplicates(
++        ["station_id", "_timestamp_key"], keep="last"
++    )
++    combined["utc_timestamp"] = combined["_timestamp_key"].dt.strftime(
++        "%Y-%m-%dT%H:%M:%SZ"
++    )
++    combined = combined.sort_values("_timestamp_key").tail(limit)
++    combined = combined.drop(
++        columns=["_timestamp_key", "_priority"], errors="ignore"
++    )
+     return combined.reset_index(drop=True)
+ 
+ 
+--- /dev/null
++++ b/electricity_mlop_final/tests/test_actuals_historical_cache.py
+@@ -0,0 +1,82 @@
++from __future__ import annotations
++
++import pandas as pd
++import yaml
++
++from backend import results_api
++
++
++def _clear_actuals_caches() -> None:
++    with results_api._HISTORICAL_ACTUALS_CACHE_LOCK:
++        results_api._HISTORICAL_ACTUALS_CACHE.clear()
++    with results_api._CACHE_LOCK:
++        results_api._CACHE.clear()
++
++
++def test_historical_actuals_are_prepared_cached_and_invalidated(tmp_path, monkeypatch):
++    history_path = tmp_path / "demand_train.csv"
++    input_path = tmp_path / "demand_test.csv"
++    config_path = tmp_path / "stations.yaml"
++
++    pd.DataFrame({
++        "utc_timestamp": ["30-09-2026 23:45", "01-10-2026 00:00"],
++        "demand": [100.0, 110.0],
++    }).to_csv(history_path, index=False)
++    pd.DataFrame({
++        "utc_timestamp": ["01-10-2026 00:00", "01-10-2026 00:15"],
++        "demand": [111.0, 120.0],
++    }).to_csv(input_path, index=False)
++    config_path.write_text(yaml.safe_dump({
++        "stations": {
++            "amprion": {
++                "history_file": str(history_path),
++                "input_file": str(input_path),
++            }
++        }
++    }), encoding="utf-8")
++
++    monkeypatch.setattr(results_api, "STATION_CONFIG_FILE", config_path)
++    monkeypatch.setattr(results_api, "ROOT", tmp_path)
++    _clear_actuals_caches()
++
++    first = results_api._read_historical_actuals("amprion")
++    second = results_api._read_historical_actuals("amprion")
++
++    assert first is second  # Cache hit reuses prepared data; no full DataFrame copy.
++    assert "_timestamp_key" in first.columns
++    assert str(first["_timestamp_key"].dtype).startswith("datetime64[ns, UTC]")
++    assert first["utc_timestamp"].tolist() == [
++        "2026-09-30T23:45:00Z",
++        "2026-10-01T00:00:00Z",
++        "2026-10-01T00:15:00Z",
++    ]
++    # The later configured source (demand_test.csv) still wins on duplicates.
++    assert first.loc[first["utc_timestamp"] == "2026-10-01T00:00:00Z", "actual_demand"].iloc[0] == 111.0
++
++    live = pd.DataFrame([
++        {"utc_timestamp": "2026-10-01T00:15:00Z", "actual_demand": 121.0},
++        {"utc_timestamp": "2026-10-01T00:30:00Z", "actual_demand": 130.0},
++    ])
++    combined = results_api._combine_actuals(
++        first, live, station="amprion", limit=10,
++        end_time="2026-10-01T00:30:00Z",
++    )
++    assert combined["utc_timestamp"].tolist() == [
++        "2026-09-30T23:45:00Z",
++        "2026-10-01T00:00:00Z",
++        "2026-10-01T00:15:00Z",
++        "2026-10-01T00:30:00Z",
++    ]
++    assert combined["actual_demand"].tolist() == [100.0, 111.0, 121.0, 130.0]
++    assert "_timestamp_key" not in combined.columns
++    assert "_priority" not in combined.columns
++
++    # Changing a source file signature must create a newly prepared cache entry.
++    with input_path.open("a", encoding="utf-8") as handle:
++        handle.write("01-10-2026 00:30,140.0\n")
++    refreshed = results_api._read_historical_actuals("amprion")
++    assert refreshed is not first
++    assert len(refreshed) == 4
++    assert refreshed.iloc[-1]["actual_demand"] == 140.0
++
++    _clear_actuals_caches()

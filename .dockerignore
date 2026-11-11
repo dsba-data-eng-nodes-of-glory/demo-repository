@@ -1,0 +1,13 @@
+.git
+__pycache__
+*.py[cod]
+.pytest_cache
+.venv
+venv
+.env
+.env.*
+logs
+checkpoints
+data/processed
+prometheus_data
+grafana_data

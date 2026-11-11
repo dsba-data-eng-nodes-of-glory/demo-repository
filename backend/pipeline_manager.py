@@ -57,9 +57,17 @@ def read_spark_config() -> dict[str, Any]:
 
 def read_kafka_config() -> dict[str, Any]:
     if not KAFKA_CONFIG.exists():
-        return {"bootstrap_servers": "127.0.0.1:9092"}
-    with KAFKA_CONFIG.open(encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        config = {"bootstrap_servers": "127.0.0.1:9092"}
+    else:
+        with KAFKA_CONFIG.open(encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    if os.getenv("KAFKA_BOOTSTRAP_SERVERS"):
+        config["bootstrap_servers"] = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+    if os.getenv("KAFKA_TOPIC_PARTITIONS"):
+        config["topic_partitions"] = int(os.environ["KAFKA_TOPIC_PARTITIONS"])
+    if os.getenv("KAFKA_TOPIC_REPLICATION_FACTOR"):
+        config["replication_factor"] = int(os.environ["KAFKA_TOPIC_REPLICATION_FACTOR"])
+    return config
 
 
 def resolve_root_path(value: str | Path) -> Path:
@@ -76,6 +84,10 @@ class PipelineManager:
         self.processes: dict[str, subprocess.Popen] = {}
         self.log_handles: dict[str, Any] = {}
         self.lock = Lock()
+        # Java version detection starts a subprocess on Windows. Status panels
+        # must never repeat that check for every station on every refresh.
+        self._runtime_status_cache: dict[str, Any] | None = None
+        self._runtime_status_cache_at = 0.0
 
     def get_runtime_environment(self) -> dict[str, Any]:
         env = os.environ.copy()
@@ -84,24 +96,19 @@ class PipelineManager:
             raise RuntimeError(f"Python executable not found: {python_exe}")
         env["PYSPARK_PYTHON"] = str(python_exe)
         env["PYSPARK_DRIVER_PYTHON"] = str(python_exe)
-        configured_java = read_spark_config().get("java_home")
-        java_candidates = [configured_java, env.get("JAVA_HOME")]
-        java_name = "java.exe" if os.name == "nt" else "java"
-        java_home_path = next(
-            (
-                Path(value).expanduser().resolve()
-                for value in java_candidates
-                if value
-                and (Path(value).expanduser() / "bin" / java_name).is_file()
-            ),
-            None,
-        )
-        if java_home_path is None:
-            java_on_path = shutil.which(java_name, path=env.get("PATH"))
-            if not java_on_path:
-                raise RuntimeError("Java was not found. Set JAVA_HOME or configure java_home in config/spark.yaml.")
-            java_home_path = Path(java_on_path).resolve().parent.parent
-        java_exe = java_home_path / "bin" / java_name
+        configured_java = read_spark_config().get("java_home") if os.name == "nt" else None
+        java_home = configured_java or env.get("JAVA_HOME")
+        if java_home:
+            java_home_path = Path(java_home).expanduser().resolve()
+            java_exe = java_home_path / "bin" / ("java.exe" if os.name == "nt" else "java")
+        else:
+            java_exe_value = shutil.which("java")
+            if not java_exe_value:
+                raise RuntimeError("Java is not available. Install a supported JDK or set JAVA_HOME.")
+            java_exe = Path(java_exe_value).resolve()
+            java_home_path = java_exe.parent.parent
+        if not java_exe.exists():
+            raise RuntimeError(f"Java executable not found: {java_exe}")
         env["JAVA_HOME"] = str(java_home_path)
         env["PATH"] = str(java_home_path / "bin") + os.pathsep + env.get("PATH", "")
         result = subprocess.run([str(java_exe), "-version"], capture_output=True, text=True, timeout=10)
@@ -115,9 +122,18 @@ class PipelineManager:
             "java_version": result.stderr + result.stdout,
         }
 
-    def kafka_available(self, host: str = "127.0.0.1", port: int = 9092) -> bool:
+    def kafka_available(self, host: str | None = None, port: int | None = None) -> bool:
+        if host is None or port is None:
+            first = str(read_kafka_config().get("bootstrap_servers", "127.0.0.1:9092")).split(",")[0].strip()
+            if ":" in first:
+                host_value, port_value = first.rsplit(":", 1)
+                host = host or host_value
+                port = port or int(port_value)
+            else:
+                host = host or first
+                port = port or 9092
         try:
-            with socket.create_connection((host, port), timeout=2):
+            with socket.create_connection((host, int(port)), timeout=2):
                 return True
         except OSError:
             return False
@@ -139,16 +155,26 @@ class PipelineManager:
                     "pid": proc.pid,
                     "return_code": proc.poll(),
                 }
-        try:
-            runtime_info = self.get_runtime_environment()
-            runtime = {
-                "python_executable": runtime_info["python_executable"],
-                "java_home": runtime_info["java_home"],
-                "java_executable": runtime_info["java_executable"],
-                "java_version": runtime_info["java_version"].strip(),
-            }
-        except Exception as exc:
-            runtime = {"error": str(exc)}
+        now = time.monotonic()
+        with self.lock:
+            cached = self._runtime_status_cache
+            cache_age = now - self._runtime_status_cache_at
+        if cached is None or cache_age >= 120.0:
+            try:
+                runtime_info = self.get_runtime_environment()
+                runtime = {
+                    "python_executable": runtime_info["python_executable"],
+                    "java_home": runtime_info["java_home"],
+                    "java_executable": runtime_info["java_executable"],
+                    "java_version": runtime_info["java_version"].strip(),
+                }
+            except Exception as exc:
+                runtime = {"error": str(exc)}
+            with self.lock:
+                self._runtime_status_cache = runtime
+                self._runtime_status_cache_at = time.monotonic()
+        else:
+            runtime = cached
         return {
             "kafka_tcp_available": self.kafka_available(),
             "runtime": runtime,
@@ -171,6 +197,7 @@ class PipelineManager:
             "station": station,
             "kafka_tcp_available": snapshot["kafka_tcp_available"],
             "services": selected,
+            "quality_consumer": snapshot["processes"].get("quality", {"running": False, "pid": None, "return_code": None}),
             "model_checkpoint": str(checkpoint),
             "model_ready": checkpoint.is_file(),
             "active_model": active_model or None,
@@ -241,14 +268,19 @@ class PipelineManager:
         """Create missing station topics. Never deletes or truncates topics."""
         config = read_station_config()
         stations = config.get("stations", {})
+        kafka_cfg = read_kafka_config()
         if station not in stations:
             raise ValueError(f"Unknown station '{station}'.")
         entry = stations[station]
-        topic_names = [entry.get("raw_topic"), entry.get("featured_topic")]
+        kafka_cfg = read_kafka_config()
+        topic_names = [entry.get("raw_topic"), entry.get("featured_topic"),
+                       kafka_cfg.get("dead_letter_topic", "electricity-dlq")]
         if not all(topic_names):
             raise ValueError(f"Station '{station}' must define raw_topic and featured_topic.")
         if not self.kafka_available():
-            raise RuntimeError("Kafka broker is not reachable at 127.0.0.1:9092. Start Kafka first.")
+            raise RuntimeError(
+                f"Kafka bootstrap servers are not reachable: {kafka_cfg.get('bootstrap_servers')}. Start Kafka first."
+            )
         try:
             from kafka.admin import KafkaAdminClient, NewTopic
         except ImportError as exc:
@@ -264,8 +296,10 @@ class PipelineManager:
             missing = [name for name in topic_names if name not in existing]
             created: list[str] = []
             if missing:
+                partitions = max(1, int(kafka_cfg.get("topic_partitions", 1)))
+                replication_factor = max(1, int(kafka_cfg.get("replication_factor", 1)))
                 futures = admin.create_topics(
-                    new_topics=[NewTopic(name, num_partitions=1, replication_factor=1) for name in missing],
+                    new_topics=[NewTopic(name, num_partitions=partitions, replication_factor=replication_factor) for name in missing],
                     validate_only=False,
                 )
                 for topic, future in futures.items():
@@ -293,22 +327,38 @@ class PipelineManager:
         algorithm: str,
         parameters: dict[str, Any],
         training_options: dict[str, Any] | None = None,
+        component: str = "demand_forecast",
+        training_data_path: str | None = None,
+        training_data_id: str | None = None,
     ) -> dict[str, Any]:
-        """Launch an immutable, versioned model training experiment."""
+        """Launch a versioned candidate using a registered or validated uploaded dataset."""
         stations = read_station_config().get("stations", {})
         if station not in stations:
             raise ValueError(f"Unknown station '{station}'.")
         entry = stations[station]
-        training_file = entry.get("training_file") or entry.get("input_file")
+        from backend.training_data import station_component_state, registered_source, digest_file
+        if not station_component_state(entry).get(component, False):
+            raise ValueError(f"Component {component} is not enabled for station {station}")
+        training_file = training_data_path or registered_source(entry, component)
         if not training_file or not resolve_root_path(training_file).is_file():
-            raise FileNotFoundError(f"Training CSV not found for '{station}': {training_file}")
+            raise FileNotFoundError(
+                f"No training CSV exists for '{station}'/{component}: {training_file}. "
+                "Upload a complete historical dataset from Model Management."
+            )
+        source_file = resolve_root_path(training_file)
+        source_digest = digest_file(source_file)
 
+        # On a single-machine deployment, training an additional station in
+        # parallel with another large model can exhaust RAM (especially HDD/8 GB).
+        for process_key, process in list(self.processes.items()):
+            if process_key.endswith(":training") and process.poll() is None:
+                raise RuntimeError(f"A training job is already active ({process_key}). Finish it before starting another.")
         key = self.process_key("training", station)
         existing = self.processes.get(key)
         if existing and existing.poll() is None:
             raise RuntimeError(f"A training job is already running for station '{station}'.")
 
-        experiment_id = f"{station}-{algorithm}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        experiment_id = f"{station}-{component}-{algorithm}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         experiment_dir = ROOT / "models" / station / "experiments" / experiment_id
         experiment_dir.mkdir(parents=True, exist_ok=True)
         config_path = experiment_dir / "experiment.json"
@@ -316,8 +366,12 @@ class PipelineManager:
             "experiment_id": experiment_id,
             "station": station,
             "algorithm": algorithm,
+            "component": component,
             "parameters": parameters,
             "training_options": training_options or {},
+            "training_data_path": training_file,
+            "training_data_id": training_data_id,
+            "training_data_sha256": source_digest,
             "created_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         }
         temporary = config_path.with_suffix(".json.tmp")
@@ -330,8 +384,12 @@ class PipelineManager:
                 "experiment_id": experiment_id,
                 "station": station,
                 "algorithm": algorithm,
+                "component": component,
                 "status": "queued",
                 "parameters": parameters,
+                "training_data_path": training_file,
+                "training_data_id": training_data_id,
+                "training_data_sha256": source_digest,
                 "config_path": config_path.relative_to(ROOT).as_posix(),
                 "created_at": experiment_config["created_at"],
             })
@@ -342,24 +400,16 @@ class PipelineManager:
         command = [sys.executable, "-u", "-m", "src.models.run_experiment", "--config", str(config_path)]
         try:
             result = self.start("training", command, station)
-        except Exception as exc:
+        except Exception:
             config_path.unlink(missing_ok=True)
-            upsert_experiment({
-                "experiment_id": experiment_id,
-                "station": station,
-                "algorithm": algorithm,
-                "status": "failed",
-                "parameters": parameters,
-                "config_path": config_path.relative_to(ROOT).as_posix(),
-                "created_at": experiment_config["created_at"],
-                "error": f"Training process could not be started: {exc}",
-                "completed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            })
             raise
         return {
             "station": station,
             "experiment_id": experiment_id,
             "algorithm": algorithm,
+            "component": component,
+            "training_data_id": training_data_id,
+            "training_data_sha256": source_digest,
             "started": bool(result.get("started")),
             "pid": result.get("pid"),
             "log": result.get("log"),
@@ -390,9 +440,18 @@ class PipelineManager:
         if station not in stations:
             raise ValueError(f"Station '{station}' is not configured.")
         if not self.kafka_available():
-            raise RuntimeError("Kafka broker is not reachable at 127.0.0.1:9092. Start Kafka first.")
+            kafka_cfg = read_kafka_config()
+            raise RuntimeError(
+                f"Kafka bootstrap servers are not reachable: {kafka_cfg.get('bootstrap_servers')}. Start Kafka first."
+            )
 
         entry = stations[station]
+        components = entry.get("model_components")
+        if components is not None and not components.get("demand_forecast", {}).get("enabled", False):
+            raise ValueError(
+                "Streaming activation currently requires the demand_forecast component. "
+                "Solar/wind-only stations can be registered and trained but require a separate stream driver."
+            )
         # Isolate station outputs so one station can be stopped/reset while
         # other station predictors continue writing their own result files.
         registry_changed = False
@@ -426,6 +485,9 @@ class PipelineManager:
         topic_result = self.ensure_station_topics(station)
         python = sys.executable
         history_arg = ["--history-file", str(history_file)]
+        producer_checkpoint_every = int(entry.get("producer_checkpoint_every", 1))
+        if producer_checkpoint_every <= 0:
+            raise ValueError("producer_checkpoint_every must be a positive integer.")
         commands = [
             ("spark", [python, "-u", "-m", "src.spark.streaming", "--station", station]),
             ("predictor", [python, "-u", "-m", "src.models.streaming_predictor", "--station", station,
@@ -433,10 +495,17 @@ class PipelineManager:
                            "--output", str(resolve_root_path(entry["forecasts_file"])),
                            "--actual-output", str(resolve_root_path(entry["actuals_file"]))]),
             ("producer", [python, "-u", "-m", "src.producers.csv_producer", "--station", station, *history_arg,
-                           "--delay", str(float(entry.get("stream_delay_seconds", 1.0)))]),
+                           "--delay", str(float(entry.get("stream_delay_seconds", 1.0))),
+                           "--checkpoint-every", str(producer_checkpoint_every)]),
         ]
         started: list[str] = []
         try:
+            quality_external = os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true"
+            quality_proc = self.processes.get(self.process_key("quality"))
+            if not quality_external and (not quality_proc or quality_proc.poll() is not None):
+                self.start("quality", [python, "-u", "-m", "src.quality.dlq_consumer"])
+                started.append("quality")
+                time.sleep(2)
             for name, command in commands:
                 result = self.start(name, command, station)
                 if result.get("started"):
@@ -446,6 +515,13 @@ class PipelineManager:
                 time.sleep(startup_wait)
                 proc = self.processes.get(self.process_key(name, station))
                 if proc and proc.poll() is not None:
+                    # The CSV producer is a finite replay job. Exit code 0 is
+                    # expected when it has published the final source row, or
+                    # when a restart finds that the saved cursor is already at
+                    # EOF. Do not tear down the long-running Spark/predictor
+                    # services just because the finite producer completed.
+                    if name == "producer" and proc.returncode == 0:
+                        continue
                     raise RuntimeError(f"{station} {name} exited during startup with code {proc.returncode}. Check logs/{station}_{name}.log")
             registry = read_station_config()
             registry["active_station"] = station
@@ -459,7 +535,7 @@ class PipelineManager:
             return {"station": station, "started": started, "topics": topic_result, "status": self.station_status(station)}
         except Exception:
             for name in reversed(started):
-                self.stop(name, station)
+                self.stop(name, None if name == "quality" else station)
             raise
 
     def stop_pipeline(self, station: str | None = None) -> dict[str, Any]:
@@ -477,6 +553,8 @@ class PipelineManager:
                 if registry.get("active_station") == station:
                     registry["active_station"] = next(iter(sorted(active_stations)), None)
                 write_station_config(registry)
+                if not active_stations:
+                    results["quality"] = self.stop("quality")
             return {"station": station, "results": results}
 
         # Backwards-compatible global stop: stop all managed station processes.
@@ -804,7 +882,7 @@ class PipelineManager:
             raise ValueError(f"Unknown station '{station}'.")
         if not self.kafka_available():
             raise RuntimeError(
-                "Kafka broker is not reachable at 127.0.0.1:9092. Start Kafka first."
+                f"Kafka bootstrap servers are not reachable: {read_kafka_config().get('bootstrap_servers')}. Start Kafka first."
             )
 
         entry = stations[station]
@@ -836,8 +914,14 @@ class PipelineManager:
                     "Give each station unique raw and featured topics before resetting."
                 )
 
-        # Preflight output schema and checkpoint path before changing Kafka.
-        if not isolated_outputs:
+        # Preflight storage before deleting Kafka records. Never silently leave
+        # Cassandra station partitions behind while claiming reset succeeded.
+        from src.storage.forecast_store import storage_backend
+        using_cassandra = storage_backend() == "cassandra"
+        if using_cassandra:
+            from src.storage.cassandra_store import clear_station_operational_data
+            clear_station_operational_data(station, dry_run=True)
+        elif not isolated_outputs:
             validate_station_output_files(station)
         spark_cfg = read_spark_config()
         checkpoint_base = str(
@@ -855,6 +939,21 @@ class PipelineManager:
             raise RuntimeError(
                 f"Spark checkpoint path is not a directory: {checkpoint_path}"
             )
+        # The DLQ output query has its own checkpoint. It must be reset with
+        # the featured query after Kafka topic records are truncated.
+        dlq_checkpoint_path = resolve_root_path(f"{checkpoint_base}_{station}_dlq")
+        for label, candidate in (("featured", checkpoint_path), ("DLQ", dlq_checkpoint_path)):
+            if (
+                not candidate.is_relative_to(ROOT.resolve())
+                or candidate == ROOT.resolve()
+            ):
+                raise RuntimeError(
+                    f"Refusing to remove the {label} Spark checkpoint outside the POC folder: {candidate}"
+                )
+            if candidate.exists() and not candidate.is_dir():
+                raise RuntimeError(
+                    f"Spark {label} checkpoint path is not a directory: {candidate}"
+                )
 
         topic_result = self._ensure_reset_topics(
             station, raw_topic, featured_topic
@@ -866,11 +965,23 @@ class PipelineManager:
         # Back up and clear this station's isolated result files. Legacy
         # stations continue using the original shared-CSV filtering behavior.
         output_backup = None
-        if isolated_outputs:
+        if using_cassandra:
+            # CSV files remain untouched when switching between backends.
+            # Only this station's registered Cassandra partitions are cleared.
+            clear_station_operational_data(station, dry_run=False)
+        elif isolated_outputs:
             import datetime as _dt
             backup_dir = ROOT / "data" / "processed" / "reset_backups" / f"{station}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            for field in ("actuals_file", "forecasts_file"):
-                output_path = resolve_root_path(stations[station][field])
+            output_fields = ("actuals_file", "forecasts_file", "renewable_forecasts_file")
+            seen_outputs: set[Path] = set()
+            for field in output_fields:
+                value = stations[station].get(field)
+                if not value:
+                    continue
+                output_path = resolve_root_path(value)
+                if output_path in seen_outputs:
+                    continue
+                seen_outputs.add(output_path)
                 if not output_path.is_relative_to(ROOT.resolve()):
                     raise RuntimeError(f"Refusing to reset output outside POC folder: {output_path}")
                 if output_path.exists():
@@ -886,6 +997,32 @@ class PipelineManager:
         checkpoint_removed = checkpoint_path.exists()
         if checkpoint_removed:
             shutil.rmtree(checkpoint_path)
+        dlq_checkpoint_removed = dlq_checkpoint_path.exists()
+        if dlq_checkpoint_removed:
+            shutil.rmtree(dlq_checkpoint_path)
+
+        # Kafka records and result files have been reset, so the producer's
+        # persisted source cursor must also be cleared. Otherwise the next
+        # normal start would correctly resume *past* the rows that this reset
+        # deliberately removed from Kafka.
+        producer_progress_path = resolve_root_path(
+            f"data/state/{station}/producer_progress.json"
+        )
+        if (
+            not producer_progress_path.is_relative_to(ROOT.resolve())
+            or producer_progress_path == ROOT.resolve()
+            or producer_progress_path.is_symlink()
+        ):
+            raise RuntimeError(
+                f"Refusing to remove unsafe producer progress path: {producer_progress_path}"
+            )
+        if producer_progress_path.exists() and not producer_progress_path.is_file():
+            raise RuntimeError(
+                f"Producer progress path is not a file: {producer_progress_path}"
+            )
+        producer_progress_removed = producer_progress_path.exists()
+        if producer_progress_removed:
+            producer_progress_path.unlink()
 
         # Record the reset state but keep every service stopped. Starting the
         # station is a separate, explicit dashboard action.
@@ -903,12 +1040,17 @@ class PipelineManager:
             "kafka_delete_records_output": delete_output[-2000:],
             "spark_checkpoint": str(checkpoint_path),
             "spark_checkpoint_removed": checkpoint_removed,
+            "spark_dlq_checkpoint": str(dlq_checkpoint_path),
+            "spark_dlq_checkpoint_removed": dlq_checkpoint_removed,
+            "producer_progress_file": str(producer_progress_path),
+            "producer_progress_removed": producer_progress_removed,
             "processed_output_backup": str(output_backup) if output_backup else None,
             "pipeline_started": False,
             "services_remain_stopped": True,
             "message": (
-                f"{station} reset completed. Kafka records, station output rows and "
-                "Spark checkpoint were reset. No services were started. Use Start "
+                f"{station} reset completed. Kafka records, station output rows, "
+                "Spark checkpoints and the producer replay cursor were reset. "
+                "No services were started. Use Start "
                 "selected station when you are ready."
             ),
         }
@@ -965,6 +1107,7 @@ class PipelineManager:
         checkpoint_path = resolve_root_path(f"{checkpoint_base}_{station}")
         fixed_station_dirs = {
             (ROOT / "data" / "raw" / "stations" / station).resolve(),
+            (ROOT / "data" / "training_uploads" / station).resolve(),
             (ROOT / "data" / "state" / station).resolve(),
             (ROOT / "data" / "processed" / "stations" / station).resolve(),
             (ROOT / "models" / station).resolve(),
@@ -1085,8 +1228,14 @@ class PipelineManager:
                     f"Deletion blocked: {station!r} shares Kafka topic(s) with {other_id!r}. Assign unique topics before deleting."
                 )
 
-        # Complete local preflight checks before mutating Kafka or filesystem records.
-        validate_station_output_files(station)
+        # Preflight the active backend before mutating Kafka or station data.
+        from src.storage.forecast_store import storage_backend
+        using_cassandra = storage_backend() == "cassandra"
+        if using_cassandra:
+            from src.storage.cassandra_store import clear_station_operational_data
+            clear_station_operational_data(station, dry_run=True)
+        else:
+            validate_station_output_files(station)
         files_to_delete, dirs_to_delete = self._station_delete_paths(station, entry, stations)
 
         # Clear only this station's Kafka records. Keep empty topic definitions to avoid
@@ -1094,7 +1243,10 @@ class PipelineManager:
         topic_result = self._ensure_reset_topics(station, raw_topic, featured_topic)
         delete_output = self._clear_topic_records(raw_topic, featured_topic)
 
-        # Remove the selected station's rows; all other station rows remain.
+        # Remove only station-scoped operational Cassandra partitions. Local
+        # station file removal below is still performed for a full deletion.
+        if using_cassandra:
+            clear_station_operational_data(station, dry_run=False)
         removed_output_rows = delete_station_output_rows(station)
 
         # Close any log handles retained by exited managed processes before unlinking logs.

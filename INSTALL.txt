@@ -1,0 +1,29 @@
+RESIDUAL LOAD SPIKE DETECTION — UI/CALIBRATION PATCH
+===================================================
+Base project: the previously delivered Version_2_Complete_Residual_Load_Intelligence.zip.
+
+Installation (Windows)
+1. STOP FastAPI, Streamlit and the station predictor.
+2. BACK UP your entire project, especially config/stations.yaml, data/, models/, checkpoints/.
+3. Extract this ZIP into your project ROOT, preserving the directories.
+4. In the project root, REMOVE ONLY THE OBSOLETE SOURCE FILE:
+   del src\models\residual\alerts.py
+   Do NOT delete any data/processed/stations/*/residual_alerts.sqlite files.
+5. Restart FastAPI, Streamlit and the station predictor.
+6. Open Monitoring: Residual Load Spike Detection is below Demand, with anomaly
+   interval bands on matching Demand forecasts and no monitoring score chart.
+7. Open sidebar > Workspace settings > Edit residual spike thresholds.
+   Choose station, set statistical/AE threshold (0=checkpoint calibration),
+   detector agreement and whether only upward spikes should be highlighted.
+
+Changes are code/UI only. Current station registry, production data and trained
+model checkpoints are deliberately NOT included and NOT overwritten. The
+new per-station settings are written by the API only when the operator saves.
+Existing checkpoint calibration continues to work without a settings migration.
+
+See docs/RESIDUAL_SPIKE_MONITORING_UI_PATCH.md for detailed behavior.
+
+Validation: 139 passed / 4 legacy Monitoring assertions failed with Amprion
+fixture files. The four legacy assertions expect old stream-start and 2-second
+refresh text, not the new residual UI. No Streamlit browser or live Windows
+Kafka/Spark execution was performed in this environment.

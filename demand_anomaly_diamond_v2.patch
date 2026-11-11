@@ -1,0 +1,428 @@
+diff -ruN basefull/electricity_mlop_final/.pytest_cache/.gitignore finalfull/electricity_mlop_final/.pytest_cache/.gitignore
+--- basefull/electricity_mlop_final/.pytest_cache/.gitignore	1970-01-01 00:00:00.000000000 +0000
++++ finalfull/electricity_mlop_final/.pytest_cache/.gitignore	2026-11-10 06:42:56.385458902 +0000
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff -ruN basefull/electricity_mlop_final/.pytest_cache/CACHEDIR.TAG finalfull/electricity_mlop_final/.pytest_cache/CACHEDIR.TAG
+--- basefull/electricity_mlop_final/.pytest_cache/CACHEDIR.TAG	1970-01-01 00:00:00.000000000 +0000
++++ finalfull/electricity_mlop_final/.pytest_cache/CACHEDIR.TAG	2026-11-10 06:42:56.385486734 +0000
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff -ruN basefull/electricity_mlop_final/.pytest_cache/README.md finalfull/electricity_mlop_final/.pytest_cache/README.md
+--- basefull/electricity_mlop_final/.pytest_cache/README.md	1970-01-01 00:00:00.000000000 +0000
++++ finalfull/electricity_mlop_final/.pytest_cache/README.md	2026-11-10 06:42:56.385418300 +0000
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff -ruN basefull/electricity_mlop_final/.pytest_cache/v/cache/lastfailed finalfull/electricity_mlop_final/.pytest_cache/v/cache/lastfailed
+--- basefull/electricity_mlop_final/.pytest_cache/v/cache/lastfailed	1970-01-01 00:00:00.000000000 +0000
++++ finalfull/electricity_mlop_final/.pytest_cache/v/cache/lastfailed	2026-11-10 06:43:19.203474677 +0000
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff -ruN basefull/electricity_mlop_final/.pytest_cache/v/cache/nodeids finalfull/electricity_mlop_final/.pytest_cache/v/cache/nodeids
+--- basefull/electricity_mlop_final/.pytest_cache/v/cache/nodeids	1970-01-01 00:00:00.000000000 +0000
++++ finalfull/electricity_mlop_final/.pytest_cache/v/cache/nodeids	2026-11-10 06:45:23.721337217 +0000
+@@ -0,0 +1,13 @@
++[
++  "tests/test_forecast_anomaly_scoring.py::test_forecast_anomaly_scoring_labels_forecast_only_and_uses_actuals_as_context",
++  "tests/test_forecast_anomaly_scoring.py::test_forecast_anomaly_scoring_preserves_missing_forecast_steps",
++  "tests/test_forecast_anomaly_scoring.py::test_invalid_station_threshold_override_is_rejected",
++  "tests/test_forecast_anomaly_scoring.py::test_station_threshold_override_is_applied_without_mutating_checkpoint",
++  "tests/test_forecast_anomaly_strips.py::test_anomalies_are_markers_on_forecast_curve_not_subplot_strips",
++  "tests/test_forecast_anomaly_strips.py::test_downward_demand_is_not_highlighted",
++  "tests/test_forecast_anomaly_strips.py::test_empty_flags_do_not_add_empty_subplot_rows_or_secondary_axes",
++  "tests/test_forecast_anomaly_strips.py::test_legacy_strip_function_ignores_row_indices_and_does_not_need_subplot",
++  "tests/test_monitoring_overlay_fix.py::test_forecast_anomalies_are_overlays_on_one_demand_subplot",
++  "tests/test_monitoring_overlay_fix.py::test_legacy_strips_keyword_does_not_raise_or_create_separate_rows",
++  "tests/test_monitoring_overlay_fix.py::test_renewable_chart_builds_solar_and_wind_actual_and_forecast_traces"
++]
+\ No newline at end of file
+diff -ruN basefull/electricity_mlop_final/config/stations.yaml finalfull/electricity_mlop_final/config/stations.yaml
+--- basefull/electricity_mlop_final/config/stations.yaml	2026-11-10 11:11:32.000000000 +0000
++++ finalfull/electricity_mlop_final/config/stations.yaml	2026-11-10 06:45:21.360005999 +0000
+@@ -1,46 +1,48 @@
+-active_station: amprion
+-stations:
+-  amprion:
+-    display_name: Amprion
+-    enabled: true
+-    status: active
+-    input_file: data/training/amprion/demand_test.csv
+-    history_file: data/training/amprion/demand_train.csv
+-    raw_topic: amprion-raw
+-    featured_topic: amprion-featured
+-    model_checkpoint: models/amprion/demand_dense_nn/model.pt
+-    model_metadata: models/amprion/demand_dense_nn/metadata.json
+-    model_version: amprion-demand-dnn-v1
+-    stream_delay_seconds: 1.5
+-    forecast_every_steps: 4
+-    actuals_file: data/processed/stations/amprion/actuals.csv
+-    forecasts_file: data/processed/stations/amprion/forecasts.csv
+-    topics_ready: true
+-    model_algorithm: dense_nn
+-    interval_minutes: 15
+-    history_steps: 672
+-    horizon_steps: 96
+-    forecast_weather_file: data/raw/stations/amprion/demand_weather_forecast.csv
+-    forecast_weather_mode: forecast_temperature_for_future_horizon
+-    anomaly_model_checkpoint: models/amprion/demand_anomaly/model.joblib
+-    anomaly_model_summary: models/amprion/demand_anomaly/training_summary.json
+-    renewable_forecasts_file: data/processed/stations/amprion/renewable_forecasts.csv
+-    renewables:
+-      enabled: true
+-      interval_minutes: 15
+-      forecast_every_steps: 4
+-      solar:
+-        train_file: data/training/amprion/solar_train.csv
+-        test_file: data/training/amprion/solar_test.csv
+-        checkpoint: models/amprion/solar_dense_nn/model.pt
+-        metadata: models/amprion/solar_dense_nn/metadata.json
+-        model_version: amprion-solar-mlp-v4
+-      wind:
+-        train_file: data/training/amprion/wind_train.csv
+-        test_file: data/training/amprion/wind_test.csv
+-        checkpoint: models/amprion/wind_dense_nn/model.pt
+-        metadata: models/amprion/wind_dense_nn/metadata.json
+-        model_version: amprion-wind-dense-v1
+-    expected_stream_start_utc: '2026-10-01T00:00:00Z'
+-active_stations:
+-- amprion
++active_station: amprion
++stations:
++  amprion:
++    display_name: Amprion
++    enabled: true
++    status: active
++    input_file: data/training/amprion/demand_test.csv
++    history_file: data/training/amprion/demand_train.csv
++    raw_topic: amprion-raw
++    featured_topic: amprion-featured
++    model_checkpoint: models/amprion/demand_dense_nn/model.pt
++    model_metadata: models/amprion/demand_dense_nn/metadata.json
++    model_version: amprion-demand-dnn-v1
++    stream_delay_seconds: 1.5
++    forecast_every_steps: 4
++    actuals_file: data/processed/stations/amprion/actuals.csv
++    forecasts_file: data/processed/stations/amprion/forecasts.csv
++    topics_ready: true
++    model_algorithm: dense_nn
++    interval_minutes: 15
++    history_steps: 672
++    horizon_steps: 96
++    forecast_weather_file: data/raw/stations/amprion/demand_weather_forecast.csv
++    forecast_weather_mode: forecast_temperature_for_future_horizon
++    anomaly_model_checkpoint: models/amprion/demand_anomaly/model.joblib
++    # null = use the checkpoint's calibrated robust-z threshold; set a number to override it at inference time.
++    demand_anomaly_threshold: null
++    anomaly_model_summary: models/amprion/demand_anomaly/training_summary.json
++    renewable_forecasts_file: data/processed/stations/amprion/renewable_forecasts.csv
++    renewables:
++      enabled: true
++      interval_minutes: 15
++      forecast_every_steps: 4
++      solar:
++        train_file: data/training/amprion/solar_train.csv
++        test_file: data/training/amprion/solar_test.csv
++        checkpoint: models/amprion/solar_dense_nn/model.pt
++        metadata: models/amprion/solar_dense_nn/metadata.json
++        model_version: amprion-solar-mlp-v4
++      wind:
++        train_file: data/training/amprion/wind_train.csv
++        test_file: data/training/amprion/wind_test.csv
++        checkpoint: models/amprion/wind_dense_nn/model.pt
++        metadata: models/amprion/wind_dense_nn/metadata.json
++        model_version: amprion-wind-dense-v1
++    expected_stream_start_utc: '2026-10-01T00:00:00Z'
++active_stations:
++- amprion
+Binary files basefull/electricity_mlop_final/dashboard/__pycache__/__init__.cpython-313.pyc and finalfull/electricity_mlop_final/dashboard/__pycache__/__init__.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/dashboard/__pycache__/anomaly_strips.cpython-313.pyc and finalfull/electricity_mlop_final/dashboard/__pycache__/anomaly_strips.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/dashboard/__pycache__/renewable_plot.cpython-313.pyc and finalfull/electricity_mlop_final/dashboard/__pycache__/renewable_plot.cpython-313.pyc differ
+diff -ruN basefull/electricity_mlop_final/dashboard/anomaly_strips.py finalfull/electricity_mlop_final/dashboard/anomaly_strips.py
+--- basefull/electricity_mlop_final/dashboard/anomaly_strips.py	2026-11-09 15:44:34.000000000 +0000
++++ finalfull/electricity_mlop_final/dashboard/anomaly_strips.py	2026-11-10 06:45:21.362114315 +0000
+@@ -20,7 +20,7 @@
+     chart_end: Any,
+     interval_minutes: int = 15,
+ ) -> dict[str, int]:
+-    """Add level and upward-ramp markers on forecast MW coordinates only.
++    """Add demand-high and upward-ramp markers on forecast MW coordinates only.
+ 
+     Low/downward-demand events are intentionally not highlighted, matching the
+     supplied Dense Autoencoder inference classifier.  No actual-demand timestamp
+@@ -59,8 +59,8 @@
+     specs = [
+         (
+             "demand_level_anomaly",
+-            "Demand level (historical baseline)",
+-            "#D32F2F",
++            "Demand high",
++            "#F57C00",
+             "circle",
+             "demand_level",
+             "demand_level_score_z",
+@@ -68,7 +68,7 @@
+         (
+             "ramp_up_anomaly",
+             "Ramp-up",
+-            "#F57C00",
++            "#D32F2F",
+             "diamond",
+             "ramp_up",
+             "ramp_up_score_z",
+Binary files basefull/electricity_mlop_final/dashboard/pages/__pycache__/monitoring.cpython-313.pyc and finalfull/electricity_mlop_final/dashboard/pages/__pycache__/monitoring.cpython-313.pyc differ
+diff -ruN basefull/electricity_mlop_final/dashboard/pages/monitoring.py finalfull/electricity_mlop_final/dashboard/pages/monitoring.py
+--- basefull/electricity_mlop_final/dashboard/pages/monitoring.py	2026-11-09 18:21:50.000000000 +0000
++++ finalfull/electricity_mlop_final/dashboard/pages/monitoring.py	2026-11-10 06:45:21.361093643 +0000
+@@ -38,13 +38,21 @@
+ 
+ @st.cache_data(ttl=60, show_spinner=False)
+ def forecast_anomaly_scores_cached(
+-    actual_records: list[dict], forecast_records: list[dict], checkpoint_path: str
++    actual_records: list[dict],
++    forecast_records: list[dict],
++    checkpoint_path: str,
++    threshold_override: float | None,
++    checkpoint_signature: tuple,
+ ) -> pd.DataFrame:
+     """Score only the latest forecast path; actuals are context, not targets."""
+     from src.models.anomaly.dashboard_scoring import score_forecast_records
++    # checkpoint_signature is deliberately part of the cache key. Retraining
++    # the checkpoint at the same path must invalidate cached anomaly scores.
++    del checkpoint_signature
+     return score_forecast_records(
+         actual_records, forecast_records, checkpoint_path,
+         max_history_points=5000, interval_minutes=15,
++        threshold_override=threshold_override,
+     )
+ 
+ 
+@@ -263,12 +271,17 @@
+         anomaly_path = Path(anomaly_model_path)
+         if not anomaly_path.is_absolute():
+             anomaly_path = Path(__file__).resolve().parents[2] / anomaly_path
++        anomaly_threshold = stations[station].get("demand_anomaly_threshold")
++        anomaly_stat = anomaly_path.stat()
+         forecast_anomaly_scores = forecast_anomaly_scores_cached(
+-            actuals.to_dict("records"), latest_run.to_dict("records"),
++            actuals.to_dict("records"),
++            latest_run.to_dict("records"),
+             str(anomaly_path.resolve()),
++            float(anomaly_threshold) if anomaly_threshold is not None else None,
++            (anomaly_stat.st_size, anomaly_stat.st_mtime_ns),
+         )
+     except Exception as exc:
+-        st.warning(f"Forecast demand-level/ramp-up strips are temporarily unavailable: {exc}")
++        st.warning(f"Forecast demand-high/ramp-up markers are temporarily unavailable: {exc}")
+ 
+ # ---------------------------------------------------------------------
+ # KPI cards
+@@ -452,15 +465,20 @@
+     )
+     st.caption(
+         "Forecast-path anomaly markers only: "
+-        f"{strip_counts['demand_level']:,} demand-level flags · "
++        f"{strip_counts['demand_level']:,} demand-high flags · "
+         f"{strip_counts['ramp_up']:,} ramp-up flags · "
+         f"{valid_scores:,} of {len(strip):,} forecast steps scored. "
+-        "Only high-demand level/ramp events are marked; downward-demand events remain uncoloured. "
+-        "No anomaly labels are assigned to the actual-demand curve."
++        "Orange circles mark demand-high events; red diamonds mark ramp-up events. Downward-demand anomalies remain uncoloured. "
++        "No anomaly labels are assigned to the actual-demand curve. "
++        + (
++            f"Threshold: {float(anomaly_threshold):.3f} (station config)."
++            if anomaly_model_path and anomaly_threshold is not None
++            else "Threshold: checkpoint-calibrated."
++        )
+     )
+ elif anomaly_model_path and not latest_run.empty:
+     st.caption(
+-        "Demand-level and ramp-up markers are waiting for a complete historical context "
++        "Demand-high and ramp-up markers are waiting for a complete historical context "
+         "and forecast run."
+     )
+ 
+Binary files basefull/electricity_mlop_final/src/__pycache__/__init__.cpython-313.pyc and finalfull/electricity_mlop_final/src/__pycache__/__init__.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/src/models/__pycache__/__init__.cpython-313.pyc and finalfull/electricity_mlop_final/src/models/__pycache__/__init__.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/src/models/anomaly/__pycache__/__init__.cpython-313.pyc and finalfull/electricity_mlop_final/src/models/anomaly/__pycache__/__init__.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/src/models/anomaly/__pycache__/dashboard_scoring.cpython-313.pyc and finalfull/electricity_mlop_final/src/models/anomaly/__pycache__/dashboard_scoring.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/src/models/anomaly/__pycache__/demand_ae_common.cpython-313.pyc and finalfull/electricity_mlop_final/src/models/anomaly/__pycache__/demand_ae_common.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/src/models/anomaly/__pycache__/demand_ae_inference.cpython-313.pyc and finalfull/electricity_mlop_final/src/models/anomaly/__pycache__/demand_ae_inference.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/src/models/anomaly/__pycache__/demand_ae_model.cpython-313.pyc and finalfull/electricity_mlop_final/src/models/anomaly/__pycache__/demand_ae_model.cpython-313.pyc differ
+diff -ruN basefull/electricity_mlop_final/src/models/anomaly/dashboard_scoring.py finalfull/electricity_mlop_final/src/models/anomaly/dashboard_scoring.py
+--- basefull/electricity_mlop_final/src/models/anomaly/dashboard_scoring.py	2026-11-09 13:28:08.000000000 +0000
++++ finalfull/electricity_mlop_final/src/models/anomaly/dashboard_scoring.py	2026-11-10 06:45:21.358664292 +0000
+@@ -49,6 +49,7 @@
+     *,
+     max_history_points: int = 5000,
+     interval_minutes: int = 15,
++    threshold_override: float | None = None,
+ ) -> pd.DataFrame:
+     """Score anomaly *risk on the forecast trajectory*, using actuals only as context.
+ 
+@@ -130,12 +131,28 @@
+     bundle = joblib.load(Path(checkpoint_path))
+     if int(bundle.get("schema_version", 0)) < 6:
+         raise ValueError("Demand anomaly checkpoint must use schema version 6 or newer.")
++
++    # Keep the checkpoint immutable. A station-level YAML override changes only
++    # the inference decision boundary; model weights, scaler and calibration
++    # statistics remain those produced during training.
++    if threshold_override is not None:
++        threshold_value = float(threshold_override)
++        if not np.isfinite(threshold_value) or threshold_value < 0:
++            raise ValueError(
++                "demand_anomaly_threshold must be a finite number >= 0, or null."
++            )
++        bundle = dict(bundle)
++        bundle["current_step_threshold"] = threshold_value
++
+     scored = score_timestamps(forecast_series, combined, bundle, batch_size=512)
+     # The inference engine uses an 'actual_demand_mw' output name generically;
+     # in this adapter every target row is a model forecast, not a realised value.
+     scored = scored.rename(columns={"actual_demand_mw": "forecast_demand_mw"})
+     scored["classification_scope"] = "FORECAST_PATH_ONLY"
+     scored["is_anomaly_risk"] = scored["classification"].eq("YES")
++    scored["threshold_source"] = (
++        "station_config" if threshold_override is not None else "model_calibrated"
++    )
+     # These are the only two dashboard strips. They use the component-level
+     # classification already produced by the supplied inference implementation;
+     # no generic NORMAL/INSUFFICIENT strip is created.
+Binary files basefull/electricity_mlop_final/tests/__pycache__/__init__.cpython-313.pyc and finalfull/electricity_mlop_final/tests/__pycache__/__init__.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_scoring.cpython-313-pytest-9.0.2.pyc and finalfull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_scoring.cpython-313-pytest-9.0.2.pyc differ
+Binary files basefull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_scoring.cpython-313.pyc and finalfull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_scoring.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_strips.cpython-313-pytest-9.0.2.pyc and finalfull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_strips.cpython-313-pytest-9.0.2.pyc differ
+Binary files basefull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_strips.cpython-313.pyc and finalfull/electricity_mlop_final/tests/__pycache__/test_forecast_anomaly_strips.cpython-313.pyc differ
+Binary files basefull/electricity_mlop_final/tests/__pycache__/test_monitoring_overlay_fix.cpython-313-pytest-9.0.2.pyc and finalfull/electricity_mlop_final/tests/__pycache__/test_monitoring_overlay_fix.cpython-313-pytest-9.0.2.pyc differ
+Binary files basefull/electricity_mlop_final/tests/__pycache__/test_monitoring_overlay_fix.cpython-313.pyc and finalfull/electricity_mlop_final/tests/__pycache__/test_monitoring_overlay_fix.cpython-313.pyc differ
+diff -ruN basefull/electricity_mlop_final/tests/test_forecast_anomaly_scoring.py finalfull/electricity_mlop_final/tests/test_forecast_anomaly_scoring.py
+--- basefull/electricity_mlop_final/tests/test_forecast_anomaly_scoring.py	2026-11-09 12:28:04.000000000 +0000
++++ finalfull/electricity_mlop_final/tests/test_forecast_anomaly_scoring.py	2026-11-10 06:45:21.364393634 +0000
+@@ -92,3 +92,66 @@
+     assert result["classification"].tolist() == ["NO", "INSUFFICIENT_DATA", "INSUFFICIENT_DATA"]
+     assert not result["demand_level_anomaly"].any()
+     assert not result["ramp_up_anomaly"].any()
++
++
++
++def test_station_threshold_override_is_applied_without_mutating_checkpoint(tmp_path, monkeypatch):
++    checkpoint = tmp_path / "bundle.joblib"
++    checkpoint.write_bytes(b"placeholder")
++    original_bundle = {"schema_version": 6, "current_step_threshold": 7.5}
++    monkeypatch.setattr(dashboard_scoring.joblib, "load", lambda _path: original_bundle)
++
++    start = pd.Timestamp("2026-01-01T00:00:00Z")
++    actual_times = pd.date_range(end=start - pd.Timedelta(minutes=15), periods=240, freq="15min")
++    actual_records = [
++        {"utc_timestamp": ts, "actual_demand": 4000.0 + i}
++        for i, ts in enumerate(actual_times)
++    ]
++    forecast_times = pd.date_range(start=start, periods=4, freq="15min")
++    forecast_records = [
++        {"forecast_timestamp_utc": ts, "predicted_demand": 5000.0 + i}
++        for i, ts in enumerate(forecast_times)
++    ]
++    captured = {}
++
++    def fake_score_timestamps(test_series, combined_series, bundle, batch_size=512):
++        captured["threshold"] = bundle["current_step_threshold"]
++        return pd.DataFrame({
++            "timestamp_utc": test_series.index,
++            "actual_demand_mw": test_series.to_numpy(),
++            "classification": ["NO"] * len(test_series),
++            "combined_anomaly_score": [1.0] * len(test_series),
++            "threshold": [bundle["current_step_threshold"]] * len(test_series),
++            "spike_cause": ["NONE"] * len(test_series),
++            "anomaly_direction": ["NORMAL"] * len(test_series),
++            "context_valid": [True] * len(test_series),
++        })
++
++    monkeypatch.setattr(dashboard_scoring, "score_timestamps", fake_score_timestamps)
++    result = dashboard_scoring.score_forecast_records(
++        actual_records, forecast_records, checkpoint, threshold_override=5.25
++    )
++    assert captured["threshold"] == 5.25
++    assert original_bundle["current_step_threshold"] == 7.5
++    assert result["threshold_source"].eq("station_config").all()
++
++
++def test_invalid_station_threshold_override_is_rejected(tmp_path, monkeypatch):
++    checkpoint = tmp_path / "bundle.joblib"
++    checkpoint.write_bytes(b"placeholder")
++    monkeypatch.setattr(
++        dashboard_scoring.joblib, "load",
++        lambda _path: {"schema_version": 6, "current_step_threshold": 7.5},
++    )
++    start = pd.Timestamp("2026-01-01T00:00:00Z")
++    actual_times = pd.date_range(end=start - pd.Timedelta(minutes=15), periods=240, freq="15min")
++    actual_records = [{"utc_timestamp": ts, "actual_demand": 4000.0} for ts in actual_times]
++    forecast_records = [{
++        "forecast_timestamp_utc": ts, "predicted_demand": 5000.0
++    } for ts in pd.date_range(start=start, periods=2, freq="15min")]
++
++    import pytest
++    with pytest.raises(ValueError, match="demand_anomaly_threshold"):
++        dashboard_scoring.score_forecast_records(
++            actual_records, forecast_records, checkpoint, threshold_override=-1
++        )
+diff -ruN basefull/electricity_mlop_final/tests/test_forecast_anomaly_strips.py finalfull/electricity_mlop_final/tests/test_forecast_anomaly_strips.py
+--- basefull/electricity_mlop_final/tests/test_forecast_anomaly_strips.py	2026-11-09 15:44:34.000000000 +0000
++++ finalfull/electricity_mlop_final/tests/test_forecast_anomaly_strips.py	2026-11-10 06:45:21.365373930 +0000
+@@ -86,7 +86,7 @@
+     assert counts == {"demand_level": 0, "ramp_up": 0}
+     assert len(fig.data) == 2
+     assert [trace.name for trace in fig.data] == [
+-        "Demand level (historical baseline)", "Ramp-up"
++        "Demand high", "Ramp-up"
+     ]
+     assert all(len(trace.x) == 0 for trace in fig.data)
+     assert not hasattr(fig.layout, "yaxis2") or fig.layout.yaxis2 is None
+diff -ruN basefull/electricity_mlop_final/tests/test_monitoring_overlay_fix.py finalfull/electricity_mlop_final/tests/test_monitoring_overlay_fix.py
+--- basefull/electricity_mlop_final/tests/test_monitoring_overlay_fix.py	2026-11-09 15:02:28.000000000 +0000
++++ finalfull/electricity_mlop_final/tests/test_monitoring_overlay_fix.py	2026-11-10 06:45:21.363201868 +0000
+@@ -30,16 +30,19 @@
+     fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
+     counts = add_forecast_anomaly_overlays(
+         fig, scores, forecast_origin=origin,
+-        chart_end=origin + pd.Timedelta(hours=1), row=1,
++        chart_end=origin + pd.Timedelta(hours=1),
+     )
+     assert counts == {"demand_level": 1, "ramp_up": 1}
+     assert len(fig.data) == 2
+-    assert all(trace.type == "bar" for trace in fig.data)
+-    assert all(trace.yaxis == "y2" for trace in fig.data)
++    assert all(trace.type == "scatter" and trace.mode == "markers" for trace in fig.data)
+     assert set(trace.name for trace in fig.data) == {
+-        "Demand level (historical baseline)", "Ramp-up"
++        "Demand high", "Ramp-up"
+     }
+-    # The timestamp at the origin and a downward event do not get highlighted.
++    assert fig.data[0].marker.symbol == "circle"
++    assert fig.data[1].marker.symbol == "diamond"
++    assert fig.data[0].marker.color == "#F57C00"
++    assert fig.data[1].marker.color == "#D32F2F"
++    # Only forecast timestamps are marked; downward demand remains unhighlighted.
+     assert pd.Timestamp(fig.data[0].x[0], tz="UTC") == origin + pd.Timedelta(minutes=15)
+     assert pd.Timestamp(fig.data[1].x[0], tz="UTC") == origin + pd.Timedelta(minutes=30)
+ 
+@@ -54,7 +57,7 @@
+     )
+     assert counts == {"demand_level": 1, "ramp_up": 1}
+     assert len(fig.data) == 2
+-    assert all(trace.yaxis == "y2" for trace in fig.data)
++    assert all(trace.type == "scatter" and trace.mode == "markers" for trace in fig.data)
+ 
+ 
+ def test_renewable_chart_builds_solar_and_wind_actual_and_forecast_traces():

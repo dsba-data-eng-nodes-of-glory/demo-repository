@@ -1,0 +1,31 @@
+{
+  "base": "Version_2_Complete_Residual_Load_Intelligence.zip",
+  "source_files": [
+    "backend/results_api.py",
+    "backend/station_api.py",
+    "dashboard/pages/model_management.py",
+    "dashboard/pages/monitoring.py",
+    "dashboard/residual_plot.py",
+    "dashboard/ui.py",
+    "docs/RESIDUAL_LOAD_MIGRATION.md",
+    "docs/RESIDUAL_SPIKE_MONITORING_UI_PATCH.md",
+    "src/models/residual/service.py",
+    "src/models/residual/snapshots.py",
+    "src/models/streaming_predictor.py",
+    "tests/test_residual_load_pipeline.py"
+  ],
+  "remove_obsolete_files": [
+    "src/models/residual/alerts.py"
+  ],
+  "excluded_user_state": [
+    "config/stations.yaml",
+    "data/",
+    "models/",
+    "checkpoints/",
+    "logs/"
+  ],
+  "validation": {
+    "full_tests_passed": 139,
+    "legacy_failures": 4
+  }
+}
