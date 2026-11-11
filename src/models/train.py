@@ -24,6 +24,9 @@ import yaml
 from src.ingestion.file_loader import load_station_csv
 from src.features.feature_schema import HISTORY_FEATURES, FUTURE_FEATURES
 from src.models.forecast_contract import station_forecast_contract
+from src.models.time_segments import (
+    continuous_segment_bounds, sample_origins_by_segment, split_forecast_origins,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -133,14 +136,6 @@ class WindowDataset(Dataset):
         )
 
 
-def sample_indices(indices: np.ndarray, maximum: int) -> np.ndarray:
-    indices = np.asarray(indices, dtype=np.int64)
-    if maximum <= 0 or len(indices) <= maximum:
-        return indices
-    chosen = np.linspace(0, len(indices) - 1, num=maximum, dtype=np.int64)
-    return indices[np.unique(chosen)]
-
-
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
              demand_mean: float, demand_std: float, criterion: nn.Module) -> tuple[float, float, float, float, float, list[dict[str, float]]]:
     """Evaluate on original MW scale while retaining scaled RMSE for compatibility."""
@@ -240,23 +235,32 @@ def main() -> None:
     torch.set_num_threads(max(1, torch_threads))
     device = torch.device("cpu")  # Local POC is intentionally CPU-safe.
 
-    frame = load_station_csv(csv_path, interval_minutes=interval_minutes)
+    frame = load_station_csv(csv_path, interval_minutes=interval_minutes, allow_gaps=True)
     timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True))
     demand = frame["demand"].to_numpy(dtype=np.float32)
     temperature = frame["temperature"].to_numpy(dtype=np.float32)
     n_rows = len(frame)
 
-    split_row = int(n_rows * (1.0 - args.validation_fraction))
-    if split_row <= history_steps + horizon_steps or n_rows - split_row < horizon_steps:
+    segments = continuous_segment_bounds(timestamps, interval_minutes)
+    train_indices, val_indices = split_forecast_origins(
+        timestamps, history_steps, horizon_steps, interval_minutes,
+        validation_fraction=args.validation_fraction,
+    )
+    if len(train_indices) < 1 or len(val_indices) < 1:
         raise ValueError(
-            f"Not enough rows ({n_rows}) for history={history_steps}, horizon={horizon_steps} "
-            "and the selected chronological validation split."
+            f"Not enough continuous data for LSTM training and validation: found "
+            f"{len(train_indices)} training and {len(val_indices)} validation windows. "
+            "Each window must stay inside one continuous timestamp segment."
         )
 
-    demand_mean = float(np.mean(demand[:split_row]))
-    demand_std = float(np.std(demand[:split_row]))
-    temp_mean = float(np.mean(temperature[:split_row]))
-    temp_std = float(np.std(temperature[:split_row]))
+    training_target_indices = np.unique(np.concatenate([
+        np.arange(origin, origin + horizon_steps, dtype=np.int64)
+        for origin in train_indices
+    ]))
+    demand_mean = float(np.mean(demand[training_target_indices]))
+    demand_std = float(np.std(demand[training_target_indices]))
+    temp_mean = float(np.mean(temperature[training_target_indices]))
+    temp_std = float(np.std(temperature[training_target_indices]))
     demand_std = demand_std if demand_std > 1e-8 else 1.0
     temp_std = temp_std if temp_std > 1e-8 else 1.0
 
@@ -271,10 +275,12 @@ def main() -> None:
     history_matrix = np.column_stack([hist_map[name] for name in HISTORY_FEATURES]).astype(np.float32)
 
     # Each index is the first target row; its history ends immediately before it.
-    train_indices = np.arange(history_steps, split_row - horizon_steps + 1, dtype=np.int64)
-    val_indices = np.arange(split_row, n_rows - horizon_steps + 1, dtype=np.int64)
-    train_indices = sample_indices(train_indices, args.max_train_windows)
-    val_indices = sample_indices(val_indices, args.max_validation_windows)
+    train_indices = sample_origins_by_segment(
+        train_indices, timestamps, interval_minutes, args.max_train_windows
+    )
+    val_indices = sample_origins_by_segment(
+        val_indices, timestamps, interval_minutes, args.max_validation_windows
+    )
     if len(train_indices) < 1 or len(val_indices) < 1:
         raise ValueError("The selected data split produced no training or validation windows.")
 
@@ -424,11 +430,12 @@ def main() -> None:
             "matched_observations": int(len(val_ds) * horizon_steps),
         },
         "horizon_metrics": best_horizon_metrics,
-        "validation_start_utc": pd.Timestamp(timestamps[split_row]).isoformat(),
-        "validation_end_utc": pd.Timestamp(timestamps[-1]).isoformat(),
-        "training_start_utc": pd.Timestamp(timestamps[0]).isoformat(),
-        "training_end_utc": pd.Timestamp(timestamps[split_row - 1]).isoformat(),
-        "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
+        "validation_start_utc": pd.Timestamp(timestamps[int(val_indices.min())]).isoformat(),
+        "validation_end_utc": pd.Timestamp(timestamps[min(n_rows - 1, int(val_indices.max()) + horizon_steps - 1)]).isoformat(),
+        "training_start_utc": pd.Timestamp(timestamps[max(0, int(train_indices.min()) - history_steps)]).isoformat(),
+        "training_end_utc": pd.Timestamp(timestamps[min(n_rows - 1, int(train_indices.max()) + horizon_steps - 1)]).isoformat(),
+        "continuous_segment_count": len(segments),
+        "evaluation_protocol": "chronological_holdout_sampled_origins_per_segment_v1",
         "training_history": history_log,
         "note": "Future temperature uses last-observed persistence in both training and inference.",
     }

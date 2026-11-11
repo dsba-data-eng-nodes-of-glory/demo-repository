@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from src.models.time_segments import valid_forecast_origins
 
 LEGACY_FEATURE_SCHEMA = "electricity_tabular_v1"
 FEATURE_SCHEMA = "electricity_tabular_v2"  # Existing day + week models.
@@ -115,8 +116,8 @@ def build_origin_features(
     if not np.isfinite(demand).all() or not np.isfinite(temperature).all():
         raise ValueError("History has missing or non-finite values.")
     if len(timestamps) > 1:
-        expected = pd.Timedelta(minutes=interval_minutes).value
-        if not np.all(np.diff(timestamps.asi8) == expected):
+        expected = pd.Timedelta(minutes=interval_minutes)
+        if not np.all(timestamps[1:] - timestamps[:-1] == expected):
             raise ValueError("History window is not continuous at the configured interval.")
 
     origin_temp = float(temperature[-1])
@@ -224,8 +225,13 @@ def build_training_examples(
     targets: list[np.ndarray] = []
     origin_ids: list[np.ndarray] = []
     timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True))
+    allowed_origins = set(valid_forecast_origins(
+        timestamps, history_steps, horizon_steps, interval_minutes
+    ).tolist())
     demand = frame["demand"].to_numpy(dtype=float)
     for origin in np.asarray(origins, dtype=int):
+        if int(origin) not in allowed_origins:
+            continue
         history = frame.iloc[origin - history_steps:origin]
         future_ts = timestamps[origin:origin + horizon_steps]
         if len(future_ts) != horizon_steps:

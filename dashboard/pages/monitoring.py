@@ -247,6 +247,16 @@ k2.metric("First Forecast Step", fmt_mw(first_forecast))
 k3.metric("24h Peak Forecast", fmt_mw(peak_forecast))
 k4.metric("24h Average Forecast", fmt_mw(average_forecast))
 
+forecast_annotations = []
+if not latest_run.empty and "predicted_demand_class" in latest_run.columns:
+    forecast_annotations.append(("First-step demand class", latest_run.iloc[0]["predicted_demand_class"]))
+if not latest_run.empty and "predicted_cluster" in latest_run.columns:
+    forecast_annotations.append(("First-step K-Means cluster", latest_run.iloc[0]["predicted_cluster"]))
+if forecast_annotations:
+    annotation_columns = st.columns(len(forecast_annotations))
+    for column, (label, value) in zip(annotation_columns, forecast_annotations):
+        column.metric(label, str(value) if pd.notna(value) else "—")
+
 if forecast_origin is not None:
     st.caption(f"Forecast origin (Now): {fmt_utc(forecast_origin)}")
 if not latest_run.empty and "forecast_issued_at_utc" in latest_run.columns:
@@ -424,6 +434,31 @@ if fig.data:
     )
     st.plotly_chart(fig, use_container_width=True)
 
+if not latest_run.empty and (
+    "predicted_demand_class" in latest_run.columns
+    or "predicted_cluster" in latest_run.columns
+):
+    annotation_views = st.columns(2)
+    if "predicted_demand_class" in latest_run.columns:
+        with annotation_views[0]:
+            st.subheader("24-hour demand classes")
+            class_counts = (
+                latest_run["predicted_demand_class"].dropna().astype(str)
+                .value_counts().rename_axis("Class").reset_index(name="Intervals")
+            )
+            if not class_counts.empty:
+                st.bar_chart(class_counts, x="Class", y="Intervals", height=260)
+    if "predicted_cluster" in latest_run.columns:
+        with annotation_views[1]:
+            st.subheader("24-hour K-Means clusters")
+            cluster_counts = (
+                pd.to_numeric(latest_run["predicted_cluster"], errors="coerce").dropna()
+                .astype(int).value_counts().sort_index().rename_axis("Cluster")
+                .reset_index(name="Intervals")
+            )
+            if not cluster_counts.empty:
+                st.bar_chart(cluster_counts, x="Cluster", y="Intervals", height=260)
+
 # ---------------------------------------------------------------------
 # Latest forecast run details
 # ---------------------------------------------------------------------
@@ -438,6 +473,8 @@ if not latest_run.empty:
             "forecast_timestamp_utc",
             "horizon_step",
             "predicted_demand",
+            "predicted_demand_class",
+            "predicted_cluster",
             "weather_mode",
             "model_file",
         ]

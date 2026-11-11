@@ -21,7 +21,8 @@ TIMESTAMP_ALIASES = (
 )
 DEMAND_ALIASES = (
     "demand", "actual_demand", "demand_mw", "load", "load_mw",
-    "actual_load", "actual_load_mw", "consumption", "power_mw", "power",
+    "demand_met", "demand_met_mw", "actual_load", "actual_load_mw",
+    "consumption", "power_mw", "power",
 )
 TEMPERATURE_ALIASES = (
     "temperature", "temp", "temperature_c", "temp_c", "temperature_2m",
@@ -47,12 +48,31 @@ def _alias_match(columns: list[str], aliases: tuple[str, ...]) -> str | None:
 def _parse_auto(raw: pd.Series) -> pd.Series:
     """Parse mixed ISO, European and common datetime strings robustly."""
     text = raw.astype("string").str.strip().replace("", pd.NA)
-    try:
-        parsed = pd.to_datetime(
-            text, format="mixed", dayfirst=True, errors="coerce", utc=True
-        )
-    except (TypeError, ValueError):  # Compatibility with older pandas releases.
-        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce", utc=True)
+    # Parse year-first ISO values separately. In recent pandas versions,
+    # ``format='mixed', dayfirst=True`` can reinterpret ISO month/day fields.
+    iso_mask = text.str.match(r"^\d{4}-\d{2}-\d{2}(?:[T ]|$)", na=False)
+    parsed = pd.Series(pd.NaT, index=text.index, dtype="datetime64[ns, UTC]")
+    if iso_mask.any():
+        try:
+            parsed.loc[iso_mask] = pd.to_datetime(
+                text.loc[iso_mask], format="ISO8601", errors="coerce", utc=True
+            )
+        except (TypeError, ValueError):
+            parsed.loc[iso_mask] = pd.to_datetime(
+                text.loc[iso_mask], errors="coerce", utc=True
+            )
+
+    other_mask = ~iso_mask & text.notna()
+    if other_mask.any():
+        try:
+            parsed.loc[other_mask] = pd.to_datetime(
+                text.loc[other_mask], format="mixed", dayfirst=True,
+                errors="coerce", utc=True,
+            )
+        except (TypeError, ValueError):  # Compatibility with older pandas releases.
+            parsed.loc[other_mask] = pd.to_datetime(
+                text.loc[other_mask], dayfirst=True, errors="coerce", utc=True
+            )
 
     # Try month-first values (for example MM/DD/YYYY) that cannot be parsed
     # with dayfirst=True, then ISO separately for mixed-offset strings.
@@ -132,13 +152,13 @@ def detect_station_columns(
     missing = []
     if not dem_col:
         missing.append("demand/load")
-    if not temp_col:
-        missing.append("temperature/temp")
     if missing:
         raise ValueError(
             "Could not identify required source column(s): " + ", ".join(missing)
-            + ". The uploaded CSV must include demand and temperature data. "
-            "Recognized headers include demand/load_mw and temperature/temp_c. "
+            + ". The uploaded CSV must include a timestamp and demand/load column. "
+            "Temperature is optional; when absent, the compatibility placeholder is 0 and "
+            "the model cannot learn temperature effects. "
+            "Recognized headers include demand/load_mw, demand_met_mw and temperature/temp_c. "
             "Available columns: " + ", ".join(map(str, columns))
         )
     return {"timestamp": ts_col, "demand": dem_col, "temperature": temp_col}
@@ -152,8 +172,10 @@ def load_station_csv(
     source_timezone: str = "UTC",
     demand_column: str | None = None,
     temperature_column: str | None = None,
+    resample_to_interval: bool = False,
+    allow_gaps: bool = False,
 ) -> pd.DataFrame:
-    """Load, normalize and validate a continuous station demand series.
+    """Load and normalize a station series, optionally resampling or retaining gaps.
 
     ``timestamp_column``, ``demand_column`` and ``temperature_column`` remain
     optional for backwards compatibility. New onboarding calls automatically
@@ -225,12 +247,20 @@ def load_station_csv(
     df = df.copy()
     df["utc_timestamp"] = ts
     df["demand"] = pd.to_numeric(df[resolved["demand"]], errors="coerce")
-    df["temperature"] = pd.to_numeric(df[resolved["temperature"]], errors="coerce")
+    temperature_available = resolved["temperature"] is not None
+    if temperature_available:
+        df["temperature"] = pd.to_numeric(df[resolved["temperature"]], errors="coerce")
+    else:
+        # Keep the canonical station schema usable by Spark and existing model
+        # code. This is a constant compatibility value, not a measurement.
+        df["temperature"] = 0.0
 
-    invalid_numeric = df[["demand", "temperature"]].isna().any(axis=1)
+    numeric_columns = ["demand", "temperature"] if temperature_available else ["demand"]
+    invalid_numeric = df[numeric_columns].isna().any(axis=1)
     if invalid_numeric.any():
         raise ValueError(
-            f"Found {int(invalid_numeric.sum()):,} rows with missing or non-numeric demand/temperature values. "
+            f"Found {int(invalid_numeric.sum()):,} rows with missing or non-numeric "
+            f"{'demand/temperature' if temperature_available else 'demand'} values. "
             "Check the uploaded CSV values; these columns are detected automatically."
         )
 
@@ -243,20 +273,44 @@ def load_station_csv(
     if (df["demand"] < 0).any():
         raise ValueError("Negative demand values found. Check the demand column mapping.")
 
+    source_row_count = int(len(df))
     expected = pd.Timedelta(minutes=interval_minutes)
-    differences = df["utc_timestamp"].diff().dropna()
-    irregular = differences[differences != expected]
-    if not irregular.empty:
-        examples = [str(value) for value in irregular.head(5).tolist()]
-        counts = differences.value_counts().head(5).to_dict()
-        raise ValueError(
-            f"Found {len(irregular):,} irregular timestamp intervals. The selected source interval is "
-            f"{interval_minutes} minutes. Most common observed intervals: {counts}. "
-            f"Examples of mismatches: {examples}. Select the actual source interval or check for missing/duplicate rows."
+    if resample_to_interval:
+        # Aggregate observations into UTC-aligned interval buckets. Empty
+        # buckets remain absent so long gaps are preserved as segment breaks.
+        df = (
+            df.set_index("utc_timestamp")[REQUIRED[1:]]
+            .resample(expected, origin="start_day", label="left", closed="left")
+            .mean()
+            .dropna(subset=["demand"])
+            .reset_index()
         )
+    else:
+        differences = df["utc_timestamp"].diff().dropna()
+        if not allow_gaps:
+            irregular = differences[differences != expected]
+            if not irregular.empty:
+                examples = [str(value) for value in irregular.head(5).tolist()]
+                counts = differences.value_counts().head(5).to_dict()
+                raise ValueError(
+                    f"Found {len(irregular):,} irregular timestamp intervals. The selected source interval is "
+                    f"{interval_minutes} minutes. Most common observed intervals: {counts}. "
+                    f"Examples of mismatches: {examples}. Select the actual source interval or check for missing/duplicate rows."
+                )
+        elif ((differences % expected) != pd.Timedelta(0)).any():
+            raise ValueError(
+                f"Timestamps must align to the selected {interval_minutes}-minute grid even when gaps are allowed."
+            )
+
+    if df.empty:
+        raise ValueError("CSV contains no observations after interval aggregation.")
 
     result = df[REQUIRED].reset_index(drop=True)
     result.attrs["source_columns"] = resolved
+    result.attrs["temperature_available"] = temperature_available
     result.attrs["timestamp_format_used"] = actual_format
     result.attrs["naive_timestamp_timezone"] = "UTC"
+    result.attrs["source_row_count"] = source_row_count
+    result.attrs["resampling_method"] = "mean" if resample_to_interval else "none"
+    result.attrs["interval_minutes"] = int(interval_minutes)
     return result

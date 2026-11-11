@@ -171,7 +171,7 @@ def load_model(
     device = torch.device(model_cfg.get("device", "cpu"))
     torch.set_num_threads(max(1, int(model_cfg.get("torch_num_threads", 2))))
 
-    if algorithm in {"random_forest", "gbt", "xgboost"} or checkpoint_path.suffix.lower() in {".joblib", ".pkl"}:
+    if algorithm in {"random_forest", "gbt", "xgboost", "kmeans"} or checkpoint_path.suffix.lower() in {".joblib", ".pkl"}:
         metadata_value = active.get("metadata_path")
         metadata_path = Path(metadata_value) if metadata_value else checkpoint_path.parent / "metadata.json"
         if not metadata_path.is_absolute():
@@ -184,6 +184,14 @@ def load_model(
         if checkpoint.get("algorithm") != algorithm:
             raise ValueError("Deployed algorithm and model metadata do not match.")
         model = joblib.load(checkpoint_path)
+        classifier_value = checkpoint.get("classification_artifact_path")
+        if classifier_value:
+            classifier_path = Path(classifier_value)
+            if not classifier_path.is_absolute():
+                classifier_path = ROOT / classifier_path
+            if not classifier_path.is_file():
+                raise FileNotFoundError(f"Demand classifier artifact not found: {classifier_path}")
+            checkpoint["classification_model"] = joblib.load(classifier_path)
         checkpoint["region_name"] = station_id
         checkpoint["history"] = int(checkpoint.get("history_steps", 672))
         checkpoint["horizon"] = int(checkpoint.get("horizon_steps", 96))
@@ -265,7 +273,7 @@ def build_model_inputs(
     history_ts = pd.DatetimeIndex(
         pd.to_datetime([row["utc_timestamp"] for row in rows], utc=True)
     )
-    if len(history_ts) > 1 and not np.all(np.diff(history_ts.asi8) == interval.value):
+    if len(history_ts) > 1 and not np.all(history_ts[1:] - history_ts[:-1] == interval):
         raise ValueError(f"Historical input window is not continuous at the configured {interval_minutes}-minute interval.")
 
     demand = np.asarray([row["demand"] for row in rows], dtype=np.float32)
@@ -361,7 +369,9 @@ def generate_forecast(
         tz="UTC",
     )
 
-    if algorithm in {"random_forest", "gbt", "xgboost"}:
+    forecast_clusters = None
+    forecast_classes = None
+    if algorithm in {"random_forest", "gbt", "xgboost", "kmeans"}:
         history_frame = pd.DataFrame(rows[-history_steps:])
         features = build_origin_features(
             history_frame, future_ts, interval_minutes,
@@ -371,7 +381,13 @@ def generate_forecast(
         missing = set(feature_names) - set(features.columns)
         if missing:
             raise ValueError(f"Serving feature builder is missing model features: {sorted(missing)}")
-        predictions = np.asarray(model.predict(features.reindex(columns=feature_names)), dtype=float).reshape(-1)
+        serving_features = features.reindex(columns=feature_names)
+        predictions = np.asarray(model.predict(serving_features), dtype=float).reshape(-1)
+        if callable(getattr(model, "predict_cluster", None)):
+            forecast_clusters = model.predict_cluster(serving_features)
+        classification_model = checkpoint.get("classification_model")
+        if classification_model is not None:
+            forecast_classes = classification_model.predict(serving_features)
     else:
         x_history, x_future, future_ts = build_model_inputs(rows, checkpoint)
         region = checkpoint["region_name"]
@@ -389,8 +405,9 @@ def generate_forecast(
         )
     issued_at = datetime.now(timezone.utc).isoformat()
     origin_at = pd.Timestamp(rows[-1]["utc_timestamp"]).isoformat()
-    return [
-        {
+    records = []
+    for step, (timestamp, value) in enumerate(zip(future_ts, predictions), start=1):
+        record = {
             "station_id": region,
             "forecast_issued_at_utc": issued_at,
             "forecast_origin_utc": origin_at,
@@ -403,8 +420,12 @@ def generate_forecast(
             "experiment_id": checkpoint.get("experiment_id", ""),
             "weather_mode": checkpoint.get("weather_mode", "last_observed_temperature_persistence"),
         }
-        for step, (timestamp, value) in enumerate(zip(future_ts, predictions), start=1)
-    ]
+        if forecast_clusters is not None:
+            record["predicted_cluster"] = int(forecast_clusters[step - 1])
+        if forecast_classes is not None:
+            record["predicted_demand_class"] = str(forecast_classes[step - 1])
+        records.append(record)
+    return records
 
 
 def parse_event(payload: dict[str, Any]) -> dict[str, Any]:
@@ -506,7 +527,7 @@ def main() -> None:
     seed_timestamps = pd.DatetimeIndex(seed_frame["utc_timestamp"])
     if len(seed_timestamps) != history_steps or (
         len(seed_timestamps) > 1
-        and not np.all(np.diff(seed_timestamps.asi8) == interval.value)
+        and not np.all(seed_timestamps[1:] - seed_timestamps[:-1] == interval)
     ):
         raise ValueError(
             f"The last {history_steps} rows in {history_path} are not a continuous "

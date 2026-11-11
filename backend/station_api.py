@@ -18,6 +18,7 @@ from backend.pipeline_manager import (
 )
 from src.ingestion.file_loader import load_station_csv
 from src.models.forecast_contract import derive_forecast_contract
+from src.models.time_segments import continuous_segment_bounds, split_forecast_origins
 
 router = APIRouter(prefix="/stations", tags=["stations"])
 
@@ -109,6 +110,7 @@ async def onboard_station(
         frame = load_station_csv(
             upload_path,
             interval_minutes=interval_minutes,
+            resample_to_interval=True,
             timestamp_column=timestamp_column,
             timestamp_format=timestamp_format,
             # The current onboarding UI intentionally assumes UTC for naive
@@ -116,29 +118,58 @@ async def onboard_station(
             source_timezone=source_timezone or "UTC",
         )
         detected_source_columns = dict(frame.attrs.get("source_columns", {}))
+        temperature_available = bool(frame.attrs.get("temperature_available", True))
         timestamp_format_used = frame.attrs.get("timestamp_format_used", timestamp_format)
-        minimum_training_rows = int((history_steps + horizon_steps + 30) / (1.0 - 0.15)) + 1
-        split_at = int(len(frame) * (1.0 - stream_fraction))
-        if split_at < minimum_training_rows:
+        source_row_count = int(frame.attrs.get("source_row_count", len(frame)))
+        segments = continuous_segment_bounds(frame["utc_timestamp"], interval_minutes)
+        if not segments:
+            raise HTTPException(
+                status_code=422,
+                detail="No observations remain after resampling to the selected interval.",
+            )
+        # The most recent continuous segment backs the live demo stream. Earlier
+        # segments remain in the training CSV and are sampled independently by
+        # the training window builder.
+        latest_start, latest_end = segments[-1]
+        latest_segment_rows = latest_end - latest_start
+        if latest_segment_rows < history_steps + horizon_steps:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Dataset has {len(frame):,} valid rows. At least {minimum_training_rows:,} are required "
-                    f"to build {history_steps} history steps, {horizon_steps} forecast steps, "
-                    "and a chronological training/validation split."
+                    f"The latest continuous segment has {latest_segment_rows:,} resampled rows; "
+                    f"it needs at least {history_steps + horizon_steps:,} rows for a "
+                    f"{history_steps}-step history and {horizon_steps}-step stream. "
+                    "Earlier segments can train the model, but cannot be joined across a gap "
+                    "to seed the live stream."
                 ),
             )
-        if len(frame) - split_at < horizon_steps:
-            raise HTTPException(
-                status_code=422,
-                detail=f"The reserved stream must contain at least {horizon_steps} rows.",
-            )
 
-        train_frame = frame.iloc[:split_at].copy()
-        stream_frame = frame.iloc[split_at:].copy()
-        history_frame = train_frame.tail(history_steps).copy()
+        requested_stream_rows = max(horizon_steps, int(latest_segment_rows * stream_fraction))
+        stream_rows = min(requested_stream_rows, latest_segment_rows - history_steps)
+        stream_start = latest_end - stream_rows
+        history_start = stream_start - history_steps
+        # Keep every resampled observation in the training source. The model
+        # trainer makes a chronological holdout inside each independent segment.
+        train_frame = frame.copy()
+        history_frame = frame.iloc[history_start:stream_start].copy()
+        stream_frame = frame.iloc[stream_start:latest_end].copy()
         if len(history_frame) != history_steps:
             raise HTTPException(status_code=422, detail="Not enough rows for the initial history seed.")
+
+        train_origins, validation_origins = split_forecast_origins(
+            train_frame["utc_timestamp"], history_steps, horizon_steps, interval_minutes,
+            validation_fraction=0.15,
+        )
+        if len(train_origins) < 2 or len(validation_origins) < 1:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"After resampling, there are {len(train_origins)} continuous training windows "
+                    f"and {len(validation_origins)} validation windows across {len(segments)} segments. "
+                    "The model needs at least two training windows and one validation window; "
+                    "gaps are kept separate and never crossed."
+                ),
+            )
 
         def save_csv(data: pd.DataFrame, path: Path) -> str:
             out = data[["utc_timestamp", "demand", "temperature"]].copy()
@@ -171,6 +202,10 @@ async def onboard_station(
             "timestamp_column": detected_source_columns.get("timestamp"),
             "demand_column": detected_source_columns.get("demand"),
             "temperature_column": detected_source_columns.get("temperature"),
+            "temperature_available": temperature_available,
+            "temperature_handling": (
+                "measured" if temperature_available else "constant_zero_compatibility_placeholder"
+            ),
             "timestamp_format": timestamp_format,
             "timestamp_format_used": timestamp_format_used,
             "source_timezone_assumption": "UTC for naive timestamps; timezone-aware values converted to UTC",
@@ -185,6 +220,11 @@ async def onboard_station(
             "horizon_steps": horizon_steps,
             "registered_source_file": file.filename,
             "registered_rows": int(len(frame)),
+            "registered_source_rows": source_row_count,
+            "resampling_method": frame.attrs.get("resampling_method", "mean"),
+            "continuous_segment_count": int(len(segments)),
+            "training_forecast_windows": int(len(train_origins)),
+            "validation_forecast_windows": int(len(validation_origins)),
             "training_rows": int(len(train_frame)),
             "stream_rows": int(len(stream_frame)),
             "stream_start_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[0]).isoformat(),
@@ -220,6 +260,23 @@ async def onboard_station(
             "stream_start_utc": stations[key]["stream_start_utc"],
             "stream_end_utc": stations[key]["stream_end_utc"],
             "detected_source_columns": detected_source_columns,
+            "source_rows": source_row_count,
+            "resampled_rows": len(frame),
+            "continuous_segment_count": len(segments),
+            "training_forecast_windows": len(train_origins),
+            "validation_forecast_windows": len(validation_origins),
+            "aggregation_method": "mean",
+            "resampling_note": (
+                f"Aggregated {source_row_count:,} source rows into {len(frame):,} "
+                f"{interval_minutes}-minute mean values across {len(segments)} separate continuous segments. "
+                "Each segment has its own chronological validation split; no training window crosses a gap. "
+                "The latest segment supplies the demo stream."
+            ),
+            "temperature_available": temperature_available,
+            "temperature_note": (
+                None if temperature_available else
+                "No temperature column was supplied. A constant 0 placeholder keeps the existing model input schema; it is not measured weather, so this station's models cannot learn temperature effects."
+            ),
             "timestamp_format_used": timestamp_format_used,
             "model_checkpoint": checkpoint_rel,
             "topics": topic_result,

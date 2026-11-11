@@ -223,7 +223,17 @@ def render_model_lab(station: str, station_label: str) -> None:
                 "Status": item.get("status"),
                 "MAE (MW)": metrics.get("mae_mw"),
                 "RMSE (MW)": metrics.get("rmse_mw"),
+                "R²": metrics.get("r2"),
                 "WAPE (%)": metrics.get("wape_pct"),
+                "Class accuracy (%)": (
+                    100 * (item.get("demand_classification") or {}).get("accuracy")
+                    if (item.get("demand_classification") or {}).get("accuracy") is not None else None
+                ),
+                "Class macro F1 (%)": (
+                    100 * (item.get("demand_classification") or {}).get("macro_f1")
+                    if (item.get("demand_classification") or {}).get("macro_f1") is not None else None
+                ),
+                "Cluster silhouette": (item.get("clustering") or {}).get("silhouette"),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
@@ -243,7 +253,8 @@ def render_comparison(station: str) -> None:
     section_title(
         "Compare experiments",
         f"Compare 2–4 completed experiments using the same station, chronological holdout and forecast contract "
-        f"({history_steps:,} history steps, {horizon_steps:,} forecast steps at {interval_minutes}-minute intervals).",
+        f"({history_steps:,} history steps, {horizon_steps:,} forecast steps at {interval_minutes}-minute intervals). "
+        "Regression metrics compare MW estimates; classifier scores and silhouette describe their separate tasks.",
     )
     complete = [item for item in records if item.get("status") in ("candidate", "deployed", "previous")]
     if len(complete) < 2:
@@ -283,13 +294,33 @@ def render_comparison(station: str) -> None:
         return
     frame = pd.DataFrame(results)
     display_columns = [
-        "model", "status", "MAE (MW)", "RMSE (MW)", "WAPE (%)", "Bias (MW)",
+        "model", "status", "MAE (MW)", "RMSE (MW)", "R²", "WAPE (%)", "Bias (MW)",
+        "Classification accuracy (%)", "Classification macro F1 (%)", "Clustering silhouette",
         "Training time (s)", "Inference latency (ms/origin)", "Model size (bytes)",
     ]
     visible = frame[[column for column in display_columns if column in frame.columns]].copy()
     st.dataframe(visible.round(4), use_container_width=True, hide_index=True)
 
-    metric_choice = st.selectbox("Compare metric", ["MAE (MW)", "RMSE (MW)", "WAPE (%)", "Training time (s)", "Inference latency (ms/origin)"], key=f"comparison_metric_{station}")
+    cluster_profile_rows = []
+    for row in results:
+        profiles = (row.get("clustering") or {}).get("cluster_profiles", [])
+        for profile in profiles:
+            cluster_profile_rows.append({
+                "Model": row.get("model"),
+                "Cluster": profile.get("cluster"),
+                "Training samples": profile.get("training_samples"),
+                "Average demand estimate (MW)": profile.get("avg_demand_mw"),
+            })
+    if cluster_profile_rows:
+        st.subheader("K-Means training cluster profiles")
+        st.dataframe(
+            pd.DataFrame(cluster_profile_rows).round(1),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Cluster IDs are arbitrary labels. Each cluster's training average is the numeric demand estimate it produces.")
+
+    metric_choice = st.selectbox("Compare metric", ["MAE (MW)", "RMSE (MW)", "R²", "WAPE (%)", "Clustering silhouette", "Classification accuracy (%)", "Training time (s)", "Inference latency (ms/origin)"], key=f"comparison_metric_{station}")
     plot_frame = frame.dropna(subset=[metric_choice]) if metric_choice in frame else pd.DataFrame()
     if not plot_frame.empty:
         fig = go.Figure(go.Bar(x=plot_frame["model"], y=plot_frame[metric_choice], text=plot_frame[metric_choice].round(3), textposition="outside"))

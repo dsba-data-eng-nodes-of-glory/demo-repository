@@ -23,6 +23,8 @@ FORECAST_FIELDS = [
     "algorithm",
     "experiment_id",
     "weather_mode",
+    "predicted_demand_class",
+    "predicted_cluster",
 ]
 
 ACTUAL_FIELDS = [

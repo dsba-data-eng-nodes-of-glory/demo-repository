@@ -52,8 +52,10 @@ stations = registry.get("stations", {})
 # ---------------------------------------------------------------------
 st.subheader("Register a new station")
 st.markdown(
-    "Upload historical station data. Timestamp, demand and temperature columns are detected automatically from the CSV headers. "
-    "Choose only the timestamp format and observation interval; timestamps are normalized to UTC."
+    "Upload historical station data. Timestamp and demand/load columns are required and detected automatically. "
+    "Temperature is optional; when absent, the platform adds a constant placeholder, so the model cannot learn temperature effects. "
+    "Choose the forecast interval; observations are averaged into that interval, while empty periods remain separate gaps. "
+    "Training windows never span a gap, and the latest continuous segment is reserved for the demo stream."
 )
 with st.form("station_onboarding_form", clear_on_submit=False):
     c1, c2 = st.columns(2)
@@ -91,13 +93,13 @@ with st.form("station_onboarding_form", clear_on_submit=False):
                 help="Example: %d-%m-%Y %H:%M",
             ).strip()
         interval_minutes = int(st.number_input(
-            "Source observation interval (minutes)",
+            "Forecast interval (minutes)",
             min_value=5,
             max_value=1440,
             value=15,
             step=1,
             help=(
-                "Enter the spacing between consecutive observations in minutes. "
+                "Source observations are averaged into this interval. "
                 "The forecasting contract keeps a 7-day history and a 24-hour forecast horizon; "
                 "the number of rows is derived automatically. The interval must divide both durations exactly."
             ),
@@ -109,7 +111,8 @@ with st.form("station_onboarding_form", clear_on_submit=False):
             )
         else:
             st.caption(
-                f"Timestamp, demand and temperature columns are detected automatically. "
+                f"Timestamp and demand/load columns are required. Temperature is optional. "
+                f"Source rows will be averaged into {interval_minutes}-minute bins; missing bins stay gaps. "
                 f"The model will use {10080 // interval_minutes:,} history steps and "
                 f"{1440 // interval_minutes:,} forecast steps for a 7-day lookback and 24-hour horizon. "
                 "Offset-aware timestamps are converted to UTC; timezone-naive timestamps are assumed to be UTC."
@@ -149,6 +152,10 @@ if submitted:
                 st.success("Kafka topics were created or already existed.")
             else:
                 st.warning(f"Station registered, but Kafka topics are pending: {result.get('topic_warning')}. Topics will be retried automatically when you activate the station after Kafka is available.")
+            if result.get("temperature_note"):
+                st.warning(result["temperature_note"])
+            if result.get("resampling_note"):
+                st.info(result["resampling_note"])
             st.json(result)
             rerun_page()
         except requests.HTTPError as exc:

@@ -10,8 +10,6 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from src.models.model_registry import next_version, upsert_experiment, utc_now
 from src.models.train_tabular import run_training
 
@@ -30,6 +28,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("The LSTM algorithm requires PyTorch. Install the project requirements and retry.") from exc
     station = str(config["station"])
     experiment_id = str(config["experiment_id"])
     params = dict(config.get("parameters") or {})
@@ -81,19 +83,10 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
     temp_checkpoint.replace(checkpoint_path)
 
     metrics = metadata.get("validation_metrics") or {}
-    station_frame_path = csv_path.resolve()
-    import pandas as pd
-    from src.ingestion.file_loader import load_station_csv
-    frame = load_station_csv(
-        station_frame_path,
-        interval_minutes=int(metadata.get("interval_minutes", station_entry.get("interval_minutes", 15))),
-    )
-    n_rows = len(frame)
-    split_row = int(n_rows * (1.0 - float(training_options.get("validation_fraction", 0.15))))
-    validation_start = pd.Timestamp(frame.iloc[split_row]["utc_timestamp"]).isoformat()
-    validation_end = pd.Timestamp(frame.iloc[-1]["utc_timestamp"]).isoformat()
-    training_start = pd.Timestamp(frame.iloc[0]["utc_timestamp"]).isoformat()
-    training_end = pd.Timestamp(frame.iloc[split_row - 1]["utc_timestamp"]).isoformat()
+    validation_start = metadata["validation_start_utc"]
+    validation_end = metadata["validation_end_utc"]
+    training_start = metadata["training_start_utc"]
+    training_end = metadata["training_end_utc"]
 
     metadata.update({
         "experiment_id": experiment_id,
@@ -108,7 +101,10 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
         "training_end_utc": training_end,
         "validation_start_utc": validation_start,
         "validation_end_utc": validation_end,
-        "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
+        "continuous_segment_count": metadata.get("continuous_segment_count"),
+        "evaluation_protocol": metadata.get(
+            "evaluation_protocol", "chronological_holdout_sampled_origins_v1"
+        ),
         "validation_fraction": float(training_options.get("validation_fraction", 0.15)),
         "model_size_bytes": int(checkpoint_path.stat().st_size),
         "created_at": utc_now(),

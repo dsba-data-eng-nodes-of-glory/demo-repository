@@ -24,14 +24,15 @@ ALGORITHM_CONFIG_PATH = ROOT / "config" / "algorithm_configs.yaml"
 ALGORITHMS = {
     "lstm": {"label": "LSTM", "family": "deep_learning", "description": "Sequence-to-sequence encoder-decoder LSTM."},
     "random_forest": {"label": "Random Forest", "family": "tree_ensemble", "description": "Bagged decision trees using lag, rolling and calendar features."},
-    "gbt": {"label": "Gradient Boosted Trees", "family": "tree_boosting", "description": "Histogram gradient-boosted trees using tabular forecasting features."},
+    "gbt": {"label": "Gradient Boosted Trees", "family": "tree_boosting", "description": "Histogram gradient-boosted-tree demand forecast with an auxiliary One-vs-Rest demand classifier."},
     "xgboost": {"label": "XGBoost", "family": "tree_boosting", "description": "Extreme gradient boosting; requires the xgboost package."},
+    "kmeans": {"label": "K-Means cluster-average forecast", "family": "clustering", "description": "Groups similar lag and calendar patterns; each cluster's training-average demand is the MW estimate."},
 }
 
 
 class ExperimentRequest(BaseModel):
     station: str
-    algorithm: Literal["lstm", "random_forest", "gbt", "xgboost"]
+    algorithm: Literal["lstm", "random_forest", "gbt", "xgboost", "kmeans"]
     parameters: dict[str, Any] = Field(default_factory=dict)
     training_options: dict[str, Any] = Field(default_factory=dict)
 
@@ -69,6 +70,16 @@ def validate_parameters(algorithm: str, supplied: dict[str, Any], defaults: dict
     if unknown:
         raise HTTPException(status_code=422, detail=f"Unsupported {algorithm} parameter(s): {sorted(unknown)}")
     merged = {**defaults, **supplied}
+    if algorithm == "kmeans":
+        for name in ("n_clusters", "n_init", "max_iter"):
+            try:
+                value = float(merged.get(name, 0))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"K-Means parameter '{name}' must be an integer.") from exc
+            if not value.is_integer():
+                raise HTTPException(status_code=422, detail=f"K-Means parameter '{name}' must be an integer.")
+        if int(merged.get("n_clusters", 4)) < 2:
+            raise HTTPException(status_code=422, detail="K-Means must use at least two clusters.")
     for name, value in merged.items():
         if isinstance(value, bool):
             continue
@@ -81,6 +92,7 @@ def validate_parameters(algorithm: str, supplied: dict[str, Any], defaults: dict
     caps = {
         "epochs": 200, "batch_size": 256, "hidden_size": 256,
         "n_estimators": 1500, "max_iter": 500, "max_depth": 20,
+        "n_clusters": 20, "n_init": 50,
         "max_train_windows": 2000, "max_validation_windows": 500,
         "max_train_origins": 1200, "max_validation_origins": 300,
     }
@@ -91,7 +103,7 @@ def validate_parameters(algorithm: str, supplied: dict[str, Any], defaults: dict
         "epochs", "batch_size", "hidden_size", "n_estimators", "max_iter",
         "max_depth", "max_leaf_nodes", "min_samples_leaf", "max_train_windows",
         "max_validation_windows", "max_train_origins", "max_validation_origins", "n_jobs",
-        "learning_rate",
+        "learning_rate", "n_clusters", "n_init",
     }
     for name in strictly_positive:
         if name in merged and float(merged[name]) <= 0:
@@ -251,6 +263,7 @@ def compare_experiments(request: CompareRequest):
     rows = []
     for record in records:
         metrics = record.get("metrics") or {}
+        class_metrics = record.get("demand_classification") or {}
         metadata = {}
         metadata_value = record.get("metadata_path")
         if metadata_value:
@@ -268,8 +281,18 @@ def compare_experiments(request: CompareRequest):
             "status": record.get("status"),
             "MAE (MW)": metrics.get("mae_mw"),
             "RMSE (MW)": metrics.get("rmse_mw"),
+            "R²": metrics.get("r2"),
             "WAPE (%)": metrics.get("wape_pct"),
             "Bias (MW)": metrics.get("bias_mw"),
+            "Clustering silhouette": (record.get("clustering") or {}).get("silhouette"),
+            "Classification accuracy (%)": (
+                float(class_metrics["accuracy"]) * 100 if class_metrics.get("accuracy") is not None else None
+            ),
+            "Classification macro F1 (%)": (
+                float(class_metrics["macro_f1"]) * 100 if class_metrics.get("macro_f1") is not None else None
+            ),
+            "demand_classification": metadata.get("demand_classification"),
+            "clustering": metadata.get("clustering"),
             "Training time (s)": record.get("training_duration_seconds"),
             "Inference latency (ms/origin)": record.get("inference_latency_ms_per_origin"),
             "Model size (bytes)": record.get("model_size_bytes"),
@@ -312,6 +335,16 @@ def deploy_model(request: DeployRequest):
     metadata_path = resolve_root_path(record.get("metadata_path", "__missing_metadata__"))
     if not artifact_path.is_file() or not metadata_path.is_file():
         raise HTTPException(status_code=409, detail="Model artifact or metadata is missing; deployment was not changed.")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=409, detail="Model metadata is unreadable; deployment was not changed.") from exc
+    classifier_value = metadata.get("classification_artifact_path")
+    if classifier_value and not resolve_root_path(classifier_value).is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Demand classifier artifact is missing; deployment was not changed.",
+        )
 
     process_status = manager.station_status(request.station).get("services", {})
     if process_status.get("predictor", {}).get("running"):

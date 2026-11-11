@@ -85,13 +85,23 @@ class PipelineManager:
         env["PYSPARK_PYTHON"] = str(python_exe)
         env["PYSPARK_DRIVER_PYTHON"] = str(python_exe)
         configured_java = read_spark_config().get("java_home")
-        java_home = configured_java or env.get("JAVA_HOME")
-        if not java_home:
-            raise RuntimeError("JAVA_HOME is not configured. Set it in Windows environment variables or config/spark.yaml.")
-        java_home_path = Path(java_home).expanduser().resolve()
-        java_exe = java_home_path / "bin" / "java.exe"
-        if not java_exe.exists():
-            raise RuntimeError(f"Java executable not found: {java_exe}")
+        java_candidates = [configured_java, env.get("JAVA_HOME")]
+        java_name = "java.exe" if os.name == "nt" else "java"
+        java_home_path = next(
+            (
+                Path(value).expanduser().resolve()
+                for value in java_candidates
+                if value
+                and (Path(value).expanduser() / "bin" / java_name).is_file()
+            ),
+            None,
+        )
+        if java_home_path is None:
+            java_on_path = shutil.which(java_name, path=env.get("PATH"))
+            if not java_on_path:
+                raise RuntimeError("Java was not found. Set JAVA_HOME or configure java_home in config/spark.yaml.")
+            java_home_path = Path(java_on_path).resolve().parent.parent
+        java_exe = java_home_path / "bin" / java_name
         env["JAVA_HOME"] = str(java_home_path)
         env["PATH"] = str(java_home_path / "bin") + os.pathsep + env.get("PATH", "")
         result = subprocess.run([str(java_exe), "-version"], capture_output=True, text=True, timeout=10)
@@ -332,8 +342,19 @@ class PipelineManager:
         command = [sys.executable, "-u", "-m", "src.models.run_experiment", "--config", str(config_path)]
         try:
             result = self.start("training", command, station)
-        except Exception:
+        except Exception as exc:
             config_path.unlink(missing_ok=True)
+            upsert_experiment({
+                "experiment_id": experiment_id,
+                "station": station,
+                "algorithm": algorithm,
+                "status": "failed",
+                "parameters": parameters,
+                "config_path": config_path.relative_to(ROOT).as_posix(),
+                "created_at": experiment_config["created_at"],
+                "error": f"Training process could not be started: {exc}",
+                "completed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            })
             raise
         return {
             "station": station,
