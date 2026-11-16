@@ -14,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from backend.pipeline_manager import (
+    STATION_REGISTRY_LOCK,
     ROOT,
     manager,
     read_station_config,
@@ -27,6 +28,8 @@ from src.ingestion.workbook_loader import (
 from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
 from src.models.forecast_weather import ForecastWeatherUnavailable
 from src.models.forecast_contract import derive_forecast_contract
+from src.storage.station_hierarchy import build_tree, parse_path, validate_path
+from backend.onboarding_training import initial_training, training_pending
 
 router = APIRouter(prefix="/stations", tags=["stations"])
 
@@ -83,15 +86,21 @@ def _validate_model_row_counts(
     if "demand_forecast" in selected_models:
         frame = datasets["demand"]
         split_at = int(len(frame) * (1.0 - stream_fraction))
-        minimum_training_rows = int((history_steps + horizon_steps + 30) / (1.0 - 0.15)) + 1
+        from backend.model_api import training_options_for
+        validation_fraction = training_options_for()["validation_fraction"]
+        minimum_training_rows = max(
+            int((history_steps + horizon_steps + 30) / (1.0 - validation_fraction)) + 1,
+            int((horizon_steps - 1) / validation_fraction) + 1,
+        )
         usable_rows = split_at
         if managed_weather:
             usable_rows = len(archive_training_span(frame.iloc[:split_at], ["forecast_temperature"]))
-        if usable_rows < minimum_training_rows:
+        if (usable_rows < minimum_training_rows
+                or usable_rows - int(usable_rows * (1.0 - validation_fraction)) < horizon_steps):
             raise ValueError(
                 f"Worksheet 'Demand' has {usable_rows:,} usable training rows. At least {minimum_training_rows:,} are required "
                 f"for the demand forecaster with {history_steps} history steps, {horizon_steps} forecast steps "
-                "and a chronological validation split. Reduce stream_fraction only if appropriate, or add history."
+                "and the configured chronological validation split. Reduce stream_fraction only if appropriate, or add history."
             )
         stream_rows = len(frame) - split_at
         if not live_kafka and stream_rows < horizon_steps:
@@ -152,6 +161,12 @@ def list_stations():
     return read_station_config()
 
 
+@router.get("/hierarchy")
+def station_tree():
+    config = read_station_config()
+    return {"nodes": build_tree(config.get("stations", {})), "active_station": config.get("active_station")}
+
+
 @router.get("/template")
 def download_station_template():
     """Download the exact workbook used by workbook onboarding."""
@@ -186,6 +201,7 @@ async def onboard_station(
     residual_demand_unit: str = Form(default="mwh_per_interval"),
     raw_topic: str | None = Form(default=None),
     featured_topic: str | None = Form(default=None),
+    hierarchy_path: str = Form(default=""),
 ):
     """Register a station from the multi-sheet Excel training workbook.
 
@@ -223,6 +239,13 @@ async def onboard_station(
         forecast_contract = derive_forecast_contract(interval_minutes, model_settings)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        parents = parse_path(hierarchy_path) if isinstance(hierarchy_path, str) else []
+        parents = validate_path(stations, parents, interval_minutes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if parents and "demand_forecast" not in selected:
+        raise HTTPException(status_code=422, detail="Select demand forecasting for a hierarchy substation's live feed.")
     history_steps = int(forecast_contract["history_steps"])
     horizon_steps = int(forecast_contract["horizon_steps"])
 
@@ -257,6 +280,18 @@ async def onboard_station(
                 source_timezone=source_timezone or "UTC",
                 location_from_workbook=True,
             )
+            grid_offset = None
+            if parents:
+                timestamp = pd.Timestamp(datasets["demand"]["utc_timestamp"].iloc[0])
+                offset_ns = timestamp.value % (interval_minutes * 60 * 10**9)
+                grid_offset, fraction = divmod(offset_ns, 10**9)
+                if fraction:
+                    raise ValueError("Hierarchy observation timestamps must use whole seconds.")
+                for frame in datasets.values():
+                    other = pd.Timestamp(frame["utc_timestamp"].iloc[0])
+                    if other.value % (interval_minutes * 60 * 10**9) != offset_ns:
+                        raise ValueError("All substation worksheets must use the same UTC interval grid.")
+                parents = validate_path(stations, parents, interval_minutes, grid_offset)
             weather_config = workbook_diagnostics.get("weather")
             if stream_input == "kafka" and not weather_config:
                 raise ValueError("Kafka live input requires the Station Location worksheet.")
@@ -308,7 +343,7 @@ async def onboard_station(
                 relative_files.update({f"demand_{name}": value for name, value in demand_forecast_paths.items()})
                 model_components["demand_forecast"] = {
                     "enabled": True,
-                    "algorithm": "lstm",
+                    "algorithm": "dense_nn",
                     "status": "pending_training",
                     **demand_forecast_paths,
                     "checkpoint": f"models/{key}/v1/{key}_encoder_decoder_lstm.pt",
@@ -402,6 +437,7 @@ async def onboard_station(
             "enabled": False,
             "status": "registered",
             "enabled_models": selected,
+            "initial_training": initial_training(selected),
             "model_components": model_components,
             "raw_topic": (raw_topic or "").strip() or f"{key}-raw",
             "featured_topic": (featured_topic or "").strip() or f"{key}-featured",
@@ -437,7 +473,6 @@ async def onboard_station(
         }
         if weather_config:
             station_entry["weather"] = weather_config
-            station_entry["stream_input"] = stream_input
         if demand_frame is not None:
             station_entry.update({
                 "registered_rows": int(len(demand_frame)),
@@ -456,7 +491,7 @@ async def onboard_station(
                 "model_checkpoint": checkpoint_rel,
                 "model_metadata": f"models/{key}/v1/metadata.json",
                 "model_version": "v1",
-                "model_algorithm": "lstm",
+                "model_algorithm": "dense_nn",
                 "training_rows": int(len(train_frame)),
                 "history_rows": int(min(history_steps, len(train_frame))),
                 "stream_rows": int(len(stream_frame)) if stream_input == "csv_replay" else 0,
@@ -473,46 +508,58 @@ async def onboard_station(
                 "stat_threshold": None, "ae_threshold": None,
             }
 
-        # Downloads can take minutes. Re-read before committing so concurrent
-        # registration or station edits are not lost while we wait on weather.
-        config = read_station_config()
-        stations = config.setdefault("stations", {})
-        if key in stations or final_station_dir.exists():
-            raise HTTPException(status_code=409, detail=f"Station '{key}' is already registered.")
-        staging_dir.rename(final_station_dir)
-        stations[key] = station_entry
-        try:
-            write_station_config(config)
-        except Exception:
-            shutil.rmtree(final_station_dir, ignore_errors=True)
-            raise
+        # Serialize registration with station activation/deletion. Workbook
+        # loading and external requests run outside this critical section.
+        station_entry["stream_input"] = stream_input
+        station_entry["topics_ready"] = False
+        with STATION_REGISTRY_LOCK:
+            config = read_station_config()
+            stations = config.setdefault("stations", {})
+            if key in stations or final_station_dir.exists():
+                raise HTTPException(status_code=409, detail=f"Station '{key}' is already registered.")
+            topics = {station_entry["raw_topic"], station_entry["featured_topic"]}
+            if len(topics) != 2:
+                raise HTTPException(status_code=422, detail="Raw and featured Kafka topics must be different.")
+            for other, entry in stations.items():
+                if topics & {entry.get("raw_topic"), entry.get("featured_topic")}:
+                    raise HTTPException(status_code=409, detail=f"Kafka topics already assigned to '{other}'.")
+            if parents:
+                try:
+                    station_entry["hierarchy_path"] = validate_path(stations, parents, interval_minutes, grid_offset)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                station_entry["hierarchy_grid_offset_seconds"] = grid_offset
+            staging_dir.rename(final_station_dir)
+            stations[key] = station_entry
+            try:
+                write_station_config(config)
+            except Exception:
+                shutil.rmtree(final_station_dir, ignore_errors=True)
+                raise
 
         topic_result = None
         topic_warning = None
         if "demand_forecast" in selected:
             try:
                 topic_result = await run_in_threadpool(manager.ensure_station_topics, key)
-                updated = read_station_config()
-                updated["stations"][key]["topics_ready"] = True
-                write_station_config(updated)
             except Exception as exc:
                 topic_warning = str(exc)
-                updated = read_station_config()
-                updated.setdefault("stations", {}).setdefault(key, {})["topics_ready"] = False
-                updated["stations"][key]["topic_setup_message"] = topic_warning
-                write_station_config(updated)
         else:
+            topic_warning = "Demand forecasting was deselected; demand streaming topics were not initialized."
+        with STATION_REGISTRY_LOCK:
             updated = read_station_config()
-            updated["stations"][key]["topics_ready"] = False
-            updated["stations"][key]["topic_setup_message"] = (
-                "Demand forecasting was deselected; demand streaming topics were not initialized."
-            )
-            write_station_config(updated)
+            current = updated.get("stations", {}).get(key)
+            if current is not None:
+                current["topics_ready"] = bool(topic_result) or bool(current.get("topics_ready"))
+                if topic_warning and not current["topics_ready"]:
+                    current["topic_setup_message"] = topic_warning
+                write_station_config(updated)
 
         return {
             "station": key,
             "display_name": display,
             "registered": True,
+            "hierarchy_path": station_entry.get("hierarchy_path", []),
             "enabled_models": selected,
             "model_components": model_components,
             "files": relative_files,
@@ -523,7 +570,8 @@ async def onboard_station(
             "topics_ready": bool(topic_result),
             "topic_warning": topic_warning,
             "renewable_serving_adapter_ready": any_renewable_selected,
-            "next_step": "Configure and train the selected models from Model Management. The streaming pipeline remains a separate activation step.",
+            "initial_training": station_entry["initial_training"],
+            "next_step": "Initial training and model deployment run automatically. Activate the station when it is ready.",
         }
     except HTTPException:
         raise
@@ -558,16 +606,20 @@ def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
         "topics": {"raw": entry.get("raw_topic"), "featured": entry.get("featured_topic")},
     }
     data_services = [services[name] for name in ("spark", "predictor", "producer")]
+    if services.get("live_actuals"):
+        data_services.append(services["live_actuals"])
     if any(service.get("state") == "failed" for service in data_services):
         lifecycle = "failed"
     elif any(service.get("state") == "restarting" for service in data_services):
         lifecycle = "recovering"
     elif any(service.get("running") for service in data_services):
         lifecycle = "active"
-    elif services.get("training", {}).get("running"):
-        lifecycle = "training"
+    elif services.get("training", {}).get("running") or training_pending(entry):
+        lifecycle = "training" if services.get("training", {}).get("running") else "training_queued"
     elif entry.get("status") == "stopped":
         lifecycle = "stopped"
+    elif any(task["status"] == "failed" for task in (entry.get("initial_training") or {}).values()):
+        lifecycle = "model_ready" if status["model_ready"] else "training_failed"
     elif services.get("training", {}).get("return_code") is not None:
         lifecycle = "model_ready" if status["model_ready"] and services["training"]["return_code"] == 0 else "training_failed"
     elif entry.get("status") == "training":
@@ -578,6 +630,8 @@ def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
         lifecycle = entry.get("status", "registered")
     status.update({
         "lifecycle_status": lifecycle,
+        "initial_training": entry.get("initial_training", {}),
+        "initial_training_pending": training_pending(entry),
         "display_name": entry.get("display_name", station),
         "registered": True,
         "training_file_exists": bool(entry.get("training_file") and resolve_root_path(entry["training_file"]).is_file()),
@@ -630,6 +684,7 @@ def stations_overview():
     return {
         "active_station": config.get("active_station"),
         "stations": entries,
+        "hierarchy": build_tree(entries),
         "statuses": statuses,
         "components": component_statuses,
         "kafka_tcp_available": bool(snapshot.get("kafka_tcp_available")),
@@ -644,14 +699,34 @@ def station_status(station: str):
     return _status_from_snapshot(station, entries[station], manager.status())
 
 
+@router.post("/{station}/retry-initial-training")
+def retry_initial_training(station: str):
+    with STATION_REGISTRY_LOCK:
+        config = read_station_config()
+        entry = config.get("stations", {}).get(station)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Unknown station.")
+        if entry.get("enabled"):
+            raise HTTPException(status_code=409, detail="Stop this station before retrying initial training.")
+        tasks = entry.get("initial_training") or {}
+        count = 0
+        for component, task in tasks.items():
+            if task["status"] == "failed":
+                tasks[component] = {"algorithm": task["algorithm"], "status": "queued"}
+                count += 1
+        write_station_config(config)
+        return {"queued": count, "initial_training": tasks}
+
+
 @router.post("/{station}/train")
 def train_station(station: str):
     try:
-        result = manager.start_training(station)
-        config = read_station_config()
-        config["stations"][station]["status"] = "training"
-        write_station_config(config)
-        return result
+        with STATION_REGISTRY_LOCK:
+            result = manager.start_training(station)
+            config = read_station_config()
+            config["stations"][station]["status"] = "training"
+            write_station_config(config)
+            return result
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -659,12 +734,13 @@ def train_station(station: str):
 @router.post("/{station}/topics")
 def create_station_topics(station: str):
     try:
-        result = manager.ensure_station_topics(station)
-        config = read_station_config()
-        config["stations"][station]["topics_ready"] = True
-        config["stations"][station].pop("topic_setup_message", None)
-        write_station_config(config)
-        return result
+        with STATION_REGISTRY_LOCK:
+            result = manager.ensure_station_topics(station)
+            config = read_station_config()
+            config["stations"][station]["topics_ready"] = True
+            config["stations"][station].pop("topic_setup_message", None)
+            write_station_config(config)
+            return result
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -722,12 +798,13 @@ def get_residual_settings(station: str):
 
 @router.put('/{station}/residual-settings')
 def put_residual_settings(station: str, request: ResidualDetectionSettingsRequest):
-    config=read_station_config()
-    entry=config.get('stations',{}).get(station)
-    if entry is None:raise HTTPException(status_code=404,detail='Unknown station')
-    # No edits to the physical pretrained checkpoint; thresholds apply at inference.
-    entry['residual_detection_settings']=request.model_dump() if hasattr(request,'model_dump') else request.dict()
-    entry.pop('residual_alert_settings', None)
-    write_station_config(config)
-    return {'station':station,'settings':entry['residual_detection_settings'],
-            'message':'Spike-detection thresholds saved for the next forecast origin.'}
+    with STATION_REGISTRY_LOCK:
+        config=read_station_config()
+        entry=config.get('stations',{}).get(station)
+        if entry is None:raise HTTPException(status_code=404,detail='Unknown station')
+        # No edits to the physical pretrained checkpoint; thresholds apply at inference.
+        entry['residual_detection_settings']=request.model_dump() if hasattr(request,'model_dump') else request.dict()
+        entry.pop('residual_alert_settings', None)
+        write_station_config(config)
+        return {'station':station,'settings':entry['residual_detection_settings'],
+                'message':'Spike-detection thresholds saved for the next forecast origin.'}

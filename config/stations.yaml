@@ -1,9 +1,9 @@
-active_station: null
+active_station: amprion
 stations:
   amprion:
     display_name: Amprion
-    enabled: false
-    status: reset
+    enabled: true
+    status: active
     input_file: data/training/amprion/demand_test.csv
     history_file: data/training/amprion/demand_train.csv
     raw_topic: amprion-raw
@@ -86,4 +86,5 @@ stations:
       stat_threshold: 3.0
       ae_threshold: 10.0
       upward_only: true
-active_stations: []
+active_stations:
+- amprion

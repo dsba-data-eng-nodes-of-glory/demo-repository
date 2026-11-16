@@ -25,6 +25,7 @@ except ImportError:  # metrics remain optional in lightweight POC installs
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    manager.start_supervisor()
     try:
         yield
     finally:

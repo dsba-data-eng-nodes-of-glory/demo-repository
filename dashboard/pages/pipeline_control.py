@@ -12,6 +12,8 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from dashboard.ui import setup_page, section_title, render_status_strip
 
+from src.storage.station_hierarchy import station_label
+
 api = setup_page("Pipeline Control", "pipeline")
 
 
@@ -50,7 +52,7 @@ station = st.selectbox(
     "Station",
     station_ids,
     index=index,
-    format_func=lambda key: stations[key].get("display_name", key),
+    format_func=lambda key: station_label(key, stations[key]),
 )
 entry = stations[station]
 
@@ -87,7 +89,9 @@ def render_live_pipeline_status(selected_station: str) -> None:
     ])
     if not live_kafka:
         st.warning("Kafka is not reachable at 127.0.0.1:9092. Start Kafka before resetting or activating this station.")
-    if not live_model:
+    if live.get("initial_training_pending"):
+        st.info("Initial model training is queued or running. Refresh the controls when it finishes.")
+    elif not live_model:
         st.warning("The demand model artifact is missing. Reset is still available, but starting the current demand-driven pipeline requires a trained demand model.")
 
 
@@ -130,7 +134,7 @@ with start_col:
         "▶  Start selected station",
         type="primary",
         use_container_width=True,
-        disabled=not model_ready or not kafka_ok,
+        disabled=not model_ready or not kafka_ok or status.get("initial_training_pending", False),
     ):
         try:
             result = post_json(f"/stations/{station}/activate", timeout=90)
@@ -176,7 +180,7 @@ with st.expander("Advanced: Kafka topics and service logs", expanded=False):
     t1.markdown(f"**Raw topic**  \n`{topics.get('raw') or entry.get('raw_topic', '—')}`")
     t2.markdown(f"**Featured topic**  \n`{topics.get('featured') or entry.get('featured_topic', '—')}`")
     section_title("Service logs", "Recent output from the selected station's individual service processes.")
-    log_service = st.selectbox("Log stream", ["spark", "predictor", "producer", "training"], key="pipeline_log_service")
+    log_service = st.selectbox("Log stream", ["spark", "predictor", "producer", "training", "live_actuals"], key="pipeline_log_service")
     if st.button("Load latest log lines"):
         try:
             result = get_json(f"/pipeline/logs/{log_service}", {"station": station})

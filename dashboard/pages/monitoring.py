@@ -10,6 +10,8 @@ import streamlit as st
 
 try:
     from dashboard.ui import setup_page, render_status_strip
+    from dashboard.hierarchy_monitoring import METRICS, render_group, show_clock
+    from dashboard.station_tree import select_monitoring_node
     from dashboard.renewable_plot import build_renewable_figure
     from dashboard.renewable_summary import build_renewable_summaries
     from dashboard.forecast_selection import select_latest_complete_forecast_run
@@ -20,6 +22,8 @@ except ModuleNotFoundError:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from dashboard.ui import setup_page, render_status_strip
+    from dashboard.hierarchy_monitoring import METRICS, render_group, show_clock
+    from dashboard.station_tree import select_monitoring_node
     from dashboard.renewable_plot import build_renewable_figure
     from dashboard.renewable_summary import build_renewable_summaries
     from dashboard.forecast_selection import select_latest_complete_forecast_run
@@ -98,7 +102,11 @@ def fmt_utc(value) -> str:
 # ---------------------------------------------------------------------
 api = setup_page("Live Monitoring", "monitoring")
 
-st.title("⚡ Live Monitoring")
+heading, clock = st.columns([3, 1], vertical_alignment="center")
+with heading:
+    st.title("⚡ Live Monitoring")
+with clock:
+    show_clock()
 
 # ---------------------------------------------------------------------
 # Sidebar
@@ -159,11 +167,28 @@ try:
     requested_station = st.query_params.get("station")
 except Exception:
     requested_station = None
-preferred_station = requested_station if requested_station in station_ids else active_station
-default_index = (
-    station_ids.index(preferred_station) if preferred_station in station_ids else 0
-)
-station = st.selectbox("Station", station_ids, index=default_index)
+preferred_station = requested_station or active_station or station_ids[0]
+try:
+    tree = api_get(api, "/stations/hierarchy").get("nodes", [])
+except requests.RequestException:
+    tree = []
+if tree:
+    with st.sidebar:
+        selected_node = select_monitoring_node(tree, preferred_station)
+else:
+    station = st.selectbox("Station", station_ids, index=station_ids.index(preferred_station)
+                           if preferred_station in station_ids else 0)
+    selected_node = {"id": station, "children": []}
+station = selected_node["id"]
+
+use_hierarchy_view = bool(selected_node["children"] or stations.get(station, {}).get("hierarchy_path"))
+if use_hierarchy_view:
+    with st.sidebar:
+        group_metric = st.selectbox("Show", list(METRICS), format_func=lambda metric: METRICS[metric][0])
+        include_forecasts = st.checkbox("Show forecasts", value=True)
+        if not selected_node["children"]:
+            use_hierarchy_view = not st.checkbox("Show individual model and anomaly panels")
+
 
 def render_live_monitoring_panel(
     api: str,
@@ -839,9 +864,27 @@ if not hasattr(st, "fragment"):
     )
     st.stop()
 
-fragment_runner = st.fragment(
-    run_every=float(refresh_seconds) if auto_refresh else None
-)(render_live_monitoring_panel)
-fragment_runner(api, station, stations, history_hours, show_forecast_table, auto_refresh,
-                refresh_seconds, 
-                show_diagnostics)
+if use_hierarchy_view:
+    @st.fragment(run_every=float(refresh_seconds) if auto_refresh else None)
+    def render_hierarchy_monitoring() -> None:
+        try:
+            descendant = selected_node
+            while descendant["children"]:
+                descendant = descendant["children"][0]
+            interval = int(stations.get(descendant["id"], {}).get("interval_minutes", 15))
+            payload = api_get(api, "/results/hierarchy", {
+                "node": station, "window": min(2016, max(1, history_hours * 60 // interval)),
+                "include_forecasts": include_forecasts,
+            })
+        except requests.RequestException as exc:
+            st.warning(f"Hierarchy readings are temporarily unavailable: {exc}")
+            return
+        render_group(payload, selected_node, group_metric)
+
+    render_hierarchy_monitoring()
+else:
+    fragment_runner = st.fragment(
+        run_every=float(refresh_seconds) if auto_refresh else None
+    )(render_live_monitoring_panel)
+    fragment_runner(api, station, stations, history_hours, show_forecast_table, auto_refresh,
+                    refresh_seconds, show_diagnostics)

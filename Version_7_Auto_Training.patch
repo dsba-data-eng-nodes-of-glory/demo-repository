@@ -1,0 +1,652 @@
+diff --git a/backend/main.py b/backend/main.py
+index c989786..7fa020a 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -25,6 +25,7 @@ except ImportError:  # metrics remain optional in lightweight POC installs
+ 
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
++    manager.start_supervisor()
+     try:
+         yield
+     finally:
+diff --git a/backend/model_api.py b/backend/model_api.py
+index a526294..44f867f 100644
+--- a/backend/model_api.py
++++ b/backend/model_api.py
+@@ -310,8 +310,22 @@ def update_algorithm_config(algorithm: str, request: ConfigUpdateRequest):
+     }
+ 
+ 
++def training_options_for(supplied: dict | None = None) -> dict:
++    options = dict(supplied or read_algorithm_config().get("training_options") or {})
++    fraction = float(options.get("validation_fraction", 0.15))
++    if not 0.05 <= fraction <= 0.40:
++        raise HTTPException(status_code=422, detail="validation_fraction must be between 0.05 and 0.40.")
++    options["validation_fraction"] = fraction
++    return options
++
++
+ @router.post("/experiments/train")
+ def start_experiment(request: ExperimentRequest):
++    with STATION_REGISTRY_LOCK:
++        return _start_experiment(request)
++
++
++def _start_experiment(request: ExperimentRequest):
+     station_config = read_station_config().get("stations", {})
+     if request.station not in station_config:
+         raise HTTPException(status_code=404, detail=f"Unknown station: {request.station}")
+@@ -325,11 +339,7 @@ def start_experiment(request: ExperimentRequest):
+     if defaults is None:
+         raise HTTPException(status_code=422, detail=f"Algorithm '{request.algorithm}' is not supported for '{request.component}'.")
+     parameters = validate_parameters(request.algorithm, request.parameters, defaults)
+-    training_options = dict(request.training_options or read_algorithm_config().get("training_options", {"validation_fraction": 0.15}))
+-    fraction = float(training_options.get("validation_fraction", 0.15))
+-    if not 0.05 <= fraction <= 0.40:
+-        raise HTTPException(status_code=422, detail="validation_fraction must be between 0.05 and 0.40.")
+-    training_options["validation_fraction"] = fraction
++    training_options = training_options_for(request.training_options)
+     try:
+         return manager.start_model_experiment(
+             request.station, request.algorithm, parameters, training_options,
+@@ -446,10 +456,10 @@ def model_registry(station: str | None = None):
+ @router.post("/deploy")
+ def deploy_model(request: DeployRequest):
+     with STATION_REGISTRY_LOCK:
+-        return _deploy_model(request)
++        return _deploy_model(request, manager)
+ 
+ 
+-def _deploy_model(request: DeployRequest):
++def _deploy_model(request: DeployRequest, manager):
+     config = read_station_config()
+     stations = config.get("stations", {})
+     if request.station not in stations:
+diff --git a/backend/onboarding_training.py b/backend/onboarding_training.py
+new file mode 100644
+index 0000000..adae8ac
+--- /dev/null
++++ b/backend/onboarding_training.py
+@@ -0,0 +1,84 @@
++"""Advance registered stations through their initial model training queue."""
++from __future__ import annotations
++
++from fastapi import HTTPException
++
++from backend.pipeline_manager import STATION_REGISTRY_LOCK, read_station_config, write_station_config
++from src.models.model_registry import get_experiment
++
++DEFAULT_MODELS = {
++    "demand_forecast": "dense_nn",
++    "solar_forecast": "dense_nn",
++    "wind_forecast": "dense_nn",
++    "residual_anomaly": "dense_autoencoder",
++}
++PENDING = {"queued", "running"}
++
++
++def initial_training(components: list[str]) -> dict:
++    return {component: {"algorithm": algorithm, "status": "queued"}
++            for component, algorithm in DEFAULT_MODELS.items() if component in components}
++
++
++def training_pending(entry: dict) -> bool:
++    return any(task["status"] in PENDING for task in (entry.get("initial_training") or {}).values())
++
++
++def advance_initial_training(manager) -> None:
++    from backend.model_api import (
++        DeployRequest, _deploy_model, component_algorithm_defaults, training_options_for, validate_parameters,
++    )
++
++    # Skip this tick if someone is registering, stopping or activating a station.
++    if not STATION_REGISTRY_LOCK.acquire(blocking=False):
++        return
++    try:
++        config = read_station_config()
++        if manager.training_running():
++            return
++        stations = config.get("stations", {})
++        task = next(((station, component, task) for station, entry in stations.items()
++                     for component, task in (entry.get("initial_training") or {}).items()
++                     if task["status"] == "running"), None)
++        if task:
++            station, component, item = task
++            try:
++                record = get_experiment(item["experiment_id"])
++                if not record or record["status"] not in {"candidate", "deployed"}:
++                    raise RuntimeError((record or {}).get("error") or "Training ended before a model was saved. Retry initial training.")
++                current = stations[station].get("model_components", {}).get(component, {})
++                if not current.get("active_experiment_id"):
++                    _deploy_model(DeployRequest(station=station, experiment_id=item["experiment_id"]), manager)
++                item["status"] = "ready"
++            except Exception as exc:
++                item.update(status="failed", error=_error_text(exc))
++            # Deployment writes the registry as well. Preserve its new assignments.
++            config = read_station_config()
++            config["stations"][station]["initial_training"][component] = item
++            write_station_config(config)
++            return
++
++        task = next(((station, component, task) for station, entry in stations.items()
++                     for component, task in (entry.get("initial_training") or {}).items()
++                     if task["status"] == "queued"), None)
++        if not task:
++            return
++        station, component, item = task
++        algorithm = item["algorithm"]
++        try:
++            options = training_options_for()
++            defaults = component_algorithm_defaults(component, algorithm)
++            if defaults is None:
++                raise ValueError(f"No parameters are configured for {algorithm}/{component}.")
++            parameters = validate_parameters(algorithm, {}, defaults)
++            result = manager.start_model_experiment(station, algorithm, parameters, options, component=component)
++            item.update(status="running", experiment_id=result["experiment_id"])
++        except Exception as exc:
++            item.update(status="failed", error=_error_text(exc))
++        write_station_config(config)
++    finally:
++        STATION_REGISTRY_LOCK.release()
++
++
++def _error_text(exc: Exception) -> str:
++    return str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+diff --git a/backend/pipeline_manager.py b/backend/pipeline_manager.py
+index 5cb3a01..208048a 100644
+--- a/backend/pipeline_manager.py
++++ b/backend/pipeline_manager.py
+@@ -175,6 +175,18 @@ class PipelineManager:
+                 self._restart_failed_services()
+             except Exception:
+                 LOG.exception("Service supervisor check failed.")
++            try:
++                from backend.onboarding_training import advance_initial_training
++                advance_initial_training(self)
++            except Exception:
++                LOG.exception("Initial training queue check failed.")
++
++    def start_supervisor(self) -> None:
++        with self.lock:
++            if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
++                self._supervisor_stop.clear()
++                self._supervisor_thread = Thread(target=self._watch_services, name="pipeline-supervisor", daemon=True)
++                self._supervisor_thread.start()
+ 
+     def _supervise(self, name: str, command: list[str], station: str | None = None) -> None:
+         key = self.process_key(name, station)
+@@ -185,10 +197,7 @@ class PipelineManager:
+             previous = self._supervised.get(key)
+             if previous is None or previous.process is not process:
+                 self._supervised[key] = ServiceRestart(command, name, station, process, time.monotonic())
+-            if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
+-                self._supervisor_stop.clear()
+-                self._supervisor_thread = Thread(target=self._watch_services, name="pipeline-supervisor", daemon=True)
+-                self._supervisor_thread.start()
++        self.start_supervisor()
+ 
+     def shutdown_supervisor(self) -> None:
+         self._supervisor_stop.set()
+@@ -328,7 +337,8 @@ class PipelineManager:
+             if existing and existing.poll() is None:
+                 return {"name": name, "station": station, "started": False, "message": "Already running", "pid": existing.pid}
+ 
+-            return self._spawn_locked(name, command, station, self.get_runtime_environment())
++            runtime = {"env": os.environ.copy()} if name == "training" else self.get_runtime_environment()
++            return self._spawn_locked(name, command, station, runtime)
+ 
+     def _spawn_locked(self, name: str, command: list[str], station: str | None, runtime: dict) -> dict[str, Any]:
+         key = self.process_key(name, station)
+@@ -431,6 +441,11 @@ class PipelineManager:
+         finally:
+             admin.close()
+ 
++    def training_running(self) -> bool:
++        with self.lock:
++            return any(key.endswith(":training") and process.poll() is None
++                       for key, process in self.processes.items())
++
+     def start_model_experiment(
+         self,
+         station: str,
+@@ -458,15 +473,8 @@ class PipelineManager:
+         source_file = resolve_root_path(training_file)
+         source_digest = digest_file(source_file)
+ 
+-        # On a single-machine deployment, training an additional station in
+-        # parallel with another large model can exhaust RAM (especially HDD/8 GB).
+-        for process_key, process in list(self.processes.items()):
+-            if process_key.endswith(":training") and process.poll() is None:
+-                raise RuntimeError(f"A training job is already active ({process_key}). Finish it before starting another.")
+-        key = self.process_key("training", station)
+-        existing = self.processes.get(key)
+-        if existing and existing.poll() is None:
+-            raise RuntimeError(f"A training job is already running for station '{station}'.")
++        if self.training_running():
++            raise RuntimeError("A training job is already active. Finish it before starting another.")
+ 
+         experiment_id = f"{station}-{component}-{algorithm}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+         experiment_dir = ROOT / "models" / station / "experiments" / experiment_id
+@@ -510,8 +518,8 @@ class PipelineManager:
+         command = [sys.executable, "-u", "-m", "src.models.run_experiment", "--config", str(config_path)]
+         try:
+             result = self.start("training", command, station)
+-        except Exception:
+-            config_path.unlink(missing_ok=True)
++        except Exception as exc:
++            upsert_experiment({"experiment_id": experiment_id, "status": "failed", "error": str(exc)})
+             raise
+         return {
+             "station": station,
+@@ -527,6 +535,8 @@ class PipelineManager:
+         }
+ 
+     def start_training(self, station: str) -> dict[str, Any]:
++        if self.training_running():
++            raise RuntimeError("A training job is already active. Finish it before starting another.")
+         stations = read_station_config().get("stations", {})
+         if station not in stations:
+             raise ValueError(f"Unknown station '{station}'.")
+@@ -560,6 +570,9 @@ class PipelineManager:
+             )
+ 
+         entry = stations[station]
++        from backend.onboarding_training import training_pending
++        if training_pending(entry):
++            raise RuntimeError("Initial model training is still queued or running for this station.")
+         components = entry.get("model_components")
+         if components is not None and not components.get("demand_forecast", {}).get("enabled", False):
+             raise ValueError(
+diff --git a/backend/station_api.py b/backend/station_api.py
+index 7e7b202..6d25d89 100644
+--- a/backend/station_api.py
++++ b/backend/station_api.py
+@@ -29,6 +29,7 @@ from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_spa
+ from src.models.forecast_weather import ForecastWeatherUnavailable
+ from src.models.forecast_contract import derive_forecast_contract
+ from src.storage.station_hierarchy import build_tree, parse_path, validate_path
++from backend.onboarding_training import initial_training, training_pending
+ 
+ router = APIRouter(prefix="/stations", tags=["stations"])
+ 
+@@ -85,15 +86,21 @@ def _validate_model_row_counts(
+     if "demand_forecast" in selected_models:
+         frame = datasets["demand"]
+         split_at = int(len(frame) * (1.0 - stream_fraction))
+-        minimum_training_rows = int((history_steps + horizon_steps + 30) / (1.0 - 0.15)) + 1
++        from backend.model_api import training_options_for
++        validation_fraction = training_options_for()["validation_fraction"]
++        minimum_training_rows = max(
++            int((history_steps + horizon_steps + 30) / (1.0 - validation_fraction)) + 1,
++            int((horizon_steps - 1) / validation_fraction) + 1,
++        )
+         usable_rows = split_at
+         if managed_weather:
+             usable_rows = len(archive_training_span(frame.iloc[:split_at], ["forecast_temperature"]))
+-        if usable_rows < minimum_training_rows:
++        if (usable_rows < minimum_training_rows
++                or usable_rows - int(usable_rows * (1.0 - validation_fraction)) < horizon_steps):
+             raise ValueError(
+                 f"Worksheet 'Demand' has {usable_rows:,} usable training rows. At least {minimum_training_rows:,} are required "
+                 f"for the demand forecaster with {history_steps} history steps, {horizon_steps} forecast steps "
+-                "and a chronological validation split. Reduce stream_fraction only if appropriate, or add history."
++                "and the configured chronological validation split. Reduce stream_fraction only if appropriate, or add history."
+             )
+         stream_rows = len(frame) - split_at
+         if not live_kafka and stream_rows < horizon_steps:
+@@ -336,7 +343,7 @@ async def onboard_station(
+                 relative_files.update({f"demand_{name}": value for name, value in demand_forecast_paths.items()})
+                 model_components["demand_forecast"] = {
+                     "enabled": True,
+-                    "algorithm": "lstm",
++                    "algorithm": "dense_nn",
+                     "status": "pending_training",
+                     **demand_forecast_paths,
+                     "checkpoint": f"models/{key}/v1/{key}_encoder_decoder_lstm.pt",
+@@ -430,6 +437,7 @@ async def onboard_station(
+             "enabled": False,
+             "status": "registered",
+             "enabled_models": selected,
++            "initial_training": initial_training(selected),
+             "model_components": model_components,
+             "raw_topic": (raw_topic or "").strip() or f"{key}-raw",
+             "featured_topic": (featured_topic or "").strip() or f"{key}-featured",
+@@ -483,7 +491,7 @@ async def onboard_station(
+                 "model_checkpoint": checkpoint_rel,
+                 "model_metadata": f"models/{key}/v1/metadata.json",
+                 "model_version": "v1",
+-                "model_algorithm": "lstm",
++                "model_algorithm": "dense_nn",
+                 "training_rows": int(len(train_frame)),
+                 "history_rows": int(min(history_steps, len(train_frame))),
+                 "stream_rows": int(len(stream_frame)) if stream_input == "csv_replay" else 0,
+@@ -562,7 +570,8 @@ async def onboard_station(
+             "topics_ready": bool(topic_result),
+             "topic_warning": topic_warning,
+             "renewable_serving_adapter_ready": any_renewable_selected,
+-            "next_step": "Configure and train the selected models from Model Management. The streaming pipeline remains a separate activation step.",
++            "initial_training": station_entry["initial_training"],
++            "next_step": "Initial training and model deployment run automatically. Activate the station when it is ready.",
+         }
+     except HTTPException:
+         raise
+@@ -605,10 +614,12 @@ def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
+         lifecycle = "recovering"
+     elif any(service.get("running") for service in data_services):
+         lifecycle = "active"
+-    elif services.get("training", {}).get("running"):
+-        lifecycle = "training"
++    elif services.get("training", {}).get("running") or training_pending(entry):
++        lifecycle = "training" if services.get("training", {}).get("running") else "training_queued"
+     elif entry.get("status") == "stopped":
+         lifecycle = "stopped"
++    elif any(task["status"] == "failed" for task in (entry.get("initial_training") or {}).values()):
++        lifecycle = "model_ready" if status["model_ready"] else "training_failed"
+     elif services.get("training", {}).get("return_code") is not None:
+         lifecycle = "model_ready" if status["model_ready"] and services["training"]["return_code"] == 0 else "training_failed"
+     elif entry.get("status") == "training":
+@@ -619,6 +630,8 @@ def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
+         lifecycle = entry.get("status", "registered")
+     status.update({
+         "lifecycle_status": lifecycle,
++        "initial_training": entry.get("initial_training", {}),
++        "initial_training_pending": training_pending(entry),
+         "display_name": entry.get("display_name", station),
+         "registered": True,
+         "training_file_exists": bool(entry.get("training_file") and resolve_root_path(entry["training_file"]).is_file()),
+@@ -686,6 +699,25 @@ def station_status(station: str):
+     return _status_from_snapshot(station, entries[station], manager.status())
+ 
+ 
++@router.post("/{station}/retry-initial-training")
++def retry_initial_training(station: str):
++    with STATION_REGISTRY_LOCK:
++        config = read_station_config()
++        entry = config.get("stations", {}).get(station)
++        if entry is None:
++            raise HTTPException(status_code=404, detail="Unknown station.")
++        if entry.get("enabled"):
++            raise HTTPException(status_code=409, detail="Stop this station before retrying initial training.")
++        tasks = entry.get("initial_training") or {}
++        count = 0
++        for component, task in tasks.items():
++            if task["status"] == "failed":
++                tasks[component] = {"algorithm": task["algorithm"], "status": "queued"}
++                count += 1
++        write_station_config(config)
++        return {"queued": count, "initial_training": tasks}
++
++
+ @router.post("/{station}/train")
+ def train_station(station: str):
+     try:
+diff --git a/dashboard/app.py b/dashboard/app.py
+index 9121b52..71646f0 100644
+--- a/dashboard/app.py
++++ b/dashboard/app.py
+@@ -116,14 +116,14 @@ with hero_left:
+         st.page_link("pages/station_management.py", label="Manage stations", icon="⚡", use_container_width=True)
+ 
+ with hero_right:
+-    station_label = html.escape(str(stations.get(active_station, {}).get("display_name", active_station))) if active_station else "Awaiting connection"
++    active_station_label = html.escape(str(stations.get(active_station, {}).get("display_name", active_station))) if active_station else "Awaiting connection"
+     badge_text = "Kafka connected" if kafka_ok else "Kafka unavailable"
+     badge_color = "#61e4b1" if kafka_ok else "#ffbd73"
+     connection_text = f"● {badge_text}" if backend_ok else "● Backend not reachable"
+     st.markdown(
+         f'<div class="ef-chart-panel">'
+         f'<div class="small">ACTIVE STATION</div>'
+-        f'<div class="big">{station_label}</div>'
++        f'<div class="big">{active_station_label}</div>'
+         '<svg class="ef-wave" viewBox="0 0 520 112" preserveAspectRatio="none" aria-label="Electricity signal">'
+         '<defs><linearGradient id="efg" x1="0" x2="1"><stop offset="0" stop-color="#25baff"/><stop offset="1" stop-color="#9b7cff"/></linearGradient></defs>'
+         '<path d="M0 78 C45 70 55 80 85 63 S130 22 158 52 S200 91 232 70 S280 28 310 48 S355 94 392 63 S455 38 520 45" fill="none" stroke="url(#efg)" stroke-width="3.5" stroke-linecap="round"/>'
+@@ -184,7 +184,7 @@ with st.expander("New station? Quick setup", expanded=not bool(station_ids)):
+         st.markdown("**1. Add station**")
+         st.page_link("pages/station_management.py", label="Register", icon="📡", use_container_width=True)
+     with quick2:
+-        st.markdown("**2. Train model**")
++        st.markdown("**2. Check model readiness**")
+         st.page_link("pages/model_management.py", label="Model Lab", icon="🧠", use_container_width=True)
+     with quick3:
+         st.markdown("**3. Monitor**")
+@@ -198,6 +198,8 @@ section_title(
+     "Each registered station has independent activation, stop and monitoring controls. Kafka topics are created automatically during registration and retried during activation. Multiple stations can run simultaneously.",
+ )
+ if backend_ok and station_ids:
++    if st.button("Refresh station cards"):
++        st.rerun()
+     station_ids.sort(key=lambda key: station_label(key, stations[key]).casefold())
+     page_size = 12
+     pages = (len(station_ids) + page_size - 1) // page_size
+@@ -212,6 +214,7 @@ if backend_ok and station_ids:
+             services.get(name, {}).get("running", False)
+             for name in ("spark", "predictor", "producer")
+         )
++        training_pending = bool(status.get("initial_training_pending"))
+         model_ready = bool(model_statuses.get(station_id, {}).get("checkpoint_exists"))
+         topics_ready = bool(entry.get("topics_ready"))
+         with card_columns[index % 2]:
+@@ -224,8 +227,12 @@ if backend_ok and station_ids:
+                     state_color, state_label = "#f87171", "FAILED"
+                 elif is_active:
+                     state_color, state_label = "#22c55e", "ACTIVE"
+-                elif training_running:
+-                    state_color, state_label = "#fbbf24", "TRAINING"
++                elif training_pending or training_running:
++                    state_color, state_label = "#fbbf24", "TRAINING" if training_running else "QUEUED"
++                elif model_ready:
++                    state_color, state_label = "#22c55e", "READY"
++                elif lifecycle == "training_failed":
++                    state_color, state_label = "#f87171", "TRAINING FAILED"
+                 else:
+                     state_color, state_label = "#f87171", "STOPPED"
+                 st.markdown(
+@@ -251,7 +258,7 @@ if backend_ok and station_ids:
+                     )
+                 b1, b2, b3 = st.columns(3)
+                 with b1:
+-                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=((is_active and lifecycle != "failed") or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
++                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=((is_active and lifecycle != "failed") or not model_ready or training_pending), use_container_width=True, help="Wait for initial training to finish." if training_pending else "Activate this station independently."):
+                         try:
+                             response = requests.post(f"{api}/stations/{station_id}/activate", timeout=120)
+                             response.raise_for_status()
+diff --git a/dashboard/pages/pipeline_control.py b/dashboard/pages/pipeline_control.py
+index a55ffc6..317f235 100644
+--- a/dashboard/pages/pipeline_control.py
++++ b/dashboard/pages/pipeline_control.py
+@@ -89,7 +89,9 @@ def render_live_pipeline_status(selected_station: str) -> None:
+     ])
+     if not live_kafka:
+         st.warning("Kafka is not reachable at 127.0.0.1:9092. Start Kafka before resetting or activating this station.")
+-    if not live_model:
++    if live.get("initial_training_pending"):
++        st.info("Initial model training is queued or running. Refresh the controls when it finishes.")
++    elif not live_model:
+         st.warning("The demand model artifact is missing. Reset is still available, but starting the current demand-driven pipeline requires a trained demand model.")
+ 
+ 
+@@ -132,7 +134,7 @@ with start_col:
+         "▶  Start selected station",
+         type="primary",
+         use_container_width=True,
+-        disabled=not model_ready or not kafka_ok,
++        disabled=not model_ready or not kafka_ok or status.get("initial_training_pending", False),
+     ):
+         try:
+             result = post_json(f"/stations/{station}/activate", timeout=90)
+diff --git a/dashboard/pages/station_management.py b/dashboard/pages/station_management.py
+index c9f09ff..8b2e5d1 100644
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -131,7 +131,8 @@ with st.form("station_onboarding_form", clear_on_submit=False):
+             st.warning("Solar, wind and anomaly components currently support only 15-minute data; deselect them for other intervals.")
+         else:
+             st.caption(f"7-day history: {10080 // interval_minutes} rows · 24-hour horizon: {1440 // interval_minutes} rows")
+-    st.markdown("**Select models to register**")
++    st.markdown("**Select models to train automatically**")
++    st.caption("Dense NN for Demand, Solar and Wind Energy. Dense Autoencoder for residual-load anomalies.")
+     selected_models = []
+     mcols = st.columns(4)
+     for idx, (model_id, label) in enumerate(model_labels.items()):
+@@ -177,13 +178,8 @@ if submitted:
+                 files={"file": (uploaded.name, uploaded.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                 timeout=(10, 900),
+             )
+-            st.success(f"Station '{result['station']}' registered; {len(selected_models)} components selected.")
+-            if result.get("topics_ready"):
+-                st.success("Kafka topics are ready.")
+-            elif result.get("topic_warning"):
+-                st.warning(f"Kafka setup pending: {result['topic_warning']}")
+-            with st.expander("Registration details", expanded=False):
+-                st.json(result)
++            st.session_state["registered_station_notice"] = result
++            st.session_state["registered_station_selection"] = result["station"]
+             rerun_page()
+         except requests.HTTPError as exc:
+             try:
+@@ -194,6 +190,14 @@ if submitted:
+         except requests.RequestException as exc:
+             st.error(f"Station registration failed: {exc}")
+ 
++notice = st.session_state.pop("registered_station_notice", None)
++if notice:
++    st.success(f"{notice['station']} registered. Initial training is queued.")
++    if notice.get("topic_warning"):
++        st.warning(f"Kafka setup pending: {notice['topic_warning']}")
++    elif notice.get("topics_ready"):
++        st.caption("Kafka topics are ready.")
++
+ st.markdown("---")
+ 
+ # ---------------------------------------------------------------------
+@@ -212,7 +216,7 @@ if not stations:
+     st.stop()
+ 
+ station_ids = list(stations.keys())
+-default_station = registry.get("active_station")
++default_station = st.session_state.pop("registered_station_selection", None) or registry.get("active_station")
+ default_index = station_ids.index(default_station) if default_station in station_ids else 0
+ selected = st.selectbox(
+     "Select station",
+@@ -281,14 +285,40 @@ def render_live_station_status(station_id: str, station_entry: dict, model_info:
+         st.warning(f"Live station status temporarily unavailable: {exc}")
+         return
+     rows_registered = station_entry.get("registered_rows")
++    demand_ready = bool(live_status.get("model_ready"))
++    pending = live_status.get("initial_training_pending", False)
++    tasks = live_status.get("initial_training") or {}
+     render_status_strip([
+         ("History", f"{rows_registered:,} rows" if isinstance(rows_registered, int) else "—", "neutral"),
+-        ("Demand", "Ready" if model_info.get("checkpoint_exists") else "Needs training",
+-         "good" if model_info.get("checkpoint_exists") else "warn"),
++        ("Demand", "Ready" if demand_ready else "Preparing model" if pending else "Needs training",
++         "good" if demand_ready else "warn"),
+         ("Kafka", "Connected" if live_status.get("kafka_tcp_available") else "Offline",
+          "good" if live_status.get("kafka_tcp_available") else "bad"),
+         ("Station", str(live_status.get("lifecycle_status", station_entry.get("status", "registered"))).replace("_", " ").title(), "neutral"),
+     ])
++    if tasks:
++        st.dataframe([
++            {"Model": model_labels.get(component, component),
++             "Status": task["status"].title(),
++             "Details": task.get("error", "")}
++            for component, task in tasks.items()
++        ], hide_index=True, use_container_width=True)
++        if any(task["status"] == "failed" for task in tasks.values()):
++            if st.button("Retry failed training", key=f"retry_initial_{station_id}",
++                         disabled=live_status.get("lifecycle_status") in {"active", "recovering", "failed"}):
++                try:
++                    api_post(f"/stations/{station_id}/retry-initial-training")
++                    st.rerun()
++                except requests.RequestException as exc:
++                    st.error(f"Could not retry training: {exc}")
++        if not pending and demand_ready and live_status.get("lifecycle_status") not in {"active", "recovering"}:
++            if st.button("Activate station", key=f"activate_registered_{station_id}", type="primary",
++                         disabled=not live_status.get("kafka_tcp_available")):
++                try:
++                    api_post(f"/stations/{station_id}/activate", timeout=120)
++                    st.rerun()
++                except requests.RequestException as exc:
++                    st.error(f"Could not activate the station: {exc}")
+     with st.expander("Technical station details", expanded=False):
+         st.json({k: v for k, v in station_entry.items() if k not in {"registered_source_file"}})
+         services = live_status.get("services", {})
+diff --git a/tests/test_onboarding_training.py b/tests/test_onboarding_training.py
+new file mode 100644
+index 0000000..566cb6c
+--- /dev/null
++++ b/tests/test_onboarding_training.py
+@@ -0,0 +1,71 @@
++
++from backend import onboarding_training, pipeline_manager, station_api
++from src.models import model_registry
++
++
++def test_initial_queue_deploys_and_retries_components(monkeypatch, tmp_path):
++    study = "demo-substation"
++    station_file = tmp_path / "stations.yaml"
++    registry_file = tmp_path / "experiments.json"
++    monkeypatch.setattr(pipeline_manager, "STATION_CONFIG", station_file)
++    monkeypatch.setattr(model_registry, "REGISTRY_PATH", registry_file)
++    plan = onboarding_training.initial_training(["demand_forecast", "solar_forecast", "residual_anomaly"])
++    assert [(key, task["algorithm"]) for key, task in plan.items()] == [
++        ("demand_forecast", "dense_nn"), ("solar_forecast", "dense_nn"),
++        ("residual_anomaly", "dense_autoencoder"),
++    ]
++    pipeline_manager.write_station_config({"stations": {study: {
++        "model_components": {key: {"enabled": True} for key in plan},
++        "initial_training": plan,
++    }}})
++
++    class TrainingManager:
++        active = False
++        started = []
++
++        def training_running(self):
++            return self.active
++
++        def station_status(self, station):
++            return {"services": {}}
++
++        def start_model_experiment(self, station, algorithm, params, options, *, component):
++            self.active = True
++            experiment_id = f"{component}-{len(self.started)}"
++            self.started.append(experiment_id)
++            model_registry.upsert_experiment({
++                "experiment_id": experiment_id, "station": station, "algorithm": algorithm,
++                "component": component, "status": "running",
++            })
++            return {"experiment_id": experiment_id}
++
++    manager = TrainingManager()
++    advance = lambda: onboarding_training.advance_initial_training(manager)
++    station = lambda: pipeline_manager.read_station_config()["stations"][study]
++    advance()
++    advance()
++    assert manager.started == ["demand_forecast-0"]
++    assert onboarding_training.training_pending(station())
++
++    artifact = tmp_path / "model.joblib"
++    metadata = tmp_path / "metadata.json"
++    artifact.touch()
++    metadata.write_text("{}")
++    model_registry.upsert_experiment({
++        "experiment_id": manager.started[-1], "status": "candidate",
++        "artifact_path": str(artifact), "metadata_path": str(metadata), "version": "v1",
++    })
++    manager.active = False
++    advance()
++    assert station()["active_model"]["algorithm"] == "dense_nn"
++    assert station()["initial_training"]["demand_forecast"]["status"] == "ready"
++    advance()
++    assert manager.started[-1] == "solar_forecast-1"
++
++    manager.active = False
++    model_registry.upsert_experiment({"experiment_id": manager.started[-1], "status": "failed", "error": "Training failed"})
++    advance()
++    assert station()["initial_training"]["solar_forecast"]["error"] == "Training failed"
++    assert station_api.retry_initial_training(study)["queued"] == 1
++    assert station()["initial_training"]["solar_forecast"] == {"algorithm": "dense_nn", "status": "queued"}
++    assert station()["initial_training"]["demand_forecast"]["status"] == "ready"

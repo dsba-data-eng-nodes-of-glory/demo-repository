@@ -11,6 +11,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.pipeline_manager import (
+    STATION_REGISTRY_LOCK,
     ROOT,
     manager,
     read_station_config,
@@ -18,6 +19,7 @@ from backend.pipeline_manager import (
     write_station_config,
 )
 from src.models.model_registry import get_experiment, list_experiments, upsert_experiment
+from backend.model_deletion import can_delete, delete_inactive_experiment, station_references
 from backend.training_data import (
     station_component_state, registered_source, list_sources, load_source,
     store_source, digest_file, COMPONENT_TO_SHEET,
@@ -309,8 +311,22 @@ def update_algorithm_config(algorithm: str, request: ConfigUpdateRequest):
     }
 
 
+def training_options_for(supplied: dict | None = None) -> dict:
+    options = dict(supplied or read_algorithm_config().get("training_options") or {})
+    fraction = float(options.get("validation_fraction", 0.15))
+    if not 0.05 <= fraction <= 0.40:
+        raise HTTPException(status_code=422, detail="validation_fraction must be between 0.05 and 0.40.")
+    options["validation_fraction"] = fraction
+    return options
+
+
 @router.post("/experiments/train")
 def start_experiment(request: ExperimentRequest):
+    with STATION_REGISTRY_LOCK:
+        return _start_experiment(request)
+
+
+def _start_experiment(request: ExperimentRequest):
     station_config = read_station_config().get("stations", {})
     if request.station not in station_config:
         raise HTTPException(status_code=404, detail=f"Unknown station: {request.station}")
@@ -324,11 +340,7 @@ def start_experiment(request: ExperimentRequest):
     if defaults is None:
         raise HTTPException(status_code=422, detail=f"Algorithm '{request.algorithm}' is not supported for '{request.component}'.")
     parameters = validate_parameters(request.algorithm, request.parameters, defaults)
-    training_options = dict(request.training_options or read_algorithm_config().get("training_options", {"validation_fraction": 0.15}))
-    fraction = float(training_options.get("validation_fraction", 0.15))
-    if not 0.05 <= fraction <= 0.40:
-        raise HTTPException(status_code=422, detail="validation_fraction must be between 0.05 and 0.40.")
-    training_options["validation_fraction"] = fraction
+    training_options = training_options_for(request.training_options)
     try:
         return manager.start_model_experiment(
             request.station, request.algorithm, parameters, training_options,
@@ -362,6 +374,24 @@ def experiment_detail(experiment_id: str):
             except Exception:
                 record["metadata_warning"] = "Metadata file could not be read."
     return record
+
+
+@router.delete("/experiments/{experiment_id}")
+def delete_experiment(experiment_id: str, station: str):
+    with STATION_REGISTRY_LOCK:
+        stations = read_station_config().get("stations", {})
+        record = get_experiment(experiment_id)
+        if station not in stations or record is None or record.get("station") != station:
+            raise HTTPException(status_code=404, detail="Model version not found for this station.")
+        # Some trainers publish a candidate before the worker finishes its final
+        # registry write. Protect that experiment until the worker exits.
+        with manager.lock:
+            process = manager.processes.get(manager.process_key("training", station))
+            if process is not None and process.poll() is None and record.get("config_path"):
+                if str(resolve_root_path(record["config_path"])) in process.args:
+                    raise HTTPException(status_code=409, detail="This model version is still being saved by the trainer.")
+        files_removed = delete_inactive_experiment(record, stations, ROOT)
+    return {"deleted": True, "experiment_id": experiment_id, "files_removed": files_removed}
 
 
 @router.post("/compare")
@@ -432,18 +462,26 @@ def compare_experiments(request: CompareRequest):
 def model_registry(station: str | None = None):
     records = list_experiments(station)
     config = read_station_config().get("stations", {})
+    references = station_references(config, ROOT)
     deployed = {
         station_id: (entry.get("active_model") or {}).get("experiment_id")
         for station_id, entry in config.items()
     }
     return {
         "experiments": records,
+        "deletable_experiment_ids": [record["experiment_id"] for record in records
+                                     if can_delete(record, *references, ROOT)],
         "deployments": deployed,
     }
 
 
 @router.post("/deploy")
 def deploy_model(request: DeployRequest):
+    with STATION_REGISTRY_LOCK:
+        return _deploy_model(request, manager)
+
+
+def _deploy_model(request: DeployRequest, manager):
     config = read_station_config()
     stations = config.get("stations", {})
     if request.station not in stations:

@@ -39,6 +39,9 @@ STATION_CONFIG = ROOT / "config" / "stations.yaml"
 KAFKA_CONFIG = ROOT / "config" / "kafka.yaml"
 
 
+STATION_REGISTRY_LOCK = RLock()
+
+
 def read_station_config() -> dict[str, Any]:
     with STATION_CONFIG.open(encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -92,7 +95,7 @@ class ServiceRestart:
 class PipelineManager:
     """Own independent local processes for every station and service."""
 
-    SERVICE_NAMES = ("spark", "predictor", "producer", "training")
+    SERVICE_NAMES = ("spark", "predictor", "producer", "training", "live_actuals")
     RESTART_DELAYS = (2, 4, 8, 16, 30, 30)
     STABLE_SECONDS = 120
 
@@ -100,7 +103,7 @@ class PipelineManager:
         self.processes: dict[str, subprocess.Popen] = {}
         self.log_handles: dict[str, Any] = {}
         self.lock = Lock()
-        self.lifecycle_lock = RLock()
+        self.lifecycle_lock = STATION_REGISTRY_LOCK
         self._supervised: dict[str, ServiceRestart] = {}
         self._supervisor_stop = Event()
         self._supervisor_thread: Thread | None = None
@@ -172,6 +175,18 @@ class PipelineManager:
                 self._restart_failed_services()
             except Exception:
                 LOG.exception("Service supervisor check failed.")
+            try:
+                from backend.onboarding_training import advance_initial_training
+                advance_initial_training(self)
+            except Exception:
+                LOG.exception("Initial training queue check failed.")
+
+    def start_supervisor(self) -> None:
+        with self.lock:
+            if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
+                self._supervisor_stop.clear()
+                self._supervisor_thread = Thread(target=self._watch_services, name="pipeline-supervisor", daemon=True)
+                self._supervisor_thread.start()
 
     def _supervise(self, name: str, command: list[str], station: str | None = None) -> None:
         key = self.process_key(name, station)
@@ -182,10 +197,7 @@ class PipelineManager:
             previous = self._supervised.get(key)
             if previous is None or previous.process is not process:
                 self._supervised[key] = ServiceRestart(command, name, station, process, time.monotonic())
-            if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
-                self._supervisor_stop.clear()
-                self._supervisor_thread = Thread(target=self._watch_services, name="pipeline-supervisor", daemon=True)
-                self._supervisor_thread.start()
+        self.start_supervisor()
 
     def shutdown_supervisor(self) -> None:
         self._supervisor_stop.set()
@@ -325,7 +337,8 @@ class PipelineManager:
             if existing and existing.poll() is None:
                 return {"name": name, "station": station, "started": False, "message": "Already running", "pid": existing.pid}
 
-            return self._spawn_locked(name, command, station, self.get_runtime_environment())
+            runtime = {"env": os.environ.copy()} if name == "training" else self.get_runtime_environment()
+            return self._spawn_locked(name, command, station, runtime)
 
     def _spawn_locked(self, name: str, command: list[str], station: str | None, runtime: dict) -> dict[str, Any]:
         key = self.process_key(name, station)
@@ -428,6 +441,11 @@ class PipelineManager:
         finally:
             admin.close()
 
+    def training_running(self) -> bool:
+        with self.lock:
+            return any(key.endswith(":training") and process.poll() is None
+                       for key, process in self.processes.items())
+
     def start_model_experiment(
         self,
         station: str,
@@ -455,15 +473,8 @@ class PipelineManager:
         source_file = resolve_root_path(training_file)
         source_digest = digest_file(source_file)
 
-        # On a single-machine deployment, training an additional station in
-        # parallel with another large model can exhaust RAM (especially HDD/8 GB).
-        for process_key, process in list(self.processes.items()):
-            if process_key.endswith(":training") and process.poll() is None:
-                raise RuntimeError(f"A training job is already active ({process_key}). Finish it before starting another.")
-        key = self.process_key("training", station)
-        existing = self.processes.get(key)
-        if existing and existing.poll() is None:
-            raise RuntimeError(f"A training job is already running for station '{station}'.")
+        if self.training_running():
+            raise RuntimeError("A training job is already active. Finish it before starting another.")
 
         experiment_id = f"{station}-{component}-{algorithm}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         experiment_dir = ROOT / "models" / station / "experiments" / experiment_id
@@ -507,8 +518,8 @@ class PipelineManager:
         command = [sys.executable, "-u", "-m", "src.models.run_experiment", "--config", str(config_path)]
         try:
             result = self.start("training", command, station)
-        except Exception:
-            config_path.unlink(missing_ok=True)
+        except Exception as exc:
+            upsert_experiment({"experiment_id": experiment_id, "status": "failed", "error": str(exc)})
             raise
         return {
             "station": station,
@@ -524,6 +535,8 @@ class PipelineManager:
         }
 
     def start_training(self, station: str) -> dict[str, Any]:
+        if self.training_running():
+            raise RuntimeError("A training job is already active. Finish it before starting another.")
         stations = read_station_config().get("stations", {})
         if station not in stations:
             raise ValueError(f"Unknown station '{station}'.")
@@ -557,6 +570,9 @@ class PipelineManager:
             )
 
         entry = stations[station]
+        from backend.onboarding_training import training_pending
+        if training_pending(entry):
+            raise RuntimeError("Initial model training is still queued or running for this station.")
         components = entry.get("model_components")
         if components is not None and not components.get("demand_forecast", {}).get("enabled", False):
             raise ValueError(
@@ -610,6 +626,10 @@ class PipelineManager:
                            "--output", str(resolve_root_path(entry["forecasts_file"])),
                            "--actual-output", str(resolve_root_path(entry["actuals_file"]))]),
         ]
+        if entry.get("live_actuals_enabled", bool(entry.get("hierarchy_path"))) and int(
+            read_kafka_config().get("topic_partitions", 1)
+        ) == 1:
+            commands.append(("live_actuals", [python, "-u", "-m", "src.ingestion.live_actuals_consumer", "--station", station]))
         if use_csv_producer:
             commands.append((
                 "producer", [python, "-u", "-m", "src.producers.csv_producer", "--station", station, *history_arg,
@@ -642,7 +662,7 @@ class PipelineManager:
                     raise
                 if result.get("started"):
                     started.append(name)
-                    time.sleep({"spark": 15, "predictor": 5, "producer": 2}[name])
+                    time.sleep({"spark": 15, "predictor": 5, "producer": 2, "live_actuals": 0}[name])
             registry = read_station_config()
             registry["active_station"] = station
             active_stations = set(registry.get("active_stations", []) or [])
@@ -675,7 +695,7 @@ class PipelineManager:
                     self._supervised.pop(self.process_key(service, station), None)
         results: dict[str, Any] = {}
         if station:
-            for name in ("producer", "predictor", "spark", "training"):
+            for name in ("producer", "predictor", "spark", "training", "live_actuals"):
                 results[name] = self.stop(name, station)
             registry = read_station_config()
             if station in registry.get("stations", {}):
@@ -710,7 +730,7 @@ class PipelineManager:
         """Refuse destructive reset while this station has streaming services alive."""
         active = []
         with self.lock:
-            for service in ("spark", "predictor", "producer", "training"):
+            for service in self.SERVICE_NAMES:
                 proc = self.processes.get(self.process_key(service, station))
                 supervisor = self._supervised.get(self.process_key(service, station))
                 if (proc and proc.poll() is None) or (supervisor is not None
@@ -726,7 +746,7 @@ class PipelineManager:
         if os.name == "nt":
             escaped = re.escape(station)
             script = (
-                "$mods='src\\.producers\\.csv_producer|src\\.spark\\.streaming|src\\.models\\.streaming_predictor'; "
+                "$mods='src\\.producers\\.csv_producer|src\\.spark\\.streaming|src\\.models\\.streaming_predictor|src\\.ingestion\\.live_actuals_consumer'; "
                 f"$needle='--station\\s+{escaped}(\\s|$)'; "
                 "$p=Get-CimInstance Win32_Process | Where-Object { "
                 "$_.CommandLine -match $mods -and $_.CommandLine -match $needle }; "
@@ -1099,11 +1119,15 @@ class PipelineManager:
         predictor_state = predictor_state_path(ROOT, station)
         recovery_files = [predictor_state, predictor_state.with_name(predictor_state.name + "-wal"),
                           predictor_state.with_name(predictor_state.name + "-shm")]
-        for path in recovery_files:
+        from src.storage.live_actuals import live_actuals_path
+        live_state = live_actuals_path(ROOT, station)
+        live_files = [live_state, live_state.with_name(live_state.name + "-wal"),
+                      live_state.with_name(live_state.name + "-shm")]
+        for path in recovery_files + live_files:
             if not path.resolve().is_relative_to(ROOT.resolve()) or path.is_symlink():
-                raise RuntimeError(f"Refusing to reset unsafe predictor recovery path: {path}")
+                raise RuntimeError(f"Refusing to reset unsafe recovery path: {path}")
             if path.exists() and not path.is_file():
-                raise RuntimeError(f"Predictor recovery path is not a file: {path}")
+                raise RuntimeError(f"Recovery path is not a file: {path}")
 
         topic_result = self._ensure_reset_topics(
             station, raw_topic, featured_topic
@@ -1122,10 +1146,12 @@ class PipelineManager:
         elif isolated_outputs:
             import datetime as _dt
             backup_dir = ROOT / "data" / "processed" / "reset_backups" / f"{station}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            output_fields = ("actuals_file", "forecasts_file", "renewable_forecasts_file")
+            output_files = [stations[station].get(field) for field in (
+                "actuals_file", "forecasts_file", "renewable_forecasts_file"
+            )]
+            output_files.append(f"data/processed/stations/{station}/renewable_actuals.csv")
             seen_outputs: set[Path] = set()
-            for field in output_fields:
-                value = stations[station].get(field)
+            for value in output_files:
                 if not value:
                     continue
                 output_path = resolve_root_path(value)
@@ -1175,7 +1201,7 @@ class PipelineManager:
             producer_progress_path.unlink()
 
         predictor_recovery_removed = any(path.exists() for path in recovery_files)
-        for path in recovery_files:
+        for path in recovery_files + live_files:
             path.unlink(missing_ok=True)
 
         # Record the reset state but keep every service stopped. Starting the
@@ -1477,7 +1503,7 @@ class PipelineManager:
 
     def read_log(self, name: str, station: str | None = None, lines: int = 100) -> str:
         if name not in self.SERVICE_NAMES:
-            raise ValueError("Unknown process log. Use spark, predictor, producer or training.")
+            raise ValueError("Unknown process log. Use spark, predictor, producer, training or live_actuals.")
         path = self.log_path(name, station)
         if not path.exists():
             return ""

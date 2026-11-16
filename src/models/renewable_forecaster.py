@@ -415,6 +415,8 @@ class AmprionRenewableForecaster:
             reading = self._live_readings[kind].get(timestamp) if live and self.weather is not None else None
             if reading is not None:
                 value = reading[target]
+            elif live:
+                continue
             else:
                 times = self._renewable_time_index.get(kind)
                 if times is None:

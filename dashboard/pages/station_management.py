@@ -5,11 +5,15 @@ import streamlit as st
 
 try:
     from dashboard.ui import setup_page, section_title, render_status_strip
+    from dashboard.station_tree import group_paths
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from dashboard.ui import setup_page, section_title, render_status_strip
+    from dashboard.station_tree import group_paths
+
+from src.storage.station_hierarchy import station_label
 
 def rerun_page():
     rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
@@ -50,7 +54,19 @@ stations = registry.get("stations", {})
 # ---------------------------------------------------------------------
 # Register new station
 # ---------------------------------------------------------------------
-st.subheader("Add a station")
+st.subheader("Register a station or substation")
+try:
+    parent_choices = group_paths(api_get("/stations/hierarchy").get("nodes", []))
+except requests.RequestException:
+    parent_choices = {}
+parent_choice = st.selectbox(
+    "Reuse an existing parent branch",
+    [None, *sorted(parent_choices, key=lambda key: parent_choices[key])],
+    format_func=lambda key: "Enter a new hierarchy or register a standalone station" if key is None else
+    " / ".join(name for _, name in parent_choices[key]),
+)
+path_prefix = "\n".join(f"{level}: {name}" for level, name in parent_choices.get(parent_choice, []))
+
 with st.expander("Excel upload guidance", expanded=False):
     st.markdown(
         "Fill in **Station Location** with a service-area name and coordinates. "
@@ -68,8 +84,13 @@ model_labels = {
 with st.form("station_onboarding_form", clear_on_submit=False):
     c1, c2 = st.columns(2)
     with c1:
-        station_id = st.text_input("Station ID", placeholder="tennet").strip().lower()
-        display_name = st.text_input("Display name", placeholder="TenneT")
+        station_id = st.text_input("Station or substation ID", placeholder="nrw-substation-01").strip().lower()
+        display_name = st.text_input("Display name", placeholder="Substation 01")
+        hierarchy_path = st.text_area(
+            "Parent hierarchy (top to bottom)", value=path_prefix, key=f"parent_path_{parent_choice}",
+            placeholder="Country: Germany\nState: North Rhine-Westphalia\nStation: Station A",
+            help="Enter one parent per line as Level: Name. Add extra levels as needed. Leave blank for a standalone source station.",
+        ).strip()
         stream_input = st.selectbox(
             "Stream input", ["csv_replay", "kafka"],
             format_func=lambda value: "Historical CSV replay" if value == "csv_replay" else "Live Kafka feed",
@@ -99,9 +120,9 @@ with st.form("station_onboarding_form", clear_on_submit=False):
             help="The current solar/wind and anomaly trainers require 15-minute observations.",
         ))
         residual_demand_unit = st.selectbox(
-            "Demand units for residual-load calculation",
+            "Demand input units",
             options=["mwh_per_interval", "mw"],
-            format_func=lambda value: "MWh per 15-minute interval" if value == "mwh_per_interval" else "MW (average power)",
+            format_func=lambda value: "MWh per source interval" if value == "mwh_per_interval" else "MW (average power)",
             help="Solar and Wind Energy are provided as MWh per 15-minute interval. MW demand is converted to MWh before subtraction.",
         )
         if 10080 % interval_minutes != 0 or 1440 % interval_minutes != 0:
@@ -110,7 +131,8 @@ with st.form("station_onboarding_form", clear_on_submit=False):
             st.warning("Solar, wind and anomaly components currently support only 15-minute data; deselect them for other intervals.")
         else:
             st.caption(f"7-day history: {10080 // interval_minutes} rows · 24-hour horizon: {1440 // interval_minutes} rows")
-    st.markdown("**Select models to register**")
+    st.markdown("**Select models to train automatically**")
+    st.caption("Dense NN for Demand, Solar and Wind Energy. Dense Autoencoder for residual-load anomalies.")
     selected_models = []
     mcols = st.columns(4)
     for idx, (model_id, label) in enumerate(model_labels.items()):
@@ -142,6 +164,7 @@ if submitted:
                 data={
                     "station_id": station_id,
                     "display_name": display_name or station_id.upper(),
+                    "hierarchy_path": hierarchy_path,
                     "stream_fraction": stream_fraction / 100.0,
                     "stream_input": stream_input,
                     "timestamp_format": timestamp_format,
@@ -155,13 +178,8 @@ if submitted:
                 files={"file": (uploaded.name, uploaded.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
                 timeout=(10, 900),
             )
-            st.success(f"Station '{result['station']}' registered; {len(selected_models)} components selected.")
-            if result.get("topics_ready"):
-                st.success("Kafka topics are ready.")
-            elif result.get("topic_warning"):
-                st.warning(f"Kafka setup pending: {result['topic_warning']}")
-            with st.expander("Registration details", expanded=False):
-                st.json(result)
+            st.session_state["registered_station_notice"] = result
+            st.session_state["registered_station_selection"] = result["station"]
             rerun_page()
         except requests.HTTPError as exc:
             try:
@@ -171,6 +189,14 @@ if submitted:
             st.error(f"Station registration failed: {detail}")
         except requests.RequestException as exc:
             st.error(f"Station registration failed: {exc}")
+
+notice = st.session_state.pop("registered_station_notice", None)
+if notice:
+    st.success(f"{notice['station']} registered. Initial training is queued.")
+    if notice.get("topic_warning"):
+        st.warning(f"Kafka setup pending: {notice['topic_warning']}")
+    elif notice.get("topics_ready"):
+        st.caption("Kafka topics are ready.")
 
 st.markdown("---")
 
@@ -190,13 +216,13 @@ if not stations:
     st.stop()
 
 station_ids = list(stations.keys())
-default_station = registry.get("active_station")
+default_station = st.session_state.pop("registered_station_selection", None) or registry.get("active_station")
 default_index = station_ids.index(default_station) if default_station in station_ids else 0
 selected = st.selectbox(
     "Select station",
     station_ids,
     index=default_index,
-    format_func=lambda key: stations[key].get("display_name", key),
+    format_func=lambda key: station_label(key, stations[key]),
 )
 entry = stations[selected]
 if entry.get("weather"):
@@ -259,14 +285,40 @@ def render_live_station_status(station_id: str, station_entry: dict, model_info:
         st.warning(f"Live station status temporarily unavailable: {exc}")
         return
     rows_registered = station_entry.get("registered_rows")
+    demand_ready = bool(live_status.get("model_ready"))
+    pending = live_status.get("initial_training_pending", False)
+    tasks = live_status.get("initial_training") or {}
     render_status_strip([
         ("History", f"{rows_registered:,} rows" if isinstance(rows_registered, int) else "—", "neutral"),
-        ("Demand", "Ready" if model_info.get("checkpoint_exists") else "Needs training",
-         "good" if model_info.get("checkpoint_exists") else "warn"),
+        ("Demand", "Ready" if demand_ready else "Preparing model" if pending else "Needs training",
+         "good" if demand_ready else "warn"),
         ("Kafka", "Connected" if live_status.get("kafka_tcp_available") else "Offline",
          "good" if live_status.get("kafka_tcp_available") else "bad"),
         ("Station", str(live_status.get("lifecycle_status", station_entry.get("status", "registered"))).replace("_", " ").title(), "neutral"),
     ])
+    if tasks:
+        st.dataframe([
+            {"Model": model_labels.get(component, component),
+             "Status": task["status"].title(),
+             "Details": task.get("error", "")}
+            for component, task in tasks.items()
+        ], hide_index=True, use_container_width=True)
+        if any(task["status"] == "failed" for task in tasks.values()):
+            if st.button("Retry failed training", key=f"retry_initial_{station_id}",
+                         disabled=live_status.get("lifecycle_status") in {"active", "recovering", "failed"}):
+                try:
+                    api_post(f"/stations/{station_id}/retry-initial-training")
+                    st.rerun()
+                except requests.RequestException as exc:
+                    st.error(f"Could not retry training: {exc}")
+        if not pending and demand_ready and live_status.get("lifecycle_status") not in {"active", "recovering"}:
+            if st.button("Activate station", key=f"activate_registered_{station_id}", type="primary",
+                         disabled=not live_status.get("kafka_tcp_available")):
+                try:
+                    api_post(f"/stations/{station_id}/activate", timeout=120)
+                    st.rerun()
+                except requests.RequestException as exc:
+                    st.error(f"Could not activate the station: {exc}")
     with st.expander("Technical station details", expanded=False):
         st.json({k: v for k, v in station_entry.items() if k not in {"registered_source_file"}})
         services = live_status.get("services", {})
@@ -290,7 +342,7 @@ render_live_station_status(selected, entry, model)
 # ---------------------------------------------------------------------
 with st.expander("Advanced: service logs", expanded=False):
     st.markdown("#### Station process logs")
-    log_service = st.selectbox("Log source", ["training", "spark", "predictor", "producer"], key="station_log_service")
+    log_service = st.selectbox("Log source", ["training", "spark", "predictor", "producer", "live_actuals"], key="station_log_service")
     if st.button("Refresh selected log"):
         try:
             log_data = api_get(f"/pipeline/logs/{log_service}?station={selected}")

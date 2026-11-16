@@ -15,6 +15,8 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from dashboard.ui import setup_page, section_title, render_status_strip
 
+from src.storage.station_hierarchy import station_label
+
 api = setup_page("Platform Overview", "home")
 
 
@@ -114,14 +116,14 @@ with hero_left:
         st.page_link("pages/station_management.py", label="Manage stations", icon="⚡", use_container_width=True)
 
 with hero_right:
-    station_label = html.escape(str(stations.get(active_station, {}).get("display_name", active_station))) if active_station else "Awaiting connection"
+    active_station_label = html.escape(str(stations.get(active_station, {}).get("display_name", active_station))) if active_station else "Awaiting connection"
     badge_text = "Kafka connected" if kafka_ok else "Kafka unavailable"
     badge_color = "#61e4b1" if kafka_ok else "#ffbd73"
     connection_text = f"● {badge_text}" if backend_ok else "● Backend not reachable"
     st.markdown(
         f'<div class="ef-chart-panel">'
         f'<div class="small">ACTIVE STATION</div>'
-        f'<div class="big">{station_label}</div>'
+        f'<div class="big">{active_station_label}</div>'
         '<svg class="ef-wave" viewBox="0 0 520 112" preserveAspectRatio="none" aria-label="Electricity signal">'
         '<defs><linearGradient id="efg" x1="0" x2="1"><stop offset="0" stop-color="#25baff"/><stop offset="1" stop-color="#9b7cff"/></linearGradient></defs>'
         '<path d="M0 78 C45 70 55 80 85 63 S130 22 158 52 S200 91 232 70 S280 28 310 48 S355 94 392 63 S455 38 520 45" fill="none" stroke="url(#efg)" stroke-width="3.5" stroke-linecap="round"/>'
@@ -182,7 +184,7 @@ with st.expander("New station? Quick setup", expanded=not bool(station_ids)):
         st.markdown("**1. Add station**")
         st.page_link("pages/station_management.py", label="Register", icon="📡", use_container_width=True)
     with quick2:
-        st.markdown("**2. Train model**")
+        st.markdown("**2. Check model readiness**")
         st.page_link("pages/model_management.py", label="Model Lab", icon="🧠", use_container_width=True)
     with quick3:
         st.markdown("**3. Monitor**")
@@ -196,8 +198,14 @@ section_title(
     "Each registered station has independent activation, stop and monitoring controls. Kafka topics are created automatically during registration and retried during activation. Multiple stations can run simultaneously.",
 )
 if backend_ok and station_ids:
+    if st.button("Refresh station cards"):
+        st.rerun()
+    station_ids.sort(key=lambda key: station_label(key, stations[key]).casefold())
+    page_size = 12
+    pages = (len(station_ids) + page_size - 1) // page_size
+    page = st.selectbox("Station page", range(1, pages + 1)) if pages > 1 else 1
     card_columns = st.columns(2, gap="large")
-    for index, station_id in enumerate(station_ids):
+    for index, station_id in enumerate(station_ids[(page - 1) * page_size:page * page_size]):
         entry = stations.get(station_id, {})
         status = station_statuses.get(station_id, {})
         services = status.get("services", {})
@@ -206,6 +214,7 @@ if backend_ok and station_ids:
             services.get(name, {}).get("running", False)
             for name in ("spark", "predictor", "producer")
         )
+        training_pending = bool(status.get("initial_training_pending"))
         model_ready = bool(model_statuses.get(station_id, {}).get("checkpoint_exists"))
         topics_ready = bool(entry.get("topics_ready"))
         with card_columns[index % 2]:
@@ -218,8 +227,12 @@ if backend_ok and station_ids:
                     state_color, state_label = "#f87171", "FAILED"
                 elif is_active:
                     state_color, state_label = "#22c55e", "ACTIVE"
-                elif training_running:
-                    state_color, state_label = "#fbbf24", "TRAINING"
+                elif training_pending or training_running:
+                    state_color, state_label = "#fbbf24", "TRAINING" if training_running else "QUEUED"
+                elif model_ready:
+                    state_color, state_label = "#22c55e", "READY"
+                elif lifecycle == "training_failed":
+                    state_color, state_label = "#f87171", "TRAINING FAILED"
                 else:
                     state_color, state_label = "#f87171", "STOPPED"
                 st.markdown(
@@ -235,6 +248,8 @@ if backend_ok and station_ids:
                     ("Demand", "Ready" if model_ready else "Needs training", "good" if model_ready else "warn"),
                     ("Kafka topics", "Ready" if topics_ready else "Check", "good" if topics_ready else "warn"),
                 ])
+                if entry.get("hierarchy_path"):
+                    st.caption(station_label(station_id, entry))
                 with st.expander("Station details", expanded=False):
                     st.code(station_id, language="text")
                     st.caption(
@@ -243,7 +258,7 @@ if backend_ok and station_ids:
                     )
                 b1, b2, b3 = st.columns(3)
                 with b1:
-                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=((is_active and lifecycle != "failed") or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
+                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=((is_active and lifecycle != "failed") or not model_ready or training_pending), use_container_width=True, help="Wait for initial training to finish." if training_pending else "Activate this station independently."):
                         try:
                             response = requests.post(f"{api}/stations/{station_id}/activate", timeout=120)
                             response.raise_for_status()

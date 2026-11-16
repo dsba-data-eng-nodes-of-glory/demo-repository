@@ -17,6 +17,7 @@ set "HISTORY_CSV=data\training\amprion\demand_train.csv"
 set "OUTPUT_DIR=%ROOT%data\processed\stations\amprion"
 set "PRODUCER_PROGRESS=%ROOT%data\state\amprion\producer_progress.json"
 set "PREDICTOR_RECOVERY=%ROOT%data\state\amprion\predictor_recovery.sqlite3"
+set "LIVE_ACTUALS=%ROOT%data\state\amprion\live_actuals.sqlite3"
 set "TOPIC_LIST=%TEMP%\amprion_kafka_topics_%RANDOM%.txt"
 set "DELETE_JSON=%TEMP%\amprion_delete_records_%RANDOM%.json"
 
@@ -60,7 +61,7 @@ if not exist "%ROOT%src\producers\csv_producer.py" goto :missingcode
 if not exist "%ROOT%src\spark\streaming.py" goto :missingcode
 if not exist "%ROOT%src\models\streaming_predictor.py" goto :missingcode
 
-powershell -NoProfile -Command "$p=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'src\.producers\.csv_producer|src\.spark\.streaming|src\.models\.streaming_predictor' }; if($p){$p | Select-Object ProcessId,CommandLine | Format-List; exit 1}"
+powershell -NoProfile -Command "$p=Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'src\.producers\.csv_producer|src\.spark\.streaming|src\.models\.streaming_predictor|src\.ingestion\.live_actuals_consumer' }; if($p){$p | Select-Object ProcessId,CommandLine | Format-List; exit 1}"
 if errorlevel 1 (
   echo ERROR: A producer, Spark streaming process, or predictor is still running.
   echo Stop the running processes before replaying.
@@ -76,10 +77,10 @@ if errorlevel 1 (
 choice /C YN /N /M "Reset Amprion outputs and replay from 1 October 2026? [Y/N] "
 if errorlevel 2 goto :cancel
 
-REM Back up and clear the station-isolated output files (including renewable forecasts).
+REM Back up and clear the station-isolated output files (including renewable results).
 for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "STAMP=%%I"
 set "BACKUP_DIR=%ROOT%data\processed\replay_backups\amprion_%STAMP%"
-for %%F in (actuals.csv forecasts.csv renewable_forecasts.csv) do (
+for %%F in (actuals.csv forecasts.csv renewable_forecasts.csv renewable_actuals.csv) do (
   if exist "%OUTPUT_DIR%\%%F" (
     if not exist "%BACKUP_DIR%" mkdir "%BACKUP_DIR%"
     copy /Y "%OUTPUT_DIR%\%%F" "%BACKUP_DIR%\%%F" >nul
@@ -133,11 +134,11 @@ if exist "%PRODUCER_PROGRESS%" (
   goto :fail
 )
 
-REM Drop only predictor recovery. The station weather database stays in place.
-for %%F in ("%PREDICTOR_RECOVERY%" "%PREDICTOR_RECOVERY%-wal" "%PREDICTOR_RECOVERY%-shm") do (
+REM Clear the predictor and live reader recovery cursors.
+for %%F in ("%PREDICTOR_RECOVERY%" "%PREDICTOR_RECOVERY%-wal" "%PREDICTOR_RECOVERY%-shm" "%LIVE_ACTUALS%" "%LIVE_ACTUALS%-wal" "%LIVE_ACTUALS%-shm") do (
   if exist "%%~F" del /Q "%%~F"
   if exist "%%~F" (
-    echo ERROR: Could not clear predictor recovery: %%~F
+    echo ERROR: Could not clear recovery state: %%~F
     goto :fail
   )
 )

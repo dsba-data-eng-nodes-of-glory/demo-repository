@@ -28,6 +28,8 @@ from pyspark.sql.functions import (
     isnan,
     current_timestamp,
     expr,
+    pmod,
+    unix_micros,
 )
 from pyspark.sql.types import (
     StructType,
@@ -187,6 +189,11 @@ def main():
         )
         if managed_weather:
             temperature_is_valid = col("temperature").isNull() | temperature_is_valid
+        offset = station.get("hierarchy_grid_offset_seconds")
+        on_station_grid = lit(True)
+        if offset is not None:
+            interval_us = int(station["interval_minutes"]) * 60 * 10**6
+            on_station_grid = pmod(unix_micros(ts), lit(interval_us)) == lit(int(offset) * 10**6)
         valid_condition = coalesce(
             (col("station_id") == lit(args.station))
             & col("utc_timestamp").isNotNull()
@@ -197,6 +204,7 @@ def main():
             & (col("demand") != lit(float("inf")))
             & (col("demand") != lit(float("-inf")))
             & ts.isNotNull()
+            & on_station_grid
             & (
                 ts
                 <= current_timestamp()
@@ -215,6 +223,7 @@ def main():
                 ts > current_timestamp() + expr(f"INTERVAL {max(0, future_skew_minutes)} MINUTES"),
                 lit("future_timestamp"),
             )
+            .when(~on_station_grid, lit("off_station_grid"))
             .when(col("demand").isNull(), lit("missing_demand"))
             .when(lit(not managed_weather) & col("temperature").isNull(), lit("missing_temperature"))
             .when(col("demand") < 0, lit("negative_demand"))

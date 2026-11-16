@@ -1,0 +1,429 @@
+diff --git a/backend/model_api.py b/backend/model_api.py
+index 44f867f..1178a2f 100644
+--- a/backend/model_api.py
++++ b/backend/model_api.py
+@@ -19,6 +19,7 @@ from backend.pipeline_manager import (
+     write_station_config,
+ )
+ from src.models.model_registry import get_experiment, list_experiments, upsert_experiment
++from backend.model_deletion import can_delete, delete_inactive_experiment, station_references
+ from backend.training_data import (
+     station_component_state, registered_source, list_sources, load_source,
+     store_source, digest_file, COMPONENT_TO_SHEET,
+@@ -375,6 +376,24 @@ def experiment_detail(experiment_id: str):
+     return record
+ 
+ 
++@router.delete("/experiments/{experiment_id}")
++def delete_experiment(experiment_id: str, station: str):
++    with STATION_REGISTRY_LOCK:
++        stations = read_station_config().get("stations", {})
++        record = get_experiment(experiment_id)
++        if station not in stations or record is None or record.get("station") != station:
++            raise HTTPException(status_code=404, detail="Model version not found for this station.")
++        # Some trainers publish a candidate before the worker finishes its final
++        # registry write. Protect that experiment until the worker exits.
++        with manager.lock:
++            process = manager.processes.get(manager.process_key("training", station))
++            if process is not None and process.poll() is None and record.get("config_path"):
++                if str(resolve_root_path(record["config_path"])) in process.args:
++                    raise HTTPException(status_code=409, detail="This model version is still being saved by the trainer.")
++        files_removed = delete_inactive_experiment(record, stations, ROOT)
++    return {"deleted": True, "experiment_id": experiment_id, "files_removed": files_removed}
++
++
+ @router.post("/compare")
+ def compare_experiments(request: CompareRequest):
+     if not 2 <= len(request.experiment_ids) <= 4:
+@@ -443,12 +462,15 @@ def compare_experiments(request: CompareRequest):
+ def model_registry(station: str | None = None):
+     records = list_experiments(station)
+     config = read_station_config().get("stations", {})
++    references = station_references(config, ROOT)
+     deployed = {
+         station_id: (entry.get("active_model") or {}).get("experiment_id")
+         for station_id, entry in config.items()
+     }
+     return {
+         "experiments": records,
++        "deletable_experiment_ids": [record["experiment_id"] for record in records
++                                     if can_delete(record, *references, ROOT)],
+         "deployments": deployed,
+     }
+ 
+diff --git a/backend/model_deletion.py b/backend/model_deletion.py
+new file mode 100644
+index 0000000..ad14c62
+--- /dev/null
++++ b/backend/model_deletion.py
+@@ -0,0 +1,96 @@
++"""Remove an inactive, station-owned experiment and its managed artifacts."""
++from __future__ import annotations
++
++import hashlib
++import logging
++from pathlib import Path
++import re
++import shutil
++
++from fastapi import HTTPException
++
++from src.models.model_registry import list_experiments, mark_experiment_deleted
++
++LOG = logging.getLogger(__name__)
++DELETABLE_STATUSES = {"candidate", "previous", "failed"}
++EXPERIMENT_PATH_KEYS = ("artifact_path", "metadata_path", "config_path", "training_summary_path")
++STATION_PATH_KEYS = {"model_checkpoint", "model_metadata", "checkpoint", "metadata",
++                     "artifact_path", "metadata_path", "residual_model_checkpoint", "residual_model_summary",
++                     "training_file", "train_file", "test_file", "data_file", "input_file", "history_file"}
++
++
++def station_references(stations: dict, root: Path) -> tuple[set, set[Path]]:
++    ids, paths = set(), set()
++
++    def collect(config: dict) -> None:
++        for key, value in config.items():
++            if isinstance(value, dict):
++                collect(value)
++            elif key in {"experiment_id", "active_experiment_id"} and isinstance(value, str):
++                ids.add(value)
++            elif key in STATION_PATH_KEYS and isinstance(value, str) and value:
++                paths.add((root / value).resolve())
++
++    for entry in stations.values():
++        collect({key: value for key, value in entry.items() if key != "initial_training"})
++        for task in (entry.get("initial_training") or {}).values():
++            if task.get("status") in {"queued", "running"} and task.get("experiment_id"):
++                ids.add(task["experiment_id"])
++    return ids, paths
++
++
++def can_delete(record: dict, ids: set, paths: set[Path], root: Path) -> bool:
++    return (
++        record.get("status") in DELETABLE_STATUSES
++        and record.get("experiment_id") not in ids
++        and not any((root / record[key]).resolve() in paths for key in EXPERIMENT_PATH_KEYS if record.get(key))
++    )
++
++
++def delete_inactive_experiment(record: dict, stations: dict, root: Path) -> bool:
++    """Return whether disk cleanup completed after committing the deletion."""
++    station, experiment_id = record["station"], record["experiment_id"]
++    for name in (station, experiment_id):
++        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
++            raise HTTPException(status_code=409, detail="The experiment uses an unsupported storage path.")
++    root = root.resolve()
++    ids, paths = station_references(stations, root)
++    if not can_delete(record, ids, paths, root):
++        raise HTTPException(status_code=409, detail="This version is deployed, referenced by a station, or still training.")
++    directory = root / "models" / station / "experiments" / experiment_id
++    for other in list_experiments():
++        keys = ("training_data_path",) if other.get("experiment_id") == experiment_id else (*EXPERIMENT_PATH_KEYS, "training_data_path")
++        paths.update((root / other[key]).resolve() for key in keys if other.get(key))
++    if any(path.is_relative_to(directory) for path in paths):
++        raise HTTPException(status_code=409, detail="Another model or dataset references this experiment folder.")
++    if any(not (root / record[key]).resolve().is_relative_to(directory)
++           for key in EXPERIMENT_PATH_KEYS if record.get(key)):
++        raise HTTPException(status_code=409, detail="This version has files outside its managed experiment folder.")
++
++    digest = hashlib.sha256(experiment_id.encode()).hexdigest()[:20]
++    staged = directory.with_name(f".deleted-{digest}")
++    if any(path.resolve() != path or (path.exists() and not path.is_dir()) for path in (directory, staged)):
++        raise HTTPException(status_code=409, detail="The model folder is not a safe managed directory.")
++    if directory.exists() and staged.exists():
++        raise HTTPException(status_code=409, detail="The experiment folder has a pending cleanup conflict.")
++
++    try:
++        if directory.exists():
++            directory.rename(staged)
++    except OSError as exc:
++        raise HTTPException(status_code=409, detail=f"Could not move the model folder: {exc}") from exc
++
++    try:
++        mark_experiment_deleted(experiment_id)
++    except (ValueError, RuntimeError, OSError) as exc:
++        if staged.exists():
++            staged.rename(directory)
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++    if staged.exists():
++        try:
++            shutil.rmtree(staged)
++        except OSError:
++            LOG.exception("Model %s was removed from the registry; disk cleanup is pending at %s.", experiment_id, staged)
++            return False
++    return True
+diff --git a/dashboard/pages/model_management.py b/dashboard/pages/model_management.py
+index 2a9f2a3..e254aa4 100644
+--- a/dashboard/pages/model_management.py
++++ b/dashboard/pages/model_management.py
+@@ -5,6 +5,7 @@ The existing operational accuracy panels are retained in the Live Performance ta
+ from __future__ import annotations
+ 
+ import math
++from urllib.parse import quote, urlencode
+ import requests
+ import pandas as pd
+ import plotly.graph_objects as go
+@@ -36,7 +37,7 @@ def get_json(api_url: str, path: str, params: dict | None = None) -> dict:
+     return response.json()
+ 
+ 
+-def api_write(method: str, path: str, payload: dict) -> dict:
++def api_write(method: str, path: str, payload: dict | None = None) -> dict:
+     response = requests.request(method, f"{api.rstrip('/')}{path}", json=payload, timeout=60)
+     response.raise_for_status()
+     return response.json()
+@@ -472,6 +473,40 @@ def render_registry_and_deployment(station: str, component: str = "demand_foreca
+             except requests.RequestException as exc:
+                 st.error(f"Deployment was not applied: {exc}")
+ 
++    notice = st.session_state.pop(f"deleted_model_{station}_{component}", None)
++    if notice:
++        st.success(f"Deleted {notice['experiment_id']} from the model registry.")
++        if not notice["files_removed"]:
++            st.warning("Some model files could not be removed. See the FastAPI log for the folder.")
++    deletable = set(payload.get("deletable_experiment_ids", []))
++    options = {item["experiment_id"]: (
++        f"{item.get('algorithm', '').upper()} {item.get('version') or ''} · "
++        f"{item['status'].title()} · {item['experiment_id']}"
++    ) for item in records if item["experiment_id"] in deletable}
++    with st.expander("Delete model version"):
++        if not options:
++            st.caption("No inactive versions are available to delete for this component.")
++        else:
++            target = st.selectbox(
++                "Version to delete", list(options), format_func=options.__getitem__,
++                key=f"delete_model_select_{station}_{component}",
++            )
++            confirmed = st.checkbox(
++                "Permanently delete the selected version and its model files",
++                key=f"confirm_delete_model_{target}",
++            )
++            if st.button("Delete selected version", disabled=not confirmed,
++                         key=f"delete_model_{station}_{component}"):
++                try:
++                    path = f"/models/experiments/{quote(target, safe='')}?{urlencode({'station': station})}"
++                    result = api_write("DELETE", path)
++                    st.session_state[f"deleted_model_{station}_{component}"] = result
++                    get_json.clear()
++                    st.rerun()
++                except requests.RequestException as exc:
++                    st.error(readable_http_error(exc))
++
++
+ 
+ 
+ 
+@@ -862,7 +897,7 @@ station = st.selectbox(
+     "Station workspace", station_ids, index=station_index,
+     format_func=lambda key: f"{station_label(key, stations[key])} ({key})",
+ )
+-station_label = stations[station].get("display_name", station)
++station_display_name = stations[station].get("display_name", station)
+ try:
+     component_payload = get_json(api, "/models/components", {"station": station})
+ except requests.RequestException as exc:
+@@ -892,7 +927,7 @@ active_section = st.radio(
+     help="Only the selected section loads data. This keeps the training screen responsive.",
+ )
+ if active_section == "Configure & Retrain":
+-    render_model_lab(station, station_label, selected_component, component_payload)
++    render_model_lab(station, station_display_name, selected_component, component_payload)
+ elif active_section == "Compare Models":
+     render_comparison(station, selected_component)
+ elif active_section == "Registry & Deployment":
+diff --git a/src/models/model_registry.py b/src/models/model_registry.py
+index 343d7bf..497d796 100644
+--- a/src/models/model_registry.py
++++ b/src/models/model_registry.py
+@@ -8,10 +8,14 @@ from __future__ import annotations
+ import json
+ import os
+ import tempfile
++import time
++from contextlib import contextmanager
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any
+ 
++from src.ingestion.station_lock import acquire_station_lock, release_station_lock
++
+ ROOT = Path(__file__).resolve().parents[2]
+ REGISTRY_PATH = ROOT / "models" / "registry" / "experiments.json"
+ 
+@@ -46,8 +50,26 @@ def _write_document(payload: dict[str, Any]) -> None:
+         Path(temp_name).unlink(missing_ok=True)
+ 
+ 
++@contextmanager
++def _registry_write_lock():
++    lock_path = REGISTRY_PATH.with_suffix(".lock")
++    deadline = time.monotonic() + 5
++    while True:
++        try:
++            handle = acquire_station_lock(lock_path, "model registry writer")
++            break
++        except RuntimeError:
++            if time.monotonic() >= deadline:
++                raise
++            time.sleep(0.05)
++    try:
++        yield
++    finally:
++        release_station_lock(handle)
++
++
+ def list_experiments(station: str | None = None) -> list[dict[str, Any]]:
+-    items = _read_document()["experiments"]
++    items = [item for item in _read_document()["experiments"] if not item.get("deleted_at")]
+     if station:
+         items = [item for item in items if item.get("station") == station]
+     return sorted(items, key=lambda item: item.get("created_at", ""), reverse=True)
+@@ -55,29 +77,52 @@ def list_experiments(station: str | None = None) -> list[dict[str, Any]]:
+ 
+ def get_experiment(experiment_id: str) -> dict[str, Any] | None:
+     for item in _read_document()["experiments"]:
+-        if item.get("experiment_id") == experiment_id:
++        if item.get("experiment_id") == experiment_id and not item.get("deleted_at"):
+             return item
+     return None
+ 
+ 
+ def upsert_experiment(record: dict[str, Any]) -> dict[str, Any]:
+-    payload = _read_document()
+-    items = payload["experiments"]
+-    for index, existing in enumerate(items):
+-        if existing.get("experiment_id") == record.get("experiment_id"):
+-            items[index] = {**existing, **record, "updated_at": utc_now()}
+-            break
+-    else:
+-        items.append({**record, "created_at": record.get("created_at") or utc_now(), "updated_at": utc_now()})
+-    payload["experiments"] = items
+-    _write_document(payload)
+-    return get_experiment(str(record["experiment_id"])) or record
++    with _registry_write_lock():
++        payload = _read_document()
++        items = payload["experiments"]
++        for index, existing in enumerate(items):
++            if existing.get("experiment_id") == record.get("experiment_id"):
++                if existing.get("deleted_at"):
++                    raise ValueError("A deleted experiment cannot be updated.")
++                items[index] = {**existing, **record, "updated_at": utc_now()}
++                saved = items[index]
++                break
++        else:
++            saved = {**record, "created_at": record.get("created_at") or utc_now(), "updated_at": utc_now()}
++            items.append(saved)
++        _write_document(payload)
++        return saved
++
++
++def mark_experiment_deleted(experiment_id: str) -> None:
++    """Retain only the identity and version needed to avoid reusing version numbers."""
++    with _registry_write_lock():
++        payload = _read_document()
++        for index, item in enumerate(payload["experiments"]):
++            if item.get("experiment_id") != experiment_id:
++                continue
++            if item.get("status") not in {"candidate", "previous", "failed"} or item.get("deleted_at"):
++                raise ValueError("Only inactive, finished experiments can be deleted.")
++            keys = ("experiment_id", "station", "algorithm", "component", "version")
++            payload["experiments"][index] = {
++                **{key: item[key] for key in keys if key in item}, "deleted_at": utc_now(),
++            }
++            _write_document(payload)
++            return
++        raise ValueError("Experiment not found.")
+ 
+ 
+ def next_version(station: str, algorithm: str, component: str = "demand_forecast") -> str:
+     versions = []
+-    for item in list_experiments(station):
+-        if item.get("algorithm") == algorithm and item.get("component", "demand_forecast") == component:
++    for item in _read_document()["experiments"]:
++        if (item.get("station") == station and item.get("algorithm") == algorithm
++                and item.get("component", "demand_forecast") == component):
+             value = str(item.get("version", "v0")).lstrip("v")
+             try:
+                 versions.append(int(value))
+diff --git a/tests/test_model_deletion.py b/tests/test_model_deletion.py
+new file mode 100644
+index 0000000..7b84fb3
+--- /dev/null
++++ b/tests/test_model_deletion.py
+@@ -0,0 +1,74 @@
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++import pytest
++
++from backend import model_api
++from src.models import model_registry
++
++
++@pytest.fixture
++def project(tmp_path, monkeypatch):
++    monkeypatch.setattr(model_api, "ROOT", tmp_path)
++    monkeypatch.setattr(model_registry, "REGISTRY_PATH", tmp_path / "experiments.json")
++    stations = {"alpha": {}, "beta": {}}
++    monkeypatch.setattr(model_api, "read_station_config", lambda: {"stations": stations})
++    app = FastAPI()
++    app.include_router(model_api.router)
++    yield TestClient(app), tmp_path, stations
++
++
++def make_version(root, key, status="candidate"):
++    folder = root / "models" / "alpha" / "experiments" / key
++    folder.mkdir(parents=True)
++    artifact = folder / "model.pt"
++    artifact.write_bytes(b"trained-model")
++    model_registry.upsert_experiment({
++        "experiment_id": key, "station": "alpha", "component": "demand_forecast",
++        "algorithm": "dense_nn", "status": status, "artifact_path": str(artifact), "version": "v2",
++    })
++    return artifact
++
++
++def test_removes_only_selected_version_and_keeps_version_sequence(project):
++    client, root, _ = project
++    artifact = make_version(root, "obsolete", "previous")
++    remaining = make_version(root, "live", "deployed")
++    dataset = root / "data.csv"
++    dataset.write_bytes(b"source")
++    model_registry.upsert_experiment({"experiment_id": "obsolete", "training_data_path": str(dataset)})
++    assert client.get("/models/registry?station=alpha").json()["deletable_experiment_ids"] == ["obsolete"]
++    assert client.delete("/models/experiments/obsolete?station=beta").status_code == 404
++    assert client.delete("/models/experiments/obsolete?station=alpha").json() == {
++        "deleted": True, "experiment_id": "obsolete", "files_removed": True,
++    }
++    assert not artifact.parent.exists()
++    assert remaining.is_file() and dataset.is_file()
++    assert client.get("/models/experiments/obsolete").status_code == 404
++    assert client.delete("/models/experiments/obsolete?station=alpha").status_code == 404
++    assert model_registry.next_version("alpha", "dense_nn") == "v3"
++
++
++def test_protects_assignments_shared_files_and_training(project):
++    client, root, stations = project
++    active = make_version(root, "stale-status")
++    ongoing = make_version(root, "training", "running")
++    shared = make_version(root, "shared")
++    pending = make_version(root, "auto-pending")
++    stations["alpha"]["active_model"] = {"experiment_id": "stale-status"}
++    stations["alpha"]["initial_training"] = {
++        "demand_forecast": {"status": "running", "experiment_id": "auto-pending"},
++    }
++    stations["beta"]["renewables"] = {"wind": {"checkpoint": str(shared)}}
++    for key in ("stale-status", "training", "shared", "auto-pending"):
++        assert client.delete(f"/models/experiments/{key}?station=alpha").status_code == 409
++    assert all(path.is_file() for path in (active, ongoing, shared, pending))
++
++
++def test_does_not_delete_external_artifact(project):
++    client, root, _ = project
++    artifact = make_version(root, "old-version")
++    external = root / "external-model.pt"
++    external.touch()
++    model_registry.upsert_experiment({"experiment_id": "old-version", "artifact_path": str(external)})
++    assert client.delete("/models/experiments/old-version?station=alpha").status_code == 409
++    assert artifact.is_file() and external.is_file()

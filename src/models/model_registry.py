@@ -8,9 +8,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from src.ingestion.station_lock import acquire_station_lock, release_station_lock
 
 ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = ROOT / "models" / "registry" / "experiments.json"
@@ -46,8 +50,26 @@ def _write_document(payload: dict[str, Any]) -> None:
         Path(temp_name).unlink(missing_ok=True)
 
 
+@contextmanager
+def _registry_write_lock():
+    lock_path = REGISTRY_PATH.with_suffix(".lock")
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            handle = acquire_station_lock(lock_path, "model registry writer")
+            break
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        release_station_lock(handle)
+
+
 def list_experiments(station: str | None = None) -> list[dict[str, Any]]:
-    items = _read_document()["experiments"]
+    items = [item for item in _read_document()["experiments"] if not item.get("deleted_at")]
     if station:
         items = [item for item in items if item.get("station") == station]
     return sorted(items, key=lambda item: item.get("created_at", ""), reverse=True)
@@ -55,29 +77,52 @@ def list_experiments(station: str | None = None) -> list[dict[str, Any]]:
 
 def get_experiment(experiment_id: str) -> dict[str, Any] | None:
     for item in _read_document()["experiments"]:
-        if item.get("experiment_id") == experiment_id:
+        if item.get("experiment_id") == experiment_id and not item.get("deleted_at"):
             return item
     return None
 
 
 def upsert_experiment(record: dict[str, Any]) -> dict[str, Any]:
-    payload = _read_document()
-    items = payload["experiments"]
-    for index, existing in enumerate(items):
-        if existing.get("experiment_id") == record.get("experiment_id"):
-            items[index] = {**existing, **record, "updated_at": utc_now()}
-            break
-    else:
-        items.append({**record, "created_at": record.get("created_at") or utc_now(), "updated_at": utc_now()})
-    payload["experiments"] = items
-    _write_document(payload)
-    return get_experiment(str(record["experiment_id"])) or record
+    with _registry_write_lock():
+        payload = _read_document()
+        items = payload["experiments"]
+        for index, existing in enumerate(items):
+            if existing.get("experiment_id") == record.get("experiment_id"):
+                if existing.get("deleted_at"):
+                    raise ValueError("A deleted experiment cannot be updated.")
+                items[index] = {**existing, **record, "updated_at": utc_now()}
+                saved = items[index]
+                break
+        else:
+            saved = {**record, "created_at": record.get("created_at") or utc_now(), "updated_at": utc_now()}
+            items.append(saved)
+        _write_document(payload)
+        return saved
+
+
+def mark_experiment_deleted(experiment_id: str) -> None:
+    """Retain only the identity and version needed to avoid reusing version numbers."""
+    with _registry_write_lock():
+        payload = _read_document()
+        for index, item in enumerate(payload["experiments"]):
+            if item.get("experiment_id") != experiment_id:
+                continue
+            if item.get("status") not in {"candidate", "previous", "failed"} or item.get("deleted_at"):
+                raise ValueError("Only inactive, finished experiments can be deleted.")
+            keys = ("experiment_id", "station", "algorithm", "component", "version")
+            payload["experiments"][index] = {
+                **{key: item[key] for key in keys if key in item}, "deleted_at": utc_now(),
+            }
+            _write_document(payload)
+            return
+        raise ValueError("Experiment not found.")
 
 
 def next_version(station: str, algorithm: str, component: str = "demand_forecast") -> str:
     versions = []
-    for item in list_experiments(station):
-        if item.get("algorithm") == algorithm and item.get("component", "demand_forecast") == component:
+    for item in _read_document()["experiments"]:
+        if (item.get("station") == station and item.get("algorithm") == algorithm
+                and item.get("component", "demand_forecast") == component):
             value = str(item.get("version", "v0")).lstrip("v")
             try:
                 versions.append(int(value))

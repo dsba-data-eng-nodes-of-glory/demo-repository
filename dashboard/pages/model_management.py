@@ -5,6 +5,7 @@ The existing operational accuracy panels are retained in the Live Performance ta
 from __future__ import annotations
 
 import math
+from urllib.parse import quote, urlencode
 import requests
 import pandas as pd
 import plotly.graph_objects as go
@@ -24,6 +25,8 @@ except ModuleNotFoundError:
         build_evaluation_frame, calculate_metrics, metrics_by_horizon, metrics_by_run,
     )
 
+from src.storage.station_hierarchy import station_label
+
 api = setup_page("Model Management", "models")
 
 
@@ -34,7 +37,7 @@ def get_json(api_url: str, path: str, params: dict | None = None) -> dict:
     return response.json()
 
 
-def api_write(method: str, path: str, payload: dict) -> dict:
+def api_write(method: str, path: str, payload: dict | None = None) -> dict:
     response = requests.request(method, f"{api.rstrip('/')}{path}", json=payload, timeout=60)
     response.raise_for_status()
     return response.json()
@@ -470,6 +473,40 @@ def render_registry_and_deployment(station: str, component: str = "demand_foreca
             except requests.RequestException as exc:
                 st.error(f"Deployment was not applied: {exc}")
 
+    notice = st.session_state.pop(f"deleted_model_{station}_{component}", None)
+    if notice:
+        st.success(f"Deleted {notice['experiment_id']} from the model registry.")
+        if not notice["files_removed"]:
+            st.warning("Some model files could not be removed. See the FastAPI log for the folder.")
+    deletable = set(payload.get("deletable_experiment_ids", []))
+    options = {item["experiment_id"]: (
+        f"{item.get('algorithm', '').upper()} {item.get('version') or ''} · "
+        f"{item['status'].title()} · {item['experiment_id']}"
+    ) for item in records if item["experiment_id"] in deletable}
+    with st.expander("Delete model version"):
+        if not options:
+            st.caption("No inactive versions are available to delete for this component.")
+        else:
+            target = st.selectbox(
+                "Version to delete", list(options), format_func=options.__getitem__,
+                key=f"delete_model_select_{station}_{component}",
+            )
+            confirmed = st.checkbox(
+                "Permanently delete the selected version and its model files",
+                key=f"confirm_delete_model_{target}",
+            )
+            if st.button("Delete selected version", disabled=not confirmed,
+                         key=f"delete_model_{station}_{component}"):
+                try:
+                    path = f"/models/experiments/{quote(target, safe='')}?{urlencode({'station': station})}"
+                    result = api_write("DELETE", path)
+                    st.session_state[f"deleted_model_{station}_{component}"] = result
+                    get_json.clear()
+                    st.rerun()
+                except requests.RequestException as exc:
+                    st.error(readable_http_error(exc))
+
+
 
 
 
@@ -858,9 +895,9 @@ active_station = station_registry.get("active_station")
 station_index = station_ids.index(active_station) if active_station in station_ids else 0
 station = st.selectbox(
     "Station workspace", station_ids, index=station_index,
-    format_func=lambda key: f"{stations[key].get('display_name', key)} ({key})",
+    format_func=lambda key: f"{station_label(key, stations[key])} ({key})",
 )
-station_label = stations[station].get("display_name", station)
+station_display_name = stations[station].get("display_name", station)
 try:
     component_payload = get_json(api, "/models/components", {"station": station})
 except requests.RequestException as exc:
@@ -890,7 +927,7 @@ active_section = st.radio(
     help="Only the selected section loads data. This keeps the training screen responsive.",
 )
 if active_section == "Configure & Retrain":
-    render_model_lab(station, station_label, selected_component, component_payload)
+    render_model_lab(station, station_display_name, selected_component, component_payload)
 elif active_section == "Compare Models":
     render_comparison(station, selected_component)
 elif active_section == "Registry & Deployment":

@@ -6,20 +6,25 @@ last rows rather than loading the entire file on every dashboard refresh.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import RLock
 import time
 import logging
+import sqlite3
 
 import pandas as pd
 import yaml
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
-from backend.pipeline_manager import ROOT
+from backend.pipeline_manager import ROOT, read_station_config
 from src.ingestion.csv_tail import csv_tail
 from src.ingestion.file_loader import parse_utc_timestamps
 from src.storage.forecast_store import storage_backend, read_actuals as cassandra_read_actuals, read_forecasts as cassandra_read_forecasts, read_latest_forecast as cassandra_read_latest_forecast, read_quality_events
 from src.storage.renewable_store import read_renewable_forecasts, read_renewable_actuals
+from src.storage.hierarchy_rollup import LeafResults, roll_up
+from src.storage.live_actuals import live_actuals_path, read_live_actuals
+from src.storage.station_hierarchy import group_stations
 
 router = APIRouter(prefix="/results", tags=["results"])
 
@@ -43,6 +48,7 @@ _HISTORICAL_ACTUALS_CACHE_LOCK = RLock()
 _HISTORICAL_ACTUALS_CACHE_MAX_ITEMS = 8
 
 _LOG = logging.getLogger(__name__)
+_ROLLUP_READERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="group-read")
 
 
 def _station_output_path(station: str, kind: str) -> Path:
@@ -470,6 +476,89 @@ def actuals(
     if frame.empty:
         return {"records": [], "message": "No actual observations found for this station"}
     return {"records": _json_safe_records(frame)}
+
+
+def _operational_leaf(station: str, entry: dict, window: int, *, include_forecasts: bool) -> LeafResults:
+    """Read processed measurements instead of looking ahead into replay uploads."""
+    limit = window * 2
+    use_cassandra = storage_backend() == "cassandra"
+    configured_actuals = entry.get("actuals_file")
+    actual_path = ROOT / configured_actuals if configured_actuals else ACTUAL_FILE
+    demand = (cassandra_read_actuals(station, limit) if use_cassandra else
+              _json_safe_records(_read_station_rows(actual_path, station, limit,
+                                                   scan_rows=limit if configured_actuals else None)))
+    live = {}
+    try:
+        live = read_live_actuals(live_actuals_path(ROOT, station), limit)
+        demand.extend(live["records"])
+    except sqlite3.Error:
+        _LOG.warning("Live reader storage is temporarily unavailable for %s.", station, exc_info=True)
+    generation = read_renewable_actuals(station, limit=limit * 2) if (entry.get("renewables") or {}).get("enabled") else []
+    if not include_forecasts:
+        return LeafResults(demand, generation, {}, live.get("recovery"))
+
+    horizon = int(entry.get("horizon_steps", 96))
+    # Read the same bounded number of recent runs per component. Include extra
+    # origins so one faster stream can wait for a slower child's latest run.
+    forecast_rows = min(10000, horizon * 20)
+    configured_forecasts = entry.get("forecasts_file")
+    forecast_path = ROOT / configured_forecasts if configured_forecasts else FORECAST_FILE
+    demand_forecasts = (cassandra_read_forecasts(station, forecast_rows) if use_cassandra else
+                        _json_safe_records(_read_station_rows(forecast_path, station, forecast_rows,
+                                                             scan_rows=forecast_rows if configured_forecasts else None)))
+    if not (entry.get("renewables") or {}).get("enabled"):
+        renewable_rows = []
+    elif use_cassandra:
+        renewable_rows = read_renewable_forecasts(station, limit=forecast_rows * 2)
+    else:
+        frame = _read_station_rows(_renewable_file(station, entry), station, forecast_rows * 2,
+                                   scan_rows=forecast_rows * 2)
+        renewable_rows = _json_safe_records(frame)
+    return LeafResults(demand, generation, {
+        "demand_mw": demand_forecasts,
+        "solar_mwh": [row for row in renewable_rows if row.get("generation_type") == "solar"],
+        "wind_mwh": [row for row in renewable_rows if row.get("generation_type") == "wind"],
+    }, live.get("recovery"))
+
+
+@router.get("/hierarchy")
+def hierarchy_results(node: str, window: int = Query(288, ge=1, le=2016), include_forecasts: bool = True):
+    """Aggregate a parent or a leaf on demand from bounded operational reads."""
+    stations = read_station_config().get("stations", {})
+    members = {node: stations[node]} if node in stations else group_stations(stations, node)
+    if not members:
+        raise HTTPException(status_code=404, detail="Unknown hierarchy node.")
+    intervals = {int(entry.get("interval_minutes", 15)) for entry in members.values()}
+    horizons = {int(entry.get("horizon_steps", 96)) for entry in members.values()}
+    if len(intervals) != 1:
+        raise HTTPException(status_code=409, detail="Substations do not share an observation interval.")
+    interval = intervals.pop()
+    forecast_compatible = len(horizons) == 1
+    if not forecast_compatible:
+        include_forecasts = False
+    horizon = min(horizons)
+
+    def read(station: str):
+        try:
+            return _operational_leaf(station, members[station], window, include_forecasts=include_forecasts)
+        except (OSError, ValueError, pd.errors.ParserError):
+            _LOG.warning("Operational results are temporarily unavailable for %s.", station, exc_info=True)
+            return LeafResults([], [], {})
+
+    results = dict(zip(members, _ROLLUP_READERS.map(read, members)))
+    totals = roll_up(members, results, window, interval, horizon)
+    latest = totals.pop("latest_demand_utc")
+    recovering = [leaf.recovery for leaf in results.values()
+                  if leaf.recovery and leaf.recovery["processed"] < leaf.recovery["total"]]
+    return {
+        **totals, "node": node, "interval_minutes": interval, "leaf_count": len(members),
+        "forecast_compatible": forecast_compatible,
+        "recovery": {key: sum(item[key] for item in recovering) for key in ("total", "processed")}
+        if recovering else None,
+        "substations": [{"station_id": station, "name": entry.get("display_name") or station,
+                         "latest_demand_utc": latest[station],
+                         "active": bool(entry.get("enabled"))} for station, entry in members.items()],
+    }
 
 
 @router.get("/quality/events")
