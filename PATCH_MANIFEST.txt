@@ -1,0 +1,11 @@
+Compact dashboard patch; applied over Version 2 plus previous Customer Dashboard and Live Model Analysis patches.
+dashboard/ui.py
+dashboard/app.py
+dashboard/pages/monitoring.py
+dashboard/pages/pipeline_control.py
+dashboard/pages/station_management.py
+dashboard/pages/model_management.py
+dashboard/renewable_plot.py
+dashboard/renewable_summary.py
+tests/test_compact_dashboard_ui.py
+docs/COMPACT_CUSTOMER_DASHBOARD_PATCH.md

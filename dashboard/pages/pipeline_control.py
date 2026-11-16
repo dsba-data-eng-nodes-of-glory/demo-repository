@@ -62,7 +62,7 @@ except requests.RequestException as exc:
 
 section_title(
     "Pipeline operations",
-    "Check service readiness before starting. Stopping also resets this station's replay output and Spark checkpoint.",
+    "Check service readiness before starting. Use Stop to pause the station. Reset Replay clears its replay position.",
 )
 # Keep buttons outside the fragment; only the status strip polls FastAPI.
 @st.fragment(run_every=2.0)
@@ -80,9 +80,10 @@ def render_live_pipeline_status(selected_station: str) -> None:
          "good" if live.get("lifecycle_status") == "active" else "neutral"),
         ("Kafka", "Connected" if live_kafka else "Offline", "good" if live_kafka else "bad"),
         ("Demand model", "Ready" if live_model else "Missing", "good" if live_model else "warn"),
-        *[(name.title(), "Running" if live_services.get(name, {}).get("running") else "Stopped",
-           "good" if live_services.get(name, {}).get("running") else "neutral")
-          for name in ("training", "spark", "predictor", "producer")],
+        *[(name.title(), item.get("state", "running" if item.get("running") else "stopped").title(),
+           "good" if item.get("running") else {"restarting": "warn", "failed": "bad"}.get(item.get("state"), "neutral"))
+          for name in ("training", "spark", "predictor", "producer")
+          for item in [live_services.get(name, {})]],
     ])
     if not live_kafka:
         st.warning("Kafka is not reachable at 127.0.0.1:9092. Start Kafka before resetting or activating this station.")
@@ -122,15 +123,7 @@ if st.toggle("Station model components · details", value=False, key=f"pipeline_
     except requests.RequestException as exc:
         st.warning(f"Model component details are unavailable: {exc}")
 
-station_services_running = any(
-    services.get(name, {}).get("running", False)
-    for name in ("training", "spark", "predictor", "producer")
-)
-
-confirm_stop = st.checkbox(
-    "Confirm resetting this station's Kafka replay records, Spark checkpoint and forecast results",
-    value=False, key=f"confirm_pipeline_stop_{station}",
-)
+station_running = status.get("lifecycle_status") in {"active", "recovering", "failed"}
 start_col, stop_col, refresh_col = st.columns([1.25, 1.1, .8])
 with start_col:
     if st.button(
@@ -147,11 +140,11 @@ with start_col:
             detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
             st.error(f"Could not start station: {detail}")
 with stop_col:
-    if st.button("■  Stop and reset selected station", use_container_width=True, disabled=not confirm_stop):
+    if st.button("■  Stop selected station", use_container_width=True, disabled=not station_running):
         try:
-            result = post_json(f"/stations/{station}/stop", timeout=300)
-            st.success(f"{station} stopped and automatically reset.")
-            st.json(result)
+            post_json(f"/stations/{station}/stop", timeout=120)
+            st.success(f"{station} stopped. Activate it to resume.")
+            st.rerun()
         except requests.RequestException as exc:
             detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
             st.error(f"Could not stop station: {detail}")
@@ -159,10 +152,24 @@ with refresh_col:
     if st.button("↻ Refresh", use_container_width=True):
         st.rerun()
 
+with st.expander("Reset replay"):
+    confirm_reset = st.checkbox(
+        "Clear this station's Kafka replay records, checkpoints and forecast outputs",
+        key=f"confirm_pipeline_reset_{station}",
+    )
+    if st.button("Reset replay from the beginning", disabled=station_running or not confirm_reset):
+        try:
+            result = post_json("/pipeline/reset", {"station": station, "confirm": True}, timeout=300)
+            st.success(f"{station} replay was reset. Start the station to replay from the beginning.")
+            st.json(result)
+        except requests.RequestException as exc:
+            detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
+            st.error(f"Could not reset replay: {detail}")
+
 with st.expander("Advanced: Kafka topics and service logs", expanded=False):
     section_title(
         "Station Kafka topics",
-        "Kafka topics are provisioned automatically during station registration and retried during activation. Stopping a station clears its retained records but keeps topic definitions.",
+        "Kafka topics are provisioned automatically during station registration and retried during activation. Reset Replay clears retained replay records and keeps topic definitions.",
     )
     topics = status.get("topics", {})
     t1, t2 = st.columns(2)

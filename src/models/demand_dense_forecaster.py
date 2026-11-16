@@ -50,7 +50,7 @@ def load_demand_dense_model(checkpoint_path: Path, station_id: str, device: torc
 def build_demand_feature_row(
     history_rows: list[dict[str, Any]],
     future_timestamps: pd.DatetimeIndex,
-    forecast_weather_file: str | Path,
+    forecast_weather_file: str | Path | pd.DataFrame,
     checkpoint: dict,
 ) -> np.ndarray:
     history_steps = int(checkpoint["history"])
@@ -58,16 +58,18 @@ def build_demand_feature_row(
     interval_minutes = int(checkpoint["interval_minutes"])
     if len(history_rows) != history_steps:
         raise ValueError(f"Dense demand model needs {history_steps} historical rows")
-    timestamps = pd.DatetimeIndex(pd.to_datetime([r["utc_timestamp"] for r in history_rows], utc=True))
+    timestamps = pd.DatetimeIndex(pd.to_datetime([r["utc_timestamp"] for r in history_rows], utc=True)).as_unit("ns")
     interval = pd.Timedelta(minutes=interval_minutes)
     if len(timestamps) > 1 and not np.all(np.diff(timestamps.asi8) == interval.value):
         raise ValueError("Demand history is not a continuous 15-minute sequence")
-    future_timestamps = pd.DatetimeIndex(pd.to_datetime(future_timestamps, utc=True))
+    future_timestamps = pd.DatetimeIndex(pd.to_datetime(future_timestamps, utc=True)).as_unit("ns")
     expected = pd.date_range(timestamps[-1] + interval, periods=horizon, freq=interval, tz="UTC")
     if not future_timestamps.equals(expected):
         raise ValueError("Requested demand forecast timestamps do not follow the history origin")
 
-    weather = load_weather_lookup(forecast_weather_file, "utc_timestamp", ["forecast_temperature"])
+    weather = forecast_weather_file
+    if not isinstance(weather, pd.DataFrame):
+        weather = load_weather_lookup(weather, "utc_timestamp", ["forecast_temperature"])
     future_weather = select_forecast_horizon(weather, future_timestamps, ["forecast_temperature"], context="Amprion demand")
     history = pd.DataFrame({
         "utc_timestamp": timestamps,
@@ -100,7 +102,7 @@ def predict_demand(
     model: nn.Module,
     checkpoint: dict,
     device: torch.device,
-    forecast_weather_file: str | Path,
+    forecast_weather_file: str | Path | pd.DataFrame,
     future_timestamps: pd.DatetimeIndex,
 ) -> np.ndarray:
     X = build_demand_feature_row(rows, future_timestamps, forecast_weather_file, checkpoint)

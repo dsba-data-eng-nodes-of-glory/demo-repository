@@ -25,13 +25,16 @@ except ImportError:  # metrics remain optional in lightweight POC installs
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    manager.stop_pipeline()
     try:
-        from src.storage.cassandra_store import close as close_cassandra
-        close_cassandra()
-    except Exception:
-        pass
+        yield
+    finally:
+        manager.shutdown_supervisor()
+        manager.stop_pipeline()
+        try:
+            from src.storage.cassandra_store import close as close_cassandra
+            close_cassandra()
+        except Exception:
+            pass
 
 app = FastAPI(title="Electricity Forecasting POC API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(

@@ -32,8 +32,6 @@ def start(request: StationRequest | None = None):
 def stop(request: StationRequest | None = None):
     try:
         if request and request.station:
-            # Keep the legacy pipeline endpoint consistent with Home: a
-            # station-scoped stop also performs the station reset.
             from backend.station_api import stop_station
             return stop_station(request.station)
         return manager.stop_pipeline(None)

@@ -78,6 +78,21 @@ def _parse_auto(raw: pd.Series) -> pd.Series:
     return parsed
 
 
+def parse_utc_timestamps(raw: pd.Series) -> pd.Series:
+    """Fast paths for platform CSV formats, retaining the mixed-date fallback."""
+    text = raw.astype("string").str.strip()
+    parsed = pd.to_datetime(text, format="ISO8601", errors="coerce", utc=True)
+    missing = parsed.isna() & text.notna()
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(
+            text.loc[missing], format="%d-%m-%Y %H:%M", errors="coerce", utc=True,
+        )
+    missing = parsed.isna() & text.notna()
+    if missing.any():
+        parsed.loc[missing] = _parse_auto(text.loc[missing])
+    return parsed
+
+
 def _parse_timestamps(raw: pd.Series, timestamp_format: str | None) -> tuple[pd.Series, str]:
     requested = (timestamp_format or "auto").strip()
     text = raw.astype("string").str.strip().replace("", pd.NA)
@@ -152,6 +167,8 @@ def load_station_csv(
     source_timezone: str = "UTC",
     demand_column: str | None = None,
     temperature_column: str | None = None,
+    *,
+    source_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Load, normalize and validate a continuous station demand series.
 
@@ -169,7 +186,7 @@ def load_station_csv(
     if interval_minutes <= 0:
         raise ValueError("interval_minutes must be greater than zero.")
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path) if source_frame is None else source_frame
     if df.empty:
         raise ValueError("The uploaded CSV contains no data rows.")
     resolved = detect_station_columns(
@@ -255,7 +272,11 @@ def load_station_csv(
             f"Examples of mismatches: {examples}. Select the actual source interval or check for missing/duplicate rows."
         )
 
-    result = df[REQUIRED].reset_index(drop=True)
+    columns = REQUIRED.copy()
+    if "forecast_temperature" in df.columns:
+        df["forecast_temperature"] = pd.to_numeric(df["forecast_temperature"], errors="coerce")
+        columns.append("forecast_temperature")
+    result = df[columns].reset_index(drop=True)
     result.attrs["source_columns"] = resolved
     result.attrs["timestamp_format_used"] = actual_format
     result.attrs["naive_timestamp_timezone"] = "UTC"

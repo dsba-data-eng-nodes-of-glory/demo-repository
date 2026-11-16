@@ -45,6 +45,7 @@ def build_origin_features(
     history: pd.DataFrame,
     future_timestamps: pd.DatetimeIndex,
     interval_minutes: int = 15,
+    future_temperature: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Return one feature row for each future timestamp at this forecast origin."""
     required = {"utc_timestamp", "demand", "temperature"}
@@ -67,7 +68,7 @@ def build_origin_features(
     history = history.tail(max(max(lag_steps), max(demand_windows), max(temperature_windows))).copy()
     demand = pd.to_numeric(history["demand"], errors="coerce").to_numpy(dtype=float)
     temperature = pd.to_numeric(history["temperature"], errors="coerce").to_numpy(dtype=float)
-    timestamps = pd.DatetimeIndex(pd.to_datetime(history["utc_timestamp"], utc=True))
+    timestamps = pd.DatetimeIndex(pd.to_datetime(history["utc_timestamp"], utc=True)).as_unit("ns")
     if not np.isfinite(demand).all() or not np.isfinite(temperature).all():
         raise ValueError("History has missing or non-finite values.")
     if len(timestamps) > 1:
@@ -113,10 +114,15 @@ def build_origin_features(
     if len(future_timestamps) == 0:
         raise ValueError("No future timestamps supplied.")
 
-    # No future weather feed exists in this POC; use last-observed persistence
-    # consistently in both training and serving.
     horizon = len(future_timestamps)
-    future_temp = np.full(horizon, origin_temp, dtype=float)
+    if future_temperature is None:
+        future_temp = np.full(horizon, origin_temp, dtype=float)
+    else:
+        future_temp = np.asarray(future_temperature, dtype=float)
+        if future_temp.shape != (horizon,) or not np.isfinite(future_temp).all():
+            raise ValueError("The demand forecast requires one finite temperature for each future step.")
+    temperature_feature = ("future_temperature_persistence" if future_temperature is None
+                           else "future_temperature_forecast")
     rolling_1h_window = _steps_for_duration(60, interval_minutes)
     rolling_24h_window = _steps_for_duration(1440, interval_minutes)
     context_needed = max(rolling_1h_window, rolling_24h_window) - 1
@@ -142,7 +148,7 @@ def build_origin_features(
         row.update({
             "horizon_step": float(index),
             "lead_hours": float(index * interval_minutes / 60.0),
-            "future_temperature_persistence": origin_temp,
+            temperature_feature: float(future_temp[index - 1]),
             "future_temperature_rolling_1h": float(roll_1h[index - 1]),
             "future_temperature_rolling_24h": float(roll_24h[index - 1]),
             "target_hour_sin": float(np.sin(hour_angle)),
@@ -163,6 +169,7 @@ def build_training_examples(
     history_steps: int,
     horizon_steps: int,
     interval_minutes: int,
+    use_forecast_weather: bool = False,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
     """Build sampled long-format supervised examples for selected forecast origins."""
     feature_frames: list[pd.DataFrame] = []
@@ -170,12 +177,14 @@ def build_training_examples(
     origin_ids: list[np.ndarray] = []
     timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True))
     demand = frame["demand"].to_numpy(dtype=float)
+    future_temp = frame["forecast_temperature"].to_numpy(dtype=float) if use_forecast_weather else None
     for origin in np.asarray(origins, dtype=int):
         history = frame.iloc[origin - history_steps:origin]
         future_ts = timestamps[origin:origin + horizon_steps]
         if len(future_ts) != horizon_steps:
             continue
-        feature_frames.append(build_origin_features(history, future_ts, interval_minutes))
+        temperatures = future_temp[origin:origin + horizon_steps] if future_temp is not None else None
+        feature_frames.append(build_origin_features(history, future_ts, interval_minutes, temperatures))
         targets.append(demand[origin:origin + horizon_steps])
         origin_ids.append(np.full(horizon_steps, origin, dtype=np.int64))
     if not feature_frames:

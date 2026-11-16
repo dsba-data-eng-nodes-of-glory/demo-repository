@@ -16,6 +16,7 @@ set "STREAM_CSV=data\training\amprion\demand_test.csv"
 set "HISTORY_CSV=data\training\amprion\demand_train.csv"
 set "OUTPUT_DIR=%ROOT%data\processed\stations\amprion"
 set "PRODUCER_PROGRESS=%ROOT%data\state\amprion\producer_progress.json"
+set "PREDICTOR_RECOVERY=%ROOT%data\state\amprion\predictor_recovery.sqlite3"
 set "TOPIC_LIST=%TEMP%\amprion_kafka_topics_%RANDOM%.txt"
 set "DELETE_JSON=%TEMP%\amprion_delete_records_%RANDOM%.json"
 
@@ -132,13 +133,22 @@ if exist "%PRODUCER_PROGRESS%" (
   goto :fail
 )
 
+REM Drop only predictor recovery. The station weather database stays in place.
+for %%F in ("%PREDICTOR_RECOVERY%" "%PREDICTOR_RECOVERY%-wal" "%PREDICTOR_RECOVERY%-shm") do (
+  if exist "%%~F" del /Q "%%~F"
+  if exist "%%~F" (
+    echo ERROR: Could not clear predictor recovery: %%~F
+    goto :fail
+  )
+)
+
 REM Start services in dependency order. The predictor seeds from the final 672
 REM training rows and creates its initial 96-step forecasts before producer starts.
 start "Amprion - Spark" cmd /k "cd /d ""%ROOT%"" && call ""%ACTIVATE%"" electricity-spark && python -u -m src.spark.streaming --station %STATION%"
 echo Waiting 15 seconds for Spark startup...
 timeout /T 15 /NOBREAK >nul
 
-start "Amprion - Predictor" cmd /k "cd /d ""%ROOT%"" && call ""%ACTIVATE%"" electricity-spark && python -u -m src.models.streaming_predictor --station %STATION% --history-file %HISTORY_CSV% --replay"
+start "Amprion - Predictor" cmd /k "cd /d ""%ROOT%"" && call ""%ACTIVATE%"" electricity-spark && python -u -m src.models.streaming_predictor --station %STATION% --history-file %HISTORY_CSV%"
 echo Waiting 5 seconds for predictor subscription...
 timeout /T 5 /NOBREAK >nul
 

@@ -78,6 +78,7 @@ def main():
         )
 
     station = stations[args.station]
+    managed_weather = bool(station.get("weather"))
 
     # ---------------------------------------------------------
     # 2. Define incoming Kafka message schema
@@ -89,6 +90,10 @@ def main():
         StructField("demand", DoubleType(), True),
         StructField("temperature", DoubleType(), True),
         StructField("forecast_temperature", DoubleType(), True),
+        StructField("solar_mwh", DoubleType(), True),
+        StructField("solar_capacity_mw", DoubleType(), True),
+        StructField("wind_mwh", DoubleType(), True),
+        StructField("wind_capacity_mw", DoubleType(), True),
 
         # Replay metadata
         StructField("is_simulated", BooleanType(), True),
@@ -174,18 +179,23 @@ def main():
     def build_batch_outputs(batch_df):
         """Apply validation/features once to the supplied micro-batch."""
         ts = to_timestamp(col("utc_timestamp"))
+        temperature_is_valid = (
+            col("temperature").isNotNull()
+            & (~isnan(col("temperature")))
+            & (col("temperature") != lit(float("inf")))
+            & (col("temperature") != lit(float("-inf")))
+        )
+        if managed_weather:
+            temperature_is_valid = col("temperature").isNull() | temperature_is_valid
         valid_condition = coalesce(
             (col("station_id") == lit(args.station))
             & col("utc_timestamp").isNotNull()
             & col("demand").isNotNull()
-            & col("temperature").isNotNull()
+            & temperature_is_valid
             & (col("demand") >= 0)
             & (~isnan(col("demand")))
-            & (~isnan(col("temperature")))
             & (col("demand") != lit(float("inf")))
             & (col("demand") != lit(float("-inf")))
-            & (col("temperature") != lit(float("inf")))
-            & (col("temperature") != lit(float("-inf")))
             & ts.isNotNull()
             & (
                 ts
@@ -206,7 +216,7 @@ def main():
                 lit("future_timestamp"),
             )
             .when(col("demand").isNull(), lit("missing_demand"))
-            .when(col("temperature").isNull(), lit("missing_temperature"))
+            .when(lit(not managed_weather) & col("temperature").isNull(), lit("missing_temperature"))
             .when(col("demand") < 0, lit("negative_demand"))
             .when(
                 isnan(col("demand"))
@@ -245,6 +255,10 @@ def main():
                 "demand",
                 "temperature",
                 "forecast_temperature",
+                "solar_mwh",
+                "solar_capacity_mw",
+                "wind_mwh",
+                "wind_capacity_mw",
                 "hour_sin",
                 "hour_cos",
                 "weekday_sin",

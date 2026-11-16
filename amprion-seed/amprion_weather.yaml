@@ -1,0 +1,37 @@
+weather:
+  provider: open_meteo
+  forecast_model: ecmwf_ifs
+  sites:
+  - location: Dortmund
+    latitude: 51.5136
+    longitude: 7.4653
+  - location: Essen
+    latitude: 51.4556
+    longitude: 7.0116
+  - location: Dusseldorf
+    latitude: 51.2277
+    longitude: 6.7735
+  - location: Cologne
+    latitude: 50.9375
+    longitude: 6.9603
+  - location: Munster
+    latitude: 51.9607
+    longitude: 7.6261
+  - location: Aachen
+    latitude: 50.7753
+    longitude: 6.0839
+  - location: Koblenz
+    latitude: 50.3569
+    longitude: 7.5889
+  - location: Trier
+    latitude: 49.7499
+    longitude: 6.6371
+  - location: Saarbrucken
+    latitude: 49.2402
+    longitude: 6.9969
+  - location: Frankfurt_am_Main
+    latitude: 50.1109
+    longitude: 8.6821
+  - location: Mainz
+    latitude: 49.9929
+    longitude: 8.2473

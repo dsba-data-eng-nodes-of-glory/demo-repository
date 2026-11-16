@@ -1,7 +1,7 @@
 """Train a station-specific encoder-decoder LSTM compatible with streaming_predictor.
 
 The trainer intentionally uses the same feature names/order and normalization
-contract consumed by src.models.streaming_predictor. Future temperature is
+contract consumed by src.models.streaming_predictor. Legacy future temperature is
 held at the last observed value during both training and inference, avoiding
 train/serve leakage from unavailable future weather observations.
 """
@@ -21,6 +21,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
+from src.ingestion.station_weather import FORECAST_WEATHER_MODE, archive_training_span
 from src.ingestion.file_loader import load_station_csv
 from src.features.feature_schema import HISTORY_FEATURES, FUTURE_FEATURES
 from src.models.forecast_contract import station_forecast_contract
@@ -83,11 +84,13 @@ class WindowDataset(Dataset):
     def __init__(self, indices: np.ndarray, demand_scaled: np.ndarray,
                  history_matrix: np.ndarray, temperatures: np.ndarray,
                  timestamps: pd.DatetimeIndex, temp_mean: float, temp_std: float,
-                 history_steps: int, horizon_steps: int, interval_minutes: int):
+                 history_steps: int, horizon_steps: int, interval_minutes: int,
+                 forecast_temperatures: np.ndarray | None = None):
         self.indices = np.asarray(indices, dtype=np.int64)
         self.demand_scaled = demand_scaled
         self.history_matrix = history_matrix
         self.temperatures = temperatures
+        self.forecast_temperatures = forecast_temperatures
         self.timestamps = timestamps
         self.temp_mean = float(temp_mean)
         self.temp_std = float(temp_std)
@@ -108,8 +111,10 @@ class WindowDataset(Dataset):
         f1 = start + self.horizon_steps
 
         hist = self.history_matrix[h0:h1]
-        last_temp = float(self.temperatures[start - 1])
-        future_temp = np.full(self.horizon_steps, last_temp, dtype=np.float32)
+        if self.forecast_temperatures is None:
+            future_temp = np.full(self.horizon_steps, self.temperatures[start - 1], dtype=np.float32)
+        else:
+            future_temp = self.forecast_temperatures[start:f1]
 
         context = self.temperatures[start - self.context_needed:start]
         combined = np.concatenate((context, future_temp))
@@ -241,6 +246,11 @@ def main() -> None:
     device = torch.device("cpu")  # Local POC is intentionally CPU-safe.
 
     frame = load_station_csv(csv_path, interval_minutes=interval_minutes)
+    managed = bool(station.get("weather"))
+    forecast_temperatures = None
+    if managed:
+        frame = archive_training_span(frame, ["forecast_temperature"])
+        forecast_temperatures = frame["forecast_temperature"].to_numpy(dtype=np.float32)
     timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True))
     demand = frame["demand"].to_numpy(dtype=np.float32)
     temperature = frame["temperature"].to_numpy(dtype=np.float32)
@@ -280,10 +290,10 @@ def main() -> None:
 
     train_ds = WindowDataset(train_indices, demand_scaled, history_matrix, temperature,
                              timestamps, temp_mean, temp_std, history_steps,
-                             horizon_steps, interval_minutes)
+                             horizon_steps, interval_minutes, forecast_temperatures)
     val_ds = WindowDataset(val_indices, demand_scaled, history_matrix, temperature,
                            timestamps, temp_mean, temp_std, history_steps,
-                           horizon_steps, interval_minutes)
+                           horizon_steps, interval_minutes, forecast_temperatures)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
@@ -378,7 +388,7 @@ def main() -> None:
                 "temperature_std": temp_std,
             }
         },
-        "weather_mode": "last_observed_temperature_persistence",
+        "weather_mode": FORECAST_WEATHER_MODE if managed else "last_observed_temperature_persistence",
         "best_validation_rmse_scaled": best_val_rmse,
         "best_validation_mae_original": best_val_mae_original,
         "best_validation_rmse_original": best_val_rmse_original,
@@ -430,7 +440,7 @@ def main() -> None:
         "training_end_utc": pd.Timestamp(timestamps[split_row - 1]).isoformat(),
         "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
         "training_history": history_log,
-        "note": "Future temperature uses last-observed persistence in both training and inference.",
+        "weather_source": "open_meteo_day_ahead" if managed else "uploaded_historical",
     }
     metadata_path = checkpoint_path.parent / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")

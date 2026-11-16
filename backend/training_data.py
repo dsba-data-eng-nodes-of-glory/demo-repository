@@ -19,9 +19,13 @@ from typing import Any
 
 import pandas as pd
 from fastapi import HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
+
+from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
+from src.models.forecast_weather import ForecastWeatherUnavailable
 
 from src.ingestion.workbook_loader import (
-    MODEL_IDS, SOLAR_COLUMNS, WIND_COLUMNS, TIMESTAMP_ALIASES,
+    ENERGY_COLUMNS, MODEL_IDS, SOLAR_COLUMNS, WIND_COLUMNS, TIMESTAMP_ALIASES,
     DEMAND_ALIASES, TEMPERATURE_ALIASES,
     _read_sheet, load_station_workbook,
 )
@@ -119,7 +123,8 @@ def digest_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_csv_component(path: Path, component: str, interval: int, timestamp_format: str, source_timezone: str) -> pd.DataFrame:
+def _read_csv_component(path: Path, component: str, interval: int, timestamp_format: str, source_timezone: str,
+                        *, managed_weather: bool = False) -> pd.DataFrame:
     try:
         frame = pd.read_csv(path, low_memory=False)
     except Exception as exc:
@@ -135,6 +140,8 @@ def _read_csv_component(path: Path, component: str, interval: int, timestamp_for
         ["utc_timestamp", "demand"] + (["temperature"] if component == "demand_forecast" else [])
         if sheet == "Demand" else SOLAR_COLUMNS if sheet == "Solar" else WIND_COLUMNS
     )
+    if managed_weather:
+        required = ENERGY_COLUMNS[sheet]
     aliases = {"utc_timestamp": TIMESTAMP_ALIASES}
     if sheet == "Demand":
         aliases.update({"demand": DEMAND_ALIASES, "temperature": TEMPERATURE_ALIASES})
@@ -187,9 +194,30 @@ def _validate_values(component: str, frame: pd.DataFrame, *, interval: int, entr
             raise ValueError("Renewable training needs enough history for 672 context steps and 96 forecast steps in each chronological split.")
 
 
-def _canonical_data(component: str, frame: pd.DataFrame) -> pd.DataFrame:
-    if component == "residual_anomaly":
-        return frame
+def prepare_training_upload(upload: Path, component: str, interval: int, timestamp_format: str,
+                            source_timezone: str, root: Path, station: str, entry: dict) -> pd.DataFrame:
+    managed = bool(entry.get("weather"))
+    kind = component.split("_")[0]
+    if upload.suffix == ".csv":
+        frame = _read_csv_component(upload, component, interval, timestamp_format, source_timezone,
+                                    managed_weather=managed)
+    else:
+        selection = (["demand_forecast", "solar_forecast", "wind_forecast"]
+                     if component == "residual_anomaly" else [component])
+        data, _ = load_station_workbook(upload, selected_models=selection, interval_minutes=interval,
+                                        timestamp_format=timestamp_format, source_timezone=source_timezone,
+                                        managed_weather=managed)
+        if component == "residual_anomaly":
+            from src.models.residual.training_data import build_training_frame
+            frame = build_training_frame(data["demand"], data["solar"], data["wind"],
+                                         entry.get("residual_demand_unit", "mwh_per_interval"))
+        else:
+            frame = data[kind]
+    if managed and component != "residual_anomaly":
+        weather = station_weather(root, station, entry)
+        weather.enrich({kind: frame})
+        frame = archive_training_span(frame, list(FORECAST_COLUMNS[kind].values()))
+    _validate_values(component, frame, interval=interval, entry=entry)
     return frame
 
 
@@ -218,26 +246,18 @@ async def store_source(*, root: Path, station: str, component: str, entry: dict[
         if size == 0:
             raise HTTPException(status_code=422, detail="Training upload is empty.")
         try:
-            if ext == ".csv":
-                frame = _read_csv_component(upload, component, interval, timestamp_format, source_timezone)
-            else:
-                selection = ['demand_forecast','solar_forecast','wind_forecast'] if component == 'residual_anomaly' else [component]
-                data, _ = load_station_workbook(upload, selected_models=selection, interval_minutes=interval,
-                                                 timestamp_format=timestamp_format, source_timezone=source_timezone)
-                if component == 'residual_anomaly':
-                    from src.models.residual.training_data import build_training_frame
-                    frame=build_training_frame(data['demand'],data['solar'],data['wind'],entry.get('residual_demand_unit','mwh_per_interval'))
-                else:
-                    frame=data['demand' if component == 'demand_forecast' else component.split('_')[0]]
-            _validate_values(component, frame, interval=interval, entry=entry)
+            frame = await run_in_threadpool(
+                prepare_training_upload, upload, component, interval,
+                timestamp_format, source_timezone, root, station, entry,
+            )
+        except ForecastWeatherUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except (ValueError, KeyError, OSError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        output = _canonical_data(component, frame)
+        output = frame.copy()
         if "utc_timestamp" in output:
-            output = output.copy()
             output["utc_timestamp"] = pd.to_datetime(output["utc_timestamp"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         if "timestamp" in output:
-            output = output.copy()
             output["timestamp"] = pd.to_datetime(output["timestamp"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         dataset_path = staging / "data.csv"
         output.to_csv(dataset_path, index=False)
@@ -249,6 +269,7 @@ async def store_source(*, root: Path, station: str, component: str, entry: dict[
             "end_utc": frame["utc_timestamp"].iloc[-1].isoformat(),
             "source_timezone": source_timezone, "timestamp_format": timestamp_format,
             "original_size_bytes": size, "sha256": digest_file(dataset_path),
+            "weather_source": "open_meteo_day_ahead" if entry.get("weather") and component != "residual_anomaly" else None,
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
         }
         (staging / "manifest.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")

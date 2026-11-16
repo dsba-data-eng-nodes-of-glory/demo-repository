@@ -46,7 +46,7 @@ def upload_dataset(station: str, component: str, uploaded, timestamp_format: str
         data={"station": station, "component": component, "timestamp_format": timestamp_format,
               "source_timezone": source_timezone},
         files={"file": (uploaded.name, uploaded.getvalue(), uploaded.type or "application/octet-stream")},
-        timeout=(10, 300),
+        timeout=(10, 900),
     )
     response.raise_for_status()
     return response.json()
@@ -157,7 +157,7 @@ def render_model_lab(station: str, station_label: str, selected_component: str,
         st.error(f"No default parameters for {selected_component}/{algo}.")
         return
     if selected_component in ("solar_forecast", "wind_forecast"):
-        st.info("Solar and Wind share algorithm parameter defaults across stations. Input forecast-weather columns must contain predictions available at the corresponding origin.")
+        st.info("Solar and Wind Energy share algorithm parameter defaults across stations.")
     if selected_component == "residual_anomaly":
         st.info("Dense Autoencoder only · 96-step capacity-aware residual windows · needs >=2 years of aligned Demand/Solar/Wind for fitting, plus validation/calibration.")
 
@@ -200,7 +200,7 @@ def render_model_lab(station: str, station_label: str, selected_component: str,
         )
 
     with st.expander("Upload and validate new historical training data", expanded=not registered_exists):
-        st.write("Upload a model CSV or the three-sheet Excel template. Residual Load requires all three sheets with aligned timestamps and capacity.")
+        st.write("Upload a model CSV or the station workbook. Stations with registered locations get weather automatically. Residual Load requires aligned Demand, Solar and Wind Energy data with installed capacity.")
         st.link_button("Download station Excel training template", f"{api.rstrip('/')}/stations/template")
         new_file = st.file_uploader(
             "New training dataset (CSV / Excel)", type=["csv", "xlsx", "xlsm"],

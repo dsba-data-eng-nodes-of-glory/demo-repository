@@ -36,12 +36,3 @@ prometheus_data/
 grafana_data/
 
 # Docker/local overrides
-__pycache__/
-*.pyc
-.pytest_cache/
-checkpoints/
-*.log
-data/state/
-data/training/
-*.lnk
-.env

@@ -81,13 +81,19 @@ def numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(raw, errors="coerce")
 
 
-def read_csv_robust(path: str | Path) -> tuple[pd.DataFrame, str]:
+def read_csv_robust(path: str | Path, *, max_rows: int | None = None) -> tuple[pd.DataFrame, str]:
     """Read UTF-8 and common Excel/Windows encodings (including CP1252)."""
     path = Path(path)
+    source = path
+    if max_rows is not None:
+        from src.ingestion.csv_tail import csv_tail
+        source = csv_tail(path, max_rows)
     last_error = None
     for encoding in ("utf-8-sig", "cp1252", "latin1"):
         try:
-            frame = pd.read_csv(path, low_memory=False, encoding=encoding)
+            if max_rows is not None:
+                source.seek(0)
+            frame = pd.read_csv(source, low_memory=False, encoding=encoding)
             frame.columns = [str(c).replace("\xa0", " ").strip() for c in frame.columns]
             for column in frame.select_dtypes(include=["object"]).columns:
                 frame[column] = frame[column].map(
@@ -169,11 +175,11 @@ def split_points(n_rows: int) -> tuple[int, int]:
     return int(n_rows * TRAIN_FRACTION), int(n_rows * (TRAIN_FRACTION + VALIDATION_FRACTION))
 
 
-def load_wind_data(path: str | Path, interval_minutes: int) -> tuple[pd.DataFrame, dict]:
+def load_wind_data(path: str | Path, interval_minutes: int, *, max_rows: int | None = None) -> tuple[pd.DataFrame, dict]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Training CSV not found: {path.resolve()}")
-    frame, _ = read_csv_robust(path)
+    frame, _ = read_csv_robust(path, max_rows=max_rows)
     frame.columns = [str(c).replace("\xa0", " ").strip() for c in frame.columns]
 
     future_speed_col = find_column(frame.columns, FUTURE_SPEED_CANDIDATES, "future wind speed column")
@@ -233,7 +239,7 @@ def load_wind_data(path: str | Path, interval_minutes: int) -> tuple[pd.DataFram
     if (grouped[CAPACITY_COLUMN].dropna() <= 0).any():
         raise ValueError(f"Zero or negative values in {CAPACITY_COLUMN}.")
 
-    timestamps = pd.DatetimeIndex(grouped[TIMESTAMP_COLUMN]).sort_values()
+    timestamps = pd.DatetimeIndex(grouped[TIMESTAMP_COLUMN]).as_unit("ns").sort_values()
     interval = pd.Timedelta(minutes=interval_minutes)
     offsets = (timestamps.asi8 - timestamps.asi8[0]) % interval.value
     if np.count_nonzero(offsets):

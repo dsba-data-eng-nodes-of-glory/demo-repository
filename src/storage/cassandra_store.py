@@ -389,7 +389,8 @@ def write_actuals(records: list[dict[str, Any]]) -> int:
         partition_key = (str(record["station_id"]), _month_bucket(ts))
         grouped.setdefault(partition_key, []).append((
             str(record["station_id"]), _month_bucket(ts), ts,
-            float(record["actual_demand"]), float(record["temperature"]),
+            float(record["actual_demand"]),
+            float(record["temperature"]) if record.get("temperature") is not None else None,
         ))
     level_name = os.getenv("CASSANDRA_CONSISTENCY_LEVEL", str(_config().get("cassandra", {}).get("consistency_level", "ONE"))).upper()
     level = getattr(ConsistencyLevel, level_name, ConsistencyLevel.ONE)

@@ -317,14 +317,14 @@ def render_live_monitoring_panel(
         return
 
     # 5,000 rows comfortably covers the 72-hour view and forecast-context window.
-    actual_params = {"station": station, "limit": 600}
+    actual_params = {"station": station, "limit": 600, "recent_only": True}
     if actuals_display_cutoff is not None:
         actual_params["end_time"] = actuals_display_cutoff.isoformat()
     try:
         actual_payload = api_get(api, "/results/actuals", actual_params)
     except requests.RequestException as exc:
-        st.error(f"Could not retrieve actuals from FastAPI: {exc}")
-        st.stop()
+        st.warning(f"Demand history is temporarily unavailable: {exc}")
+        actual_payload = {}
     actuals = pd.DataFrame(actual_payload.get("records", []))
     if not actuals.empty:
         actuals = as_utc(actuals, "utc_timestamp")
@@ -582,7 +582,7 @@ def render_live_monitoring_panel(
                 for item in residual_payload.get('history',[])])
             if not history.empty:st.dataframe(history,use_container_width=True,hide_index=True)
     else:
-        st.caption(residual_payload.get('message','Awaiting synchronized Demand, Solar and Wind forecasts.'))
+        st.caption(residual_payload.get("message", "Waiting for a Residual Load assessment from synchronized forecasts."))
 
     # ---------------------------------------------------------------------
     # Renewable generation monitoring (solar + onshore wind)
@@ -594,9 +594,8 @@ def render_live_monitoring_panel(
         renewable_params["end_time"] = forecast_origin.isoformat()
     try:
         renewable_payload = api_get(api, "/results/renewables", renewable_params)
-        if renewable_payload.get('pending'):
-            st.info(renewable_payload.get('message', 'Solar/Wind data is loading.'))
-            return  # Avoid incorrectly reporting missing generation while cache warms.
+        if renewable_payload.get("history_pending"):
+            st.caption("Loading Solar and Wind Energy observations in the background.")
         renewable_actuals = pd.DataFrame(renewable_payload.get("actuals", []))
         if not renewable_actuals.empty:
             renewable_actuals = as_utc(renewable_actuals, "utc_timestamp")
@@ -618,7 +617,7 @@ def render_live_monitoring_panel(
         )
 
         renewable_summary = build_renewable_summaries(renewable_actuals, renewable_forecasts)
-        for kind, label in (("solar", "Solar"), ("wind", "Wind")):
+        for kind, label in (("solar", "Solar"), ("wind", "Wind Energy")):
             stats = renewable_summary[kind]
             st.markdown(f"**{label}** · MWh per {station_interval_minutes}-minute interval")
             r1, r2, r3, r4 = st.columns(4, gap="small")
@@ -636,8 +635,8 @@ def render_live_monitoring_panel(
         renewable_series_added = any(renewable_counts.values())
         if renewable_series_added:
             st.plotly_chart(renewable_fig, use_container_width=True)
-        else:
-            st.info("Solar/wind actual and forecast records are not available for the selected Amprion time window.")
+        elif not renewable_payload.get("history_pending"):
+            st.info("Waiting for Solar or Wind Energy forecasts for this time window.")
         coverage = renewable_payload.get("coverage", {}) or {}
         coverage = {kind: dict(details or {}) for kind, details in coverage.items()}
         # Coverage labels must describe the rows actually visible in this graph,

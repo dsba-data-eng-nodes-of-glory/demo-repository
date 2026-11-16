@@ -53,14 +53,16 @@ stations = registry.get("stations", {})
 st.subheader("Add a station")
 with st.expander("Excel upload guidance", expanded=False):
     st.markdown(
-        "Upload one workbook with **Demand**, **Solar** and **Wind** sheets. "
-        "Demand also supplies anomaly training. All four models are selected by default."
+        "Fill in **Station Location** with a service-area name and coordinates. "
+        "Use additional representative points for a large area. "
+        "Upload timestamps, electricity readings and renewable capacity in the selected sheets. "
+        "The application obtains weather from Open-Meteo."
     )
 st.link_button("Download station training Excel template", f"{api}/stations/template", use_container_width=False)
 model_labels = {
     "demand_forecast": "Demand forecasting",
     "solar_forecast": "Solar forecasting",
-    "wind_forecast": "Wind forecasting",
+    "wind_forecast": "Wind Energy forecasting",
     "residual_anomaly": "Residual Load anomaly autoencoder",
 }
 with st.form("station_onboarding_form", clear_on_submit=False):
@@ -68,7 +70,11 @@ with st.form("station_onboarding_form", clear_on_submit=False):
     with c1:
         station_id = st.text_input("Station ID", placeholder="tennet").strip().lower()
         display_name = st.text_input("Display name", placeholder="TenneT")
-        stream_fraction = st.slider("Reserve for demo stream (%)", min_value=10, max_value=50, value=20, step=5)
+        stream_input = st.selectbox(
+            "Stream input", ["csv_replay", "kafka"],
+            format_func=lambda value: "Historical CSV replay" if value == "csv_replay" else "Live Kafka feed",
+        )
+        stream_fraction = st.slider("Hold out from model fitting (%)", min_value=10, max_value=50, value=20, step=5)
         uploaded = st.file_uploader("Historical station workbook", type=["xlsx", "xlsm"], key="station_workbook_upload")
     with c2:
         st.markdown("**Timestamp configuration**")
@@ -137,6 +143,7 @@ if submitted:
                     "station_id": station_id,
                     "display_name": display_name or station_id.upper(),
                     "stream_fraction": stream_fraction / 100.0,
+                    "stream_input": stream_input,
                     "timestamp_format": timestamp_format,
                     "source_timezone": source_timezone or "UTC",
                     "interval_minutes": interval_minutes,
@@ -146,7 +153,7 @@ if submitted:
                     "featured_topic": featured_topic.strip(),
                 },
                 files={"file": (uploaded.name, uploaded.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                timeout=240,
+                timeout=(10, 900),
             )
             st.success(f"Station '{result['station']}' registered; {len(selected_models)} components selected.")
             if result.get("topics_ready"):
@@ -192,6 +199,9 @@ selected = st.selectbox(
     format_func=lambda key: stations[key].get("display_name", key),
 )
 entry = stations[selected]
+if entry.get("weather"):
+    locations = ", ".join(point["location"] for point in entry["weather"].get("sites", []))
+    st.caption(f"Open-Meteo weather · {locations}")
 selected_components = entry.get("model_components", {})
 try:
     component_summary = api_get(f"/models/components?station={selected}")

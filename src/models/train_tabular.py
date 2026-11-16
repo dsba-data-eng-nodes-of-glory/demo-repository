@@ -17,6 +17,7 @@ import yaml
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+from src.ingestion.station_weather import FORECAST_WEATHER_MODE, archive_training_span
 from src.ingestion.file_loader import load_station_csv
 from src.models.model_registry import next_version, upsert_experiment, utc_now
 from src.models.forecast_contract import station_forecast_contract
@@ -135,6 +136,9 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("validation_fraction must be between 0.05 and 0.40.")
 
     frame = load_station_csv(csv_path, interval_minutes=interval_minutes)
+    managed = bool(station_entry.get("weather"))
+    if managed:
+        frame = archive_training_span(frame, ["forecast_temperature"])
     n_rows = len(frame)
     split_row = int(n_rows * (1.0 - validation_fraction))
     if split_row <= history_steps + horizon_steps or n_rows - split_row < horizon_steps:
@@ -153,10 +157,10 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Not enough train/validation forecast origins after sampling.")
 
     x_train, y_train, train_origin_ids = build_training_examples(
-        frame, train_origins, history_steps, horizon_steps, interval_minutes
+        frame, train_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
     )
     x_valid, y_valid, valid_origin_ids = build_training_examples(
-        frame, validation_origins, history_steps, horizon_steps, interval_minutes
+        frame, validation_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
     )
     feature_names = list(x_train.columns)
     x_valid = x_valid.reindex(columns=feature_names)
@@ -231,8 +235,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "model_size_bytes": int(artifact_path.stat().st_size),
         "training_csv": csv_path.relative_to(ROOT).as_posix() if csv_path.is_relative_to(ROOT) else str(csv_path),
         "created_at": created,
-        "weather_mode": "last_observed_temperature_persistence",
-        "note": "Future temperature uses last-observed persistence in both training and inference; no future actual weather is used.",
+        "weather_mode": FORECAST_WEATHER_MODE if managed else "last_observed_temperature_persistence",
+        "weather_source": "open_meteo_day_ahead" if managed else "uploaded_historical",
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 

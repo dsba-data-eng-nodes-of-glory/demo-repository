@@ -14,6 +14,8 @@ def validate_event(
     interval_minutes: int,
     previous_timestamp: pd.Timestamp | None = None,
     max_future_skew_minutes: int = 5,
+    *,
+    require_temperature: bool = True,
 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
     """Return a normalized event and quality issues; never silently discard data."""
     issues: list[dict[str, str]] = []
@@ -41,7 +43,7 @@ def validate_event(
         issues.append({"rule_name": "invalid_demand", "severity": "error", "message": "Demand is missing or non-finite."})
     elif demand < 0:
         issues.append({"rule_name": "negative_demand", "severity": "error", "message": "Demand cannot be negative."})
-    if not math.isfinite(temperature):
+    if (require_temperature or payload.get("temperature") is not None) and not math.isfinite(temperature):
         issues.append({"rule_name": "invalid_temperature", "severity": "error", "message": "Temperature is missing or non-finite."})
 
     if not pd.isna(ts) and previous_timestamp is not None:
@@ -59,7 +61,7 @@ def validate_event(
         "station_id": expected_station,
         "utc_timestamp": pd.Timestamp(ts),
         "demand": demand,
-        "temperature": temperature,
+        "temperature": temperature if math.isfinite(temperature) else None,
     }, []
 
 

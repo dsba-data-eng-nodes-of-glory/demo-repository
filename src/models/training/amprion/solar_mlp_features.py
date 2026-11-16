@@ -45,12 +45,18 @@ def load_solar_csv(
     path: str | Path,
     interval_minutes: int = INTERVAL_MINUTES,
     capacity_column: str = CAPACITY_COLUMN,
+    *,
+    max_rows: int | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {path}")
 
-    frame = pd.read_csv(path, low_memory=False)
+    if max_rows is not None:
+        from src.ingestion.csv_tail import csv_tail
+        frame = pd.read_csv(csv_tail(path, max_rows), low_memory=False)
+    else:
+        frame = pd.read_csv(path, low_memory=False)
     frame.columns = [str(c).strip() for c in frame.columns]
     required = [
         TIMESTAMP_COLUMN, TARGET_COLUMN, CLOUD_COLUMN, RADIATION_COLUMN,
@@ -83,7 +89,7 @@ def load_solar_csv(
     ]
     frame = frame.groupby(TIMESTAMP_COLUMN, as_index=False)[value_cols].mean()
     frame = frame.sort_values(TIMESTAMP_COLUMN)
-    ts = pd.DatetimeIndex(frame[TIMESTAMP_COLUMN])
+    ts = pd.DatetimeIndex(frame[TIMESTAMP_COLUMN]).as_unit("ns")
     interval = pd.Timedelta(minutes=interval_minutes)
     offsets = (ts.asi8 - ts.asi8[0]) % interval.value
     if np.any(offsets):

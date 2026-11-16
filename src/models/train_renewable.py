@@ -1,7 +1,7 @@
 """Component-scoped renewable experiments using the original solar/wind feature builders.
 
 The three data splits are chronological. Fit scalers only on the training
-period. Future weather inputs come exclusively from uploaded forecast columns.
+period. Future weather inputs come from archived or customer-supplied forecasts.
 One forecast origin has exactly 672 past observations and 96 predicted steps.
 """
 from __future__ import annotations
@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from src.ingestion.station_weather import archive_training_span
 from src.models.model_registry import next_version, utc_now
 from src.models.training.amprion import solar_mlp_features as solar
 from src.models.training.amprion import solar_mlp_model
@@ -251,6 +252,10 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     if not data_path.is_absolute():
         data_path = ROOT / data_path
     frame = load_frame(kind, data_path)
+    if entry.get("weather"):
+        weather_columns = ([solar.FORECAST_CLOUD_COLUMN, solar.FORECAST_RADIATION_COLUMN] if kind == "solar"
+                           else ["_future_wind_speed", "_future_wind_direction"])
+        frame = archive_training_span(frame, weather_columns)
     target_col = solar.TARGET_COLUMN if kind == "solar" else wind.TARGET_COLUMN
     all_targets = frame[target_col].to_numpy(dtype=np.float64)
     count = len(frame)
@@ -376,10 +381,10 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "evaluation_protocol": "chronological_train_validation_test_sampled_origins_v1",
         "metrics": unit_metrics,
         "parameters": params, "forecast_weather_mode": "forecast_weather_columns_by_valid_timestamp",
-        "weather_vintage_warning": (
-            "For operational backtests forecast weather must be the vintage available at each forecast origin. "
-            "A single forecast value per valid timestamp cannot reconstruct all historical forecast vintages."
-        ),
+        "weather_vintage": ("open_meteo_fixed_24h_before_valid_hour" if entry.get("weather")
+                            else "uploaded_forecast_by_valid_time"),
+        "weather_vintage_warning": ("Archived values use a fixed lead at each valid hour. "
+                                    "They do not reconstruct a single forecast run per model origin."),
         "model_size_bytes": int(artifact_path.stat().st_size),
         "training_duration_seconds": time.perf_counter() - started_at,
         "created_at": utc_now(), **extra,

@@ -193,7 +193,7 @@ with st.expander("New station? Quick setup", expanded=not bool(station_ids)):
 # ---------------------------------------------------------------------
 section_title(
     "Registered stations",
-    "Each registered station has independent activation, stop/reset and monitoring controls. Kafka topics are created automatically during registration and retried during activation. Multiple stations can run simultaneously.",
+    "Each registered station has independent activation, stop and monitoring controls. Kafka topics are created automatically during registration and retried during activation. Multiple stations can run simultaneously.",
 )
 if backend_ok and station_ids:
     card_columns = st.columns(2, gap="large")
@@ -201,7 +201,8 @@ if backend_ok and station_ids:
         entry = stations.get(station_id, {})
         status = station_statuses.get(station_id, {})
         services = status.get("services", {})
-        is_active = status.get("lifecycle_status") == "active" or any(
+        lifecycle = status.get("lifecycle_status")
+        is_active = lifecycle in {"active", "recovering", "failed"} or any(
             services.get(name, {}).get("running", False)
             for name in ("spark", "predictor", "producer")
         )
@@ -211,7 +212,11 @@ if backend_ok and station_ids:
             with st.container(border=True):
                 display_name = html.escape(str(entry.get("display_name", station_id)))
                 training_running = bool(services.get("training", {}).get("running"))
-                if is_active:
+                if lifecycle == "recovering":
+                    state_color, state_label = "#fbbf24", "RECOVERING"
+                elif lifecycle == "failed":
+                    state_color, state_label = "#f87171", "FAILED"
+                elif is_active:
                     state_color, state_label = "#22c55e", "ACTIVE"
                 elif training_running:
                     state_color, state_label = "#fbbf24", "TRAINING"
@@ -238,7 +243,7 @@ if backend_ok and station_ids:
                     )
                 b1, b2, b3 = st.columns(3)
                 with b1:
-                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=(is_active or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
+                    if st.button("Activate", key=f"home_activate_{station_id}", type="primary", disabled=((is_active and lifecycle != "failed") or not model_ready), use_container_width=True, help="Train and deploy a model from Model Management before activation." if not model_ready else "Activate this station independently."):
                         try:
                             response = requests.post(f"{api}/stations/{station_id}/activate", timeout=120)
                             response.raise_for_status()
@@ -248,19 +253,15 @@ if backend_ok and station_ids:
                             detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
                             st.error(f"Activation failed: {detail}")
                 with b2:
-                    with st.popover("Stop / reset", use_container_width=True, disabled=not is_active):
-                        st.warning("This clears this station's Kafka replay records, Spark checkpoint and forecast results. Trained models and source data are retained.")
-                        confirm_stop = st.checkbox("I understand the station's replay results will be cleared", key=f"home_confirm_stop_{station_id}")
-                        stop_requested = st.button("Confirm stop and reset", key=f"home_stop_{station_id}", disabled=not confirm_stop, use_container_width=True)
-                    if is_active and stop_requested:
+                    if st.button("Stop", key=f"home_stop_{station_id}", disabled=not is_active, use_container_width=True):
                         try:
-                            response = requests.post(f"{api}/stations/{station_id}/stop", timeout=300)
+                            response = requests.post(f"{api}/stations/{station_id}/stop", timeout=120)
                             response.raise_for_status()
-                            st.success("Station stopped and reset. Other active stations are unaffected.")
+                            st.success("Station stopped. Activate it to resume.")
                             st.rerun()
                         except requests.RequestException as exc:
                             detail = exc.response.text if getattr(exc, "response", None) is not None else str(exc)
-                            st.error(f"Stop/reset failed: {detail}")
+                            st.error(f"Stop failed: {detail}")
                 with b3:
                     st.page_link(
                         "pages/monitoring.py",

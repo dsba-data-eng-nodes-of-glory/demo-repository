@@ -21,6 +21,8 @@ from typing import Any, Iterator
 
 import pandas as pd
 import yaml
+
+from src.ingestion.station_lock import acquire_station_lock, release_station_lock
 try:
     from kafka import KafkaProducer
 except ImportError:  # Keep file/progress helpers testable without the Kafka extra.
@@ -36,18 +38,19 @@ def load_yaml(relative_path: str) -> dict[str, Any]:
         return yaml.safe_load(file) or {}
 
 
-def normalize_chunk(raw: pd.DataFrame, source: Path) -> pd.DataFrame:
+def normalize_chunk(raw: pd.DataFrame, source: Path, require_temperature: bool = True) -> pd.DataFrame:
     """Apply the same timestamp/numeric cleaning as load_station_csv."""
-    missing = set(REQUIRED_COLUMNS) - set(raw.columns)
+    required = REQUIRED_COLUMNS if require_temperature else REQUIRED_COLUMNS[:2]
+    missing = set(required) - set(raw.columns)
     if missing:
         raise ValueError(f"{source} is missing required columns: {sorted(missing)}")
 
-    frame = raw[REQUIRED_COLUMNS].copy()
+    frame = raw.reindex(columns=REQUIRED_COLUMNS).copy()
     frame["utc_timestamp"] = parse_utc_timestamps(frame["utc_timestamp"])
 
     frame["demand"] = pd.to_numeric(frame["demand"], errors="coerce")
     frame["temperature"] = pd.to_numeric(frame["temperature"], errors="coerce")
-    frame = frame.dropna(subset=REQUIRED_COLUMNS)
+    frame = frame.dropna(subset=required)
     frame = frame.sort_values("utc_timestamp").drop_duplicates(
         "utc_timestamp", keep="last"
     )
@@ -55,11 +58,11 @@ def normalize_chunk(raw: pd.DataFrame, source: Path) -> pd.DataFrame:
 
 
 def iter_clean_chunks(
-    csv_path: Path, chunksize: int
+    csv_path: Path, chunksize: int, require_temperature: bool = True
 ) -> Iterator[pd.DataFrame]:
     """Read and normalise the stream incrementally."""
     for raw_chunk in pd.read_csv(csv_path, chunksize=chunksize):
-        clean = normalize_chunk(raw_chunk, csv_path)
+        clean = normalize_chunk(raw_chunk, csv_path, require_temperature)
         if not clean.empty:
             yield clean
 
@@ -94,61 +97,6 @@ def read_history_end(history_path: Path) -> pd.Timestamp:
     if timestamps.empty:
         raise ValueError(f"No valid timestamps found in {history_path}")
     return pd.Timestamp(timestamps.max())
-
-
-def acquire_station_lock(lock_path: Path):
-    """Acquire an OS-released exclusive lock for this station's producer.
-
-    The lock is advisory and process-scoped: Windows releases it when the
-    process exits or crashes, so a stale lock file does not block recovery.
-    The lock file itself is intentionally retained between runs.
-    """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+", encoding="utf-8")
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(" ")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        handle.close()
-        raise RuntimeError(
-            f"A producer for this station is already running (lock: {lock_path}). "
-            "Stop the existing producer before starting another one."
-        ) from exc
-
-    handle.seek(0)
-    handle.truncate()
-    handle.write(json.dumps({"pid": os.getpid(), "station_lock": str(lock_path)}))
-    handle.flush()
-    os.fsync(handle.fileno())
-    return handle
-
-
-def release_station_lock(handle) -> None:
-    if handle is None:
-        return
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    finally:
-        handle.close()
 
 
 def load_producer_progress(
@@ -377,7 +325,10 @@ def run_producer(args: argparse.Namespace) -> None:
         last_history_ts = None
 
     print(f"[3/5] Opening streaming CSV in chunks of {args.chunksize:,} rows...", flush=True)
-    chunk_iterator = iter_clean_chunks(csv_path, args.chunksize)
+    if station.get("weather"):
+        chunk_iterator = iter_clean_chunks(csv_path, args.chunksize, require_temperature=False)
+    else:
+        chunk_iterator = iter_clean_chunks(csv_path, args.chunksize)
     first_chunk = next(chunk_iterator, None)
     if first_chunk is None:
         raise ValueError(f"No valid streaming rows found in {csv_path}.")
@@ -521,8 +472,10 @@ def run_producer(args: argparse.Namespace) -> None:
                 "station_id": args.station,
                 "utc_timestamp": timestamp.isoformat(),
                 "demand": float(row.demand),
-                "temperature": float(row.temperature),
+                "is_simulated": True,
             }
+            if pd.notna(row.temperature):
+                payload["temperature"] = float(row.temperature)
             future = producer.send(topic, key=args.station, value=payload)
             pending_futures.append(future)
             pending_last_timestamp = timestamp

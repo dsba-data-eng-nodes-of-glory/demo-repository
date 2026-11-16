@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from backend.pipeline_manager import (
@@ -23,6 +24,8 @@ from src.ingestion.workbook_loader import (
     load_station_workbook,
     parse_selected_models,
 )
+from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
+from src.models.forecast_weather import ForecastWeatherUnavailable
 from src.models.forecast_contract import derive_forecast_contract
 
 router = APIRouter(prefix="/stations", tags=["stations"])
@@ -66,6 +69,8 @@ def _validate_model_row_counts(
     source_timezone: str,
     history_steps: int,
     horizon_steps: int,
+    managed_weather: bool = False,
+    live_kafka: bool = False,
 ) -> dict[str, Any]:
     """Fail onboarding early where the shipped trainers cannot form valid splits."""
     counts: dict[str, Any] = {}
@@ -79,27 +84,38 @@ def _validate_model_row_counts(
         frame = datasets["demand"]
         split_at = int(len(frame) * (1.0 - stream_fraction))
         minimum_training_rows = int((history_steps + horizon_steps + 30) / (1.0 - 0.15)) + 1
-        if split_at < minimum_training_rows:
+        usable_rows = split_at
+        if managed_weather:
+            usable_rows = len(archive_training_span(frame.iloc[:split_at], ["forecast_temperature"]))
+        if usable_rows < minimum_training_rows:
             raise ValueError(
-                f"Worksheet 'Demand' has {len(frame):,} rows. At least {minimum_training_rows:,} are required "
+                f"Worksheet 'Demand' has {usable_rows:,} usable training rows. At least {minimum_training_rows:,} are required "
                 f"for the demand forecaster with {history_steps} history steps, {horizon_steps} forecast steps "
                 "and a chronological validation split. Reduce stream_fraction only if appropriate, or add history."
             )
         stream_rows = len(frame) - split_at
-        if stream_rows < horizon_steps:
+        if not live_kafka and stream_rows < horizon_steps:
             raise ValueError(
                 f"Worksheet 'Demand' reserves {stream_rows:,} stream rows; at least {horizon_steps:,} are required."
             )
         counts["demand_forecast"] = {
             "total_rows": int(len(frame)),
-            "training_rows": int(split_at),
+            "training_rows": int(usable_rows),
             "stream_rows": int(stream_rows),
         }
 
     for model_name, dataset_name in (("solar_forecast", "solar"), ("wind_forecast", "wind")):
         if model_name not in selected_models:
             continue
-        n_rows = len(datasets[dataset_name])
+        frame = datasets[dataset_name]
+        if managed_weather and "demand_forecast" in selected and not live_kafka:
+            # Do not train on generation actuals reserved for the station replay.
+            demand = datasets["demand"]
+            replay_start = demand.utc_timestamp.iloc[int(len(demand) * (1.0 - stream_fraction))]
+            frame = frame.loc[frame.utc_timestamp < replay_start]
+        if managed_weather:
+            frame = archive_training_span(frame, list(FORECAST_COLUMNS[dataset_name].values()))
+        n_rows = len(frame)
         train_end = int(n_rows * 0.70)
         val_end = int(n_rows * 0.85)
         if (
@@ -166,6 +182,7 @@ async def onboard_station(
     source_timezone: str = Form(default="UTC"),
     interval_minutes: int = Form(default=15),
     selected_models: str = Form(default=""),
+    stream_input: str = Form(default="csv_replay"),
     residual_demand_unit: str = Form(default="mwh_per_interval"),
     raw_topic: str | None = Form(default=None),
     featured_topic: str | None = Form(default=None),
@@ -177,6 +194,10 @@ async def onboard_station(
     the onboarding UI to deselect each component independently.
     """
     key = _station_key(station_id)
+    if not isinstance(stream_input, str):
+        stream_input = "csv_replay"
+    if stream_input not in {"csv_replay", "kafka"}:
+        raise HTTPException(status_code=422, detail="Choose csv_replay or kafka for stream input.")
     if not 0.10 <= stream_fraction <= 0.50:
         raise HTTPException(status_code=422, detail="stream_fraction must be between 0.10 and 0.50.")
     if not file.filename or Path(file.filename).suffix.lower() not in {".xlsx", ".xlsm"}:
@@ -228,17 +249,33 @@ async def onboard_station(
             raise HTTPException(status_code=422, detail="The uploaded workbook is empty.")
 
         try:
-            datasets, workbook_diagnostics = load_station_workbook(
-                upload_path,
+            datasets, workbook_diagnostics = await run_in_threadpool(
+                load_station_workbook, upload_path,
                 selected_models=selected,
                 interval_minutes=interval_minutes,
                 timestamp_format=timestamp_format,
                 source_timezone=source_timezone or "UTC",
+                location_from_workbook=True,
             )
-            model_row_counts = _validate_model_row_counts(
-                datasets, selected, interval_minutes, stream_fraction,
-                source_timezone or "UTC", history_steps, horizon_steps,
+            weather_config = workbook_diagnostics.get("weather")
+            if stream_input == "kafka" and not weather_config:
+                raise ValueError("Kafka live input requires the Station Location worksheet.")
+            if weather_config and horizon_steps * interval_minutes > 1440:
+                raise ValueError("Archived day-ahead weather supports forecast horizons up to 24 hours.")
+            if weather_config:
+                weather = await run_in_threadpool(station_weather, ROOT, key, {"weather": weather_config})
+                await run_in_threadpool(weather.enrich, datasets)
+                for kind, frame in datasets.items():
+                    diagnostics = workbook_diagnostics["worksheets"][kind.title()]
+                    diagnostics["columns"] = list(frame.columns)
+                    columns = list(FORECAST_COLUMNS[kind].values())
+                    diagnostics["missing_day_ahead_rows"] = int(frame[columns].isna().any(axis=1).sum())
+            model_row_counts = await run_in_threadpool(
+                _validate_model_row_counts, datasets, selected, interval_minutes, stream_fraction,
+                source_timezone or "UTC", history_steps, horizon_steps, bool(weather_config), stream_input == "kafka",
             )
+        except ForecastWeatherUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -258,7 +295,7 @@ async def onboard_station(
                 split_at = int(len(demand_frame) * (1.0 - stream_fraction))
                 train_frame = demand_frame.iloc[:split_at].copy()
                 stream_frame = demand_frame.iloc[split_at:].copy()
-                history_frame = train_frame.tail(history_steps).copy()
+                history_frame = (demand_frame if stream_input == "kafka" else train_frame).tail(history_steps).copy()
 
                 demand_training = staging_dir / f"{key}_demand_training.csv"
                 demand_history = staging_dir / f"{key}_demand_history.csv"
@@ -314,6 +351,12 @@ async def onboard_station(
                 data_path = staging_dir / f"{key}_{kind}_data.csv"
                 data_rel = _write_csv(frame, data_path, station_dir)
                 relative_files[f"{kind}_data_file"] = data_rel
+                training_rel = data_rel
+                if weather_config and "demand_forecast" in selected and stream_input == "csv_replay":
+                    replay_start = stream_frame.utc_timestamp.iloc[0]
+                    training_rel = _write_csv(frame.loc[frame.utc_timestamp < replay_start],
+                                              staging_dir / f"{key}_{kind}_training.csv", station_dir)
+                    relative_files[f"{kind}_training_file"] = training_rel
                 if kind == "solar":
                     checkpoint = f"models/{key}/solar_dense_nn/solar_pv_mlp_v4.pt"
                     metadata = f"models/{key}/solar_dense_nn/solar_mlp_v4_metadata.json"
@@ -324,9 +367,8 @@ async def onboard_station(
                     version = f"{key}-wind-dense-v1"
                 renewable_components[kind] = {
                     "enabled": True,
-                    # One complete canonical dataset is used for training and
-                    # later serving-time history/future-weather lookup.
-                    "train_file": data_rel,
+                    # Keep all generation actuals for serving and a pre-replay training source.
+                    "train_file": training_rel,
                     "test_file": None,
                     "data_file": data_rel,
                     "checkpoint": checkpoint,
@@ -338,7 +380,7 @@ async def onboard_station(
                     "enabled": True,
                     "algorithm": "dense_nn",
                     "status": "pending_training",
-                    "training_file": data_rel,
+                    "training_file": training_rel,
                     "checkpoint": checkpoint,
                     "metadata": metadata,
                 }
@@ -353,7 +395,6 @@ async def onboard_station(
         # the serving adapter skips missing checkpoints safely.
         any_renewable_selected = any(x in selected for x in ("solar_forecast", "wind_forecast"))
         final_station_dir = station_dir
-        staging_dir.rename(final_station_dir)
 
         display = display_name.strip() if display_name and display_name.strip() else key.upper()
         station_entry: dict[str, Any] = {
@@ -381,7 +422,7 @@ async def onboard_station(
             "model_row_counts": model_row_counts,
             "stream_fraction": float(stream_fraction),
             "residual_demand_unit": residual_demand_unit,
-            "stream_delay_seconds": 0.3,
+            "stream_delay_seconds": 2.0 if weather_config else 0.3,
             "renewables": {
                 "enabled": any_renewable_selected,
                 "components_enabled": {
@@ -394,6 +435,9 @@ async def onboard_station(
                 **renewable_components,
             },
         }
+        if weather_config:
+            station_entry["weather"] = weather_config
+            station_entry["stream_input"] = stream_input
         if demand_frame is not None:
             station_entry.update({
                 "registered_rows": int(len(demand_frame)),
@@ -415,10 +459,12 @@ async def onboard_station(
                 "model_algorithm": "lstm",
                 "training_rows": int(len(train_frame)),
                 "history_rows": int(min(history_steps, len(train_frame))),
-                "stream_rows": int(len(stream_frame)),
+                "stream_rows": int(len(stream_frame)) if stream_input == "csv_replay" else 0,
                 "stream_start_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[0]).isoformat(),
                 "stream_end_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[-1]).isoformat(),
             })
+            if weather_config and stream_input == "csv_replay":
+                station_entry["expected_stream_start_utc"] = station_entry["stream_start_utc"]
         if "residual_anomaly" in selected:
             station_entry["residual_model_checkpoint"] = model_components["residual_anomaly"]["checkpoint"]
             station_entry["residual_model_summary"] = model_components["residual_anomaly"]["metadata"]
@@ -427,6 +473,13 @@ async def onboard_station(
                 "stat_threshold": None, "ae_threshold": None,
             }
 
+        # Downloads can take minutes. Re-read before committing so concurrent
+        # registration or station edits are not lost while we wait on weather.
+        config = read_station_config()
+        stations = config.setdefault("stations", {})
+        if key in stations or final_station_dir.exists():
+            raise HTTPException(status_code=409, detail=f"Station '{key}' is already registered.")
+        staging_dir.rename(final_station_dir)
         stations[key] = station_entry
         try:
             write_station_config(config)
@@ -438,7 +491,7 @@ async def onboard_station(
         topic_warning = None
         if "demand_forecast" in selected:
             try:
-                topic_result = manager.ensure_station_topics(key)
+                topic_result = await run_in_threadpool(manager.ensure_station_topics, key)
                 updated = read_station_config()
                 updated["stations"][key]["topics_ready"] = True
                 write_station_config(updated)
@@ -465,6 +518,7 @@ async def onboard_station(
             "files": relative_files,
             "model_row_counts": model_row_counts,
             "workbook_diagnostics": workbook_diagnostics,
+            "weather": weather_config,
             "topics": topic_result,
             "topics_ready": bool(topic_result),
             "topic_warning": topic_warning,
@@ -503,7 +557,12 @@ def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
         "active_model": active_model or None,
         "topics": {"raw": entry.get("raw_topic"), "featured": entry.get("featured_topic")},
     }
-    if any(services.get(name, {}).get("running") for name in ("spark", "predictor", "producer")):
+    data_services = [services[name] for name in ("spark", "predictor", "producer")]
+    if any(service.get("state") == "failed" for service in data_services):
+        lifecycle = "failed"
+    elif any(service.get("state") == "restarting" for service in data_services):
+        lifecycle = "recovering"
+    elif any(service.get("running") for service in data_services):
         lifecycle = "active"
     elif services.get("training", {}).get("running"):
         lifecycle = "training"
@@ -613,12 +672,7 @@ def create_station_topics(station: str):
 @router.post("/{station}/activate")
 def activate_station(station: str):
     try:
-        result = manager.start_pipeline(station)
-        config = read_station_config()
-        config["stations"][station]["enabled"] = True
-        config["stations"][station]["status"] = "active"
-        write_station_config(config)
-        return result
+        return manager.start_pipeline(station)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -628,19 +682,7 @@ def stop_station(station: str):
     config = read_station_config().get("stations", {})
     if station not in config:
         raise HTTPException(status_code=404, detail=f"Unknown station: {station}")
-    stop_result = manager.stop_pipeline(station)
-    updated = read_station_config()
-    station_entry = updated["stations"][station]
-    station_entry.setdefault("actuals_file", f"data/processed/stations/{station}/actuals.csv")
-    station_entry.setdefault("forecasts_file", f"data/processed/stations/{station}/forecasts.csv")
-    write_station_config(updated)
-    reset_result = manager.reset_station_pipeline(station)
-    updated = read_station_config()
-    updated["stations"][station]["enabled"] = False
-    updated["stations"][station]["status"] = "stopped"
-    write_station_config(updated)
-    return {"station": station, "stopped": stop_result, "reset": reset_result,
-            "message": f"{station} stopped and reset. Its source files and trained model were preserved."}
+    return manager.stop_pipeline(station)
 
 
 @router.delete("/{station}")

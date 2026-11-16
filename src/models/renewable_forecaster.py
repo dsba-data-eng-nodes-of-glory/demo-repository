@@ -8,6 +8,8 @@ run rather than substituting realised future weather.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from collections import OrderedDict
 
 import joblib
 from pathlib import Path
@@ -17,6 +19,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.ingestion.station_weather import FORECAST_COLUMNS, HISTORY_COLUMNS, StationWeather, live_origin
+from src.models.forecast_weather import ForecastWeatherUnavailable, select_forecast_horizon
 from src.models.training.amprion import solar_mlp_features as solar_features
 from src.models.training.amprion import solar_mlp_model
 from src.models.training.amprion import Amprion_Wind_Dense as wind_features
@@ -31,13 +35,13 @@ def _path(root: Path, value: str | Path | None) -> Path | None:
     return result if result.is_absolute() else root / result
 
 
-def _combine_loaded(paths: list[Path], loader, *args):
+def _combine_loaded(paths: list[Path], loader, interval_minutes: int, *, max_rows: int | None = None):
     frames = []
     diagnostics = []
     for path in paths:
         if not path.is_file():
             continue
-        frame, diag = loader(path, *args)
+        frame, diag = loader(path, interval_minutes, max_rows=max_rows)
         frames.append(frame)
         diagnostics.append({"file": str(path), **diag})
     if not frames:
@@ -78,11 +82,15 @@ def _check_context(frame: pd.DataFrame, origin: pd.Timestamp, history_steps: int
 
 
 class AmprionRenewableForecaster:
-    def __init__(self, root: Path, station_id: str, config: dict[str, Any], device: torch.device | None = None):
+    def __init__(self, root: Path, station_id: str, config: dict[str, Any], device: torch.device | None = None,
+                 *, weather: StationWeather | None = None, startup_origin: pd.Timestamp | None = None):
         self.root = Path(root)
         self.station_id = station_id
         self.config = config or {}
         self.device = device or torch.device("cpu")
+        self.weather = weather
+        self.startup_origin = startup_origin
+        self._live_readings: dict[str, OrderedDict] = {"solar": OrderedDict(), "wind": OrderedDict()}
         self.enabled = bool(self.config.get("enabled", False))
         self.interval_minutes = 15
         self.history_steps = 672
@@ -105,8 +113,11 @@ class AmprionRenewableForecaster:
             item = self.config.get(kind) or {}
             path = _path(self.root, item.get("checkpoint"))
             if item.get("enabled", True) and path is not None and path.is_file():
-                getattr(self, f"_load_{kind}")(item)
-                setattr(self, f"{kind}_enabled", True)
+                try:
+                    getattr(self, f"_load_{kind}")(item)
+                    setattr(self, f"{kind}_enabled", True)
+                except Exception:
+                    log.exception("Could not initialize %s forecasts for station %s", kind, station_id)
             elif item.get("enabled", True):
                 log.warning("Renewable %s is selected but its checkpoint is unavailable: %s", kind, path)
         self.enabled = self.solar_enabled or self.wind_enabled
@@ -161,12 +172,31 @@ class AmprionRenewableForecaster:
         return np.maximum(output * float(cp["target_std"]) + float(cp["target_mean"]), 0.0)
 
 
+    def _read_history(self, paths: list[Path], loader):
+        if self.startup_origin is None:
+            return _combine_loaded(paths, loader, self.interval_minutes)
+        # Station registration writes chronological files. Retain the current
+        # replay set plus extra history when reading each file's tail.
+        step = pd.Timedelta(minutes=self.interval_minutes)
+        start = self.startup_origin - (self.history_steps - 1) * step
+        end = self.startup_origin if self.weather is not None else self.startup_origin + self.horizon_steps * step
+        try:
+            frame, diagnostics = _combine_loaded(paths, loader, self.interval_minutes, max_rows=8192)
+            required = pd.date_range(start, end, freq=step)
+            available = pd.DatetimeIndex(frame["utc_timestamp"])
+            check = required if self.weather is None else required[required <= available[-1]]
+            if check.isin(available).all():
+                return frame, diagnostics
+        except (ValueError, OSError):
+            log.debug("Using full renewable history after a tail read could not supply the requested window.")
+        return _combine_loaded(paths, loader, self.interval_minutes)
+
     def _load_solar(self, cfg: dict[str, Any]) -> None:
         paths = [_path(self.root, cfg.get("train_file")), _path(self.root, cfg.get("test_file"))]
+        if self.weather is not None and cfg.get("data_file"):
+            paths = [_path(self.root, cfg["data_file"])]
         paths = [p for p in paths if p is not None]
-        self.solar_frame, diagnostics = _combine_loaded(
-            paths, solar_features.load_solar_csv, self.interval_minutes,
-        )
+        self.solar_frame, diagnostics = self._read_history(paths, solar_features.load_solar_csv)
         checkpoint_path = _path(self.root, cfg.get("checkpoint"))
         if checkpoint_path is None or not checkpoint_path.is_file():
             raise FileNotFoundError(f"Solar checkpoint not found: {checkpoint_path}")
@@ -178,8 +208,10 @@ class AmprionRenewableForecaster:
 
     def _load_wind(self, cfg: dict[str, Any]) -> None:
         paths = [_path(self.root, cfg.get("train_file")), _path(self.root, cfg.get("test_file"))]
+        if self.weather is not None and cfg.get("data_file"):
+            paths = [_path(self.root, cfg["data_file"])]
         paths = [p for p in paths if p is not None]
-        self.wind_frame, diagnostics = _combine_loaded(paths, wind_features.load_wind_data, self.interval_minutes)
+        self.wind_frame, diagnostics = self._read_history(paths, wind_features.load_wind_data)
         checkpoint_path = _path(self.root, cfg.get("checkpoint"))
         if checkpoint_path is None or not checkpoint_path.is_file():
             raise FileNotFoundError(f"Wind checkpoint not found: {checkpoint_path}")
@@ -189,21 +221,115 @@ class AmprionRenewableForecaster:
         log.info("Loaded Amprion wind model; rows=%d; coverage=%s..%s; inputs=%s",
                  len(self.wind_frame), self.wind_frame.utc_timestamp.min(), self.wind_frame.utc_timestamp.max(), diagnostics)
 
-    def _solar_forecast(self, origin: pd.Timestamp, issued_at: str) -> list[dict]:
+    def accept_observation(self, timestamp: pd.Timestamp, payload: dict) -> None:
+        """Record optional on-site generation readings coming from Kafka."""
+        if self.weather is None or payload.get("is_simulated") is True:
+            return
+        for kind, features in (("solar", solar_features), ("wind", wind_features)):
+            if not getattr(self, f"{kind}_enabled"):
+                continue
+            try:
+                generation = float(payload.get(f"{kind}_mwh"))
+                capacity = float(payload.get(f"{kind}_capacity_mw"))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite([generation, capacity]).all() or generation < 0 or capacity <= 0:
+                continue
+            readings = self._live_readings[kind]
+            readings[timestamp] = {features.TARGET_COLUMN: generation, features.CAPACITY_COLUMN: capacity}
+            while len(readings) > self.history_steps:
+                readings.popitem(last=False)
+
+    def observed_generation(self) -> dict[str, pd.DataFrame]:
+        """Recent live generation and capacity for residual-load scoring."""
+        result = {}
+        for kind, readings in self._live_readings.items():
+            if readings:
+                features = solar_features if kind == "solar" else wind_features
+                result[kind] = pd.DataFrame.from_dict(readings, orient="index").rename(
+                    columns={features.TARGET_COLUMN: kind, features.CAPACITY_COLUMN: f"{kind}_capacity_mw"}
+                )
+        return result
+
+    def residual_history(self, origin: pd.Timestamp, *, live: bool) -> dict[str, pd.DataFrame]:
+        """Return the observations already loaded by the renewable models."""
+        history = {}
+        live_readings = self.observed_generation() if live else {}
+        for kind, features in (("solar", solar_features), ("wind", wind_features)):
+            if not getattr(self, f"{kind}_enabled"):
+                continue
+            times = self._renewable_time_index[kind]
+            end = times.searchsorted(origin, side="right")
+            stored = getattr(self, f"{kind}_frame").iloc[max(0, end - 450):end]
+            columns = {features.TARGET_COLUMN: kind, features.CAPACITY_COLUMN: f"{kind}_capacity_mw"}
+            recent = stored.set_index("utc_timestamp")[list(columns)].rename(columns=columns)
+            if kind in live_readings:
+                recent = pd.concat([recent, live_readings[kind].loc[lambda frame: frame.index <= origin]]).sort_index(kind="stable")
+                recent = recent[~recent.index.duplicated(keep="last")]
+            history[kind] = recent.tail(450)
+        return history
+
+    def _managed_context(self, kind: str, origin: pd.Timestamp, *, replay_weather: bool):
+        frame = getattr(self, f"{kind}_frame")
+        use_live = live_origin(origin, replay=replay_weather)
+        interval = pd.Timedelta(minutes=self.interval_minutes)
+        history_ts = pd.date_range(end=origin, periods=self.history_steps, freq=interval)
+        future_ts = pd.date_range(start=origin + interval, periods=self.horizon_steps, freq=interval)
+        timestamps = self._renewable_time_index[kind]
+        positions = timestamps.get_indexer(history_ts)
+        # Read only the lookback rows, even when the registered history spans years.
+        hist = frame.iloc[np.maximum(positions, 0)].copy().set_axis(history_ts)
+        hist.loc[positions < 0, :] = np.nan
+        features = solar_features if kind == "solar" else wind_features
+        target, capacity = features.TARGET_COLUMN, features.CAPACITY_COLUMN
+        if not replay_weather:
+            live = self._live_readings[kind]
+            if live:
+                readings = pd.DataFrame.from_dict(live, orient="index").reindex(history_ts)
+                hist.update(readings)
+        if hist[[target, capacity]].isna().any().any():
+            raise ForecastWeatherUnavailable(
+                f"{kind} requires {self.history_steps} consecutive generation and capacity readings ending at the origin."
+            )
+        weather_fields = HISTORY_COLUMNS[kind]
+        missing_weather = hist[list(weather_fields.values())].isna().any(axis=1)
+        if missing_weather.any():
+            missing_times = hist.index[missing_weather]
+            past = self.weather.historical(missing_times, live=use_live)
+            for source, column in weather_fields.items():
+                hist.loc[missing_times, column] = past[source].to_numpy()
+            if hist[list(weather_fields.values())].isna().any().any():
+                raise ForecastWeatherUnavailable(f"{kind} lookback weather coverage is incomplete.")
+        hist["utc_timestamp"] = history_ts
+        forecast_fields = FORECAST_COLUMNS[kind]
+        weather = self.weather.forecast(future_ts, live=use_live).rename(columns=forecast_fields)
+        future = select_forecast_horizon(weather, future_ts, list(forecast_fields.values()), context=kind)
+        if kind == "wind":
+            future = future.rename(columns={"future_wind_speed": "_future_wind_speed",
+                                            "future_wind_direction": "_future_wind_direction"})
+        future[target] = 0.0  # Feature builders require a finite label placeholder at serving time.
+        future[capacity] = float(hist[capacity].iloc[-1])
+        mode = "open_meteo_live" if use_live else "open_meteo_archived_day_ahead"
+        return pd.concat([hist, future], ignore_index=True), future_ts, mode
+
+    def _solar_forecast(self, origin: pd.Timestamp, issued_at: str, *, replay_weather: bool = False) -> list[dict]:
         cp = self.solar_checkpoint
-        hist, future, future_ts = _check_context(self.solar_frame, origin)
-        target = solar_features.TARGET_COLUMN
-        future[target] = 0.0  # Do not expose realised future generation to the model.
-        frame = pd.concat([hist, future], ignore_index=True)
+        mode = "forecast_cloud_and_radiation"
+        if self.weather is not None:
+            frame, future_ts, mode = self._managed_context("solar", origin, replay_weather=replay_weather)
+        else:
+            hist, future, future_ts = _check_context(self.solar_frame, origin)
+            future[solar_features.TARGET_COLUMN] = 0.0
+            frame = pd.concat([hist, future], ignore_index=True)
         if cp.get("model_kind") == "renewable_lstm_v1":
             values = self._predict_sequence("solar", self.solar_model, cp, frame)
-            return self._records("solar", origin, future_ts, values, issued_at, self.solar_name, "forecast_cloud_and_radiation")
+            return self._records("solar", origin, future_ts, values, issued_at, self.solar_name, mode)
         x, _y, _baseline, names, diagnostics, _starts = solar_features.build_feature_matrix(
             frame, np.asarray([self.history_steps], dtype=np.int64),
             capacity_column=cp.get("capacity_column", solar_features.CAPACITY_COLUMN),
             include_solar_position=bool(cp.get("include_solar_position", False)),
-            latitude=float(cp.get("latitude") or 50.966111),
-            longitude=float(cp.get("longitude") or 6.805556),
+            latitude=float(cp["latitude"]) if cp.get("latitude") is not None else 50.966111,
+            longitude=float(cp["longitude"]) if cp.get("longitude") is not None else 6.805556,
             chunk_size=1, target_mean=float(cp["target_mean"]), target_std=float(cp["target_std"]),
         )
         if names != list(cp["feature_names"]) or x.shape[0] != 1 or diagnostics["valid_origins"] != 1:
@@ -211,7 +337,7 @@ class AmprionRenewableForecaster:
         if "estimator" in cp:
             from src.models.train_renewable import expand_origin_features
             values = np.maximum(self.solar_model.predict(expand_origin_features(x)).reshape(-1), 0.0)
-            return self._records("solar", origin, future_ts, values, issued_at, self.solar_name, "forecast_cloud_and_radiation")
+            return self._records("solar", origin, future_ts, values, issued_at, self.solar_name, mode)
         if x.shape[1] != int(cp["input_size"]):
             raise ValueError("Solar serving feature dimension does not match checkpoint")
         mean = np.asarray(cp["x_mean"], dtype=np.float32)
@@ -223,17 +349,20 @@ class AmprionRenewableForecaster:
         values = np.maximum(scaled * float(cp["target_std"]) + float(cp["target_mean"]), 0.0)
         if len(values) != self.horizon_steps or not np.isfinite(values).all():
             raise RuntimeError("Solar model returned invalid forecast values")
-        return self._records("solar", origin, future_ts, values, issued_at, self.solar_name, "forecast_cloud_and_radiation")
+        return self._records("solar", origin, future_ts, values, issued_at, self.solar_name, mode)
 
-    def _wind_forecast(self, origin: pd.Timestamp, issued_at: str) -> list[dict]:
+    def _wind_forecast(self, origin: pd.Timestamp, issued_at: str, *, replay_weather: bool = False) -> list[dict]:
         cp = self.wind_checkpoint
-        hist, future, future_ts = _check_context(self.wind_frame, origin)
-        target = wind_features.TARGET_COLUMN
-        future[target] = 0.0  # Do not expose realised future generation to the model.
-        frame = pd.concat([hist, future], ignore_index=True)
+        mode = "forecast_wind_speed_and_direction"
+        if self.weather is not None:
+            frame, future_ts, mode = self._managed_context("wind", origin, replay_weather=replay_weather)
+        else:
+            hist, future, future_ts = _check_context(self.wind_frame, origin)
+            future[wind_features.TARGET_COLUMN] = 0.0
+            frame = pd.concat([hist, future], ignore_index=True)
         if cp.get("model_kind") == "renewable_lstm_v1":
             values = self._predict_sequence("wind", self.wind_model, cp, frame)
-            return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, "forecast_wind_speed_and_direction")
+            return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, mode)
         x, _y, names, _starts, diagnostics = wind_features.build_feature_matrix(
             frame, np.asarray([self.history_steps], dtype=np.int64),
             interval_minutes=self.interval_minutes, chunk_size=1,
@@ -244,7 +373,7 @@ class AmprionRenewableForecaster:
         if "estimator" in cp:
             from src.models.train_renewable import expand_origin_features
             values = np.maximum(self.wind_model.predict(expand_origin_features(x)).reshape(-1), 0.0)
-            return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, "forecast_wind_speed_and_direction")
+            return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, mode)
         mean = np.asarray(cp["feature_mean"], dtype=np.float32)
         scale = np.asarray(cp["feature_std"], dtype=np.float32)
         scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
@@ -254,7 +383,7 @@ class AmprionRenewableForecaster:
         values = np.maximum(scaled * float(cp["target_std"]) + float(cp["target_mean"]), 0.0)
         if len(values) != self.horizon_steps or not np.isfinite(values).all():
             raise RuntimeError("Wind model returned invalid forecast values")
-        return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, "forecast_wind_speed_and_direction")
+        return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, mode)
 
     def _records(self, kind: str, origin: pd.Timestamp, timestamps: pd.DatetimeIndex, values: np.ndarray,
                  issued_at: str, model_version: str, weather_mode: str) -> list[dict]:
@@ -268,7 +397,7 @@ class AmprionRenewableForecaster:
             "model_version": model_version, "weather_mode": weather_mode,
         } for step, (ts, value) in enumerate(zip(timestamps, values), start=1)]
 
-    def observations_at(self, timestamp: pd.Timestamp) -> list[dict]:
+    def observations_at(self, timestamp: pd.Timestamp, *, live: bool = False) -> list[dict]:
         """Actual generation exactly at the replayed observation timestamp.
 
         The model feature tables currently only extend through the configured
@@ -283,24 +412,28 @@ class AmprionRenewableForecaster:
             frame = getattr(self, f"{kind}_frame")
             if frame.empty or target not in frame.columns:
                 continue
-            # DatetimeIndex is pre-sorted by the corresponding feature loader.
-            times = self._renewable_time_index.get(kind)
-            if times is None:
-                times = pd.DatetimeIndex(frame["utc_timestamp"])
-            index = times.get_indexer([timestamp])[0]
-            if index < 0:
-                continue
-            value = pd.to_numeric(pd.Series([frame.iloc[index][target]]), errors="coerce").iloc[0]
+            reading = self._live_readings[kind].get(timestamp) if live and self.weather is not None else None
+            if reading is not None:
+                value = reading[target]
+            else:
+                times = self._renewable_time_index.get(kind)
+                if times is None:
+                    times = pd.DatetimeIndex(frame["utc_timestamp"])
+                index = times.get_indexer([timestamp])[0]
+                if index < 0:
+                    continue
+                value = frame.iloc[index][target]
             if pd.notna(value):
                 found.append({
                     "station_id": self.station_id, "generation_type": kind,
                     "utc_timestamp": timestamp.isoformat(),
                     "actual_generation_mwh": float(value),
-                    "source": "registered_historical_replay",
+                    "source": "kafka" if reading is not None else "registered_historical_replay",
                 })
         return found
 
-    def forecast_at(self, origin: pd.Timestamp) -> list[dict]:
+    def forecast_at(self, origin: pd.Timestamp, *, replay_weather: bool = False,
+                    on_result: Callable[[list[dict]], None] | None = None) -> list[dict]:
         if not self.enabled:
             return []
         origin = pd.Timestamp(origin)
@@ -311,9 +444,16 @@ class AmprionRenewableForecaster:
             if not getattr(self, f"{name}_enabled", False):
                 continue
             try:
-                records.extend(method(origin, issued_at))
+                component_records = method(origin, issued_at, replay_weather=replay_weather)
+            except ForecastWeatherUnavailable as exc:
+                log.warning("Skipping %s forecast at %s: %s", name, origin.isoformat(), exc)
+                continue
             except Exception as exc:
                 # Renewable output is an independent enrichment. A solar/wind
                 # failure must not stop the primary demand forecasting stream.
                 log.exception("Skipping %s renewable forecast at %s: %s", name, origin.isoformat(), exc)
+                continue
+            if on_result is not None:
+                on_result(component_records)
+            records.extend(component_records)
         return records

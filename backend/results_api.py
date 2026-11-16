@@ -6,7 +6,6 @@ last rows rather than loading the entire file on every dashboard refresh.
 from __future__ import annotations
 
 from collections import OrderedDict
-from io import BytesIO
 from pathlib import Path
 from threading import RLock
 import time
@@ -17,6 +16,8 @@ import yaml
 from fastapi import APIRouter, Query
 
 from backend.pipeline_manager import ROOT
+from src.ingestion.csv_tail import csv_tail
+from src.ingestion.file_loader import parse_utc_timestamps
 from src.storage.forecast_store import storage_backend, read_actuals as cassandra_read_actuals, read_forecasts as cassandra_read_forecasts, read_latest_forecast as cassandra_read_latest_forecast, read_quality_events
 from src.storage.renewable_store import read_renewable_forecasts, read_renewable_actuals
 
@@ -122,34 +123,7 @@ def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0) -> pd.Da
         return cached
 
     try:
-        with path.open("rb") as file:
-            header = file.readline().rstrip(b"\r\n")
-            header_end = file.tell()
-            file.seek(0, 2)
-            position = file.tell()
-            chunks: list[bytes] = []
-            newline_count = 0
-            block_size = 64 * 1024
-
-            while position > header_end and newline_count <= max_rows:
-                start = max(header_end, position - block_size)
-                file.seek(start)
-                block = file.read(position - start)
-                chunks.insert(0, block)
-                newline_count += block.count(b"\n")
-                position = start
-
-        body = b"".join(chunks)
-        lines = body.splitlines()
-        # If reading began in the middle of a record, discard that partial line.
-        if position > header_end and lines:
-            lines = lines[1:]
-        lines = lines[-max_rows:]
-        if not lines:
-            return pd.DataFrame()
-
-        payload = header + b"\n" + b"\n".join(lines)
-        frame = pd.read_csv(BytesIO(payload))
+        frame = pd.read_csv(csv_tail(path, max_rows))
     except (OSError, ValueError, pd.errors.ParserError, UnicodeDecodeError):
         return pd.DataFrame()
 
@@ -186,7 +160,7 @@ def _read_station_rows(
     return frame.tail(limit).reset_index(drop=True)
 
 
-def _read_historical_actuals(station: str) -> pd.DataFrame:
+def _read_historical_actuals(station: str, recent_rows: int | None = None) -> pd.DataFrame:
     """Return cached, normalised static actuals for one station.
 
     The training and test CSVs are immutable during a replay. Their file
@@ -241,7 +215,7 @@ def _read_historical_actuals(station: str) -> pd.DataFrame:
                 signatures.append((str(source_path), stat.st_mtime_ns, stat.st_size))
             except OSError:
                 signatures.append((str(source_path), None, None))
-        cache_key = (str(station), tuple(signatures))
+        cache_key = (str(station), tuple(signatures), recent_rows)
 
         # Serialise cache misses: concurrent first page loads should not parse
         # the same large CSVs multiple times.
@@ -257,7 +231,8 @@ def _read_historical_actuals(station: str) -> pd.DataFrame:
                     continue
                 # Do not also retain a second raw copy in the generic CSV
                 # cache: this station-level cache owns the prepared frame.
-                frame = pd.read_csv(source_path)
+                frame = (_read_csv_tail(source_path, recent_rows, ttl_seconds=300)
+                         if recent_rows else pd.read_csv(source_path))
                 if frame.empty or "utc_timestamp" not in frame.columns:
                     continue
                 if "actual_demand" not in frame.columns and "demand" in frame.columns:
@@ -268,13 +243,7 @@ def _read_historical_actuals(station: str) -> pd.DataFrame:
                 frame["station_id"] = station
                 # Source files use day-first timestamps (for example,
                 # 30-09-2026 23:45); keep the mixed parser used by this project.
-                frame["_timestamp_key"] = pd.to_datetime(
-                    frame["utc_timestamp"].astype("string").str.strip(),
-                    format="mixed",
-                    dayfirst=True,
-                    utc=True,
-                    errors="coerce",
-                )
+                frame["_timestamp_key"] = parse_utc_timestamps(frame["utc_timestamp"])
                 frame["actual_demand"] = pd.to_numeric(
                     frame["actual_demand"], errors="coerce"
                 )
@@ -477,8 +446,16 @@ def actuals(
     station: str,
     limit: int = Query(default=5000, ge=1, le=20000),
     end_time: str | None = Query(default=None, description="Optional UTC cutoff, normally the forecast origin"),
+    recent_only: bool = False,
 ):
-    historical = _read_historical_actuals(station)
+    if recent_only is True:
+        historical = _read_historical_actuals(station, recent_rows=max(672, limit))
+        if end_time and not historical.empty:
+            cutoff = pd.to_datetime(end_time, utc=True, errors="coerce")
+            if pd.notna(cutoff) and (historical["_timestamp_key"] <= cutoff).sum() < limit:
+                historical = _read_historical_actuals(station)
+    else:
+        historical = _read_historical_actuals(station)
     if storage_backend() == "cassandra":
         live = pd.DataFrame(cassandra_read_actuals(station, limit))
     else:
@@ -735,11 +712,10 @@ def renewables(
     defer_heavy: bool = False,
 ):
     """Return solar/wind actual series and the latest saved per-resource forecasts."""
-    if defer_heavy and not _renewable_warmed_or_schedule(station):
-        return {'station': station, 'pending': True, 'actuals': [],
-                'forecasts': {'solar': [], 'wind': []},
-                'message': 'Loading Solar and Wind history in the background.'}
-    actual_frame, coverage = _load_configured_renewable_actuals(station, end_time=end_time)
+    history_pending = defer_heavy and not _renewable_warmed_or_schedule(station)
+    actual_frame, coverage = (pd.DataFrame(), {}) if history_pending else _load_configured_renewable_actuals(
+        station, end_time=end_time,
+    )
     actual_records = _json_safe_records(actual_frame.tail(limit)) if not actual_frame.empty else []
     forecast_value = None
     try:
@@ -830,6 +806,7 @@ def renewables(
     )
     return {
         "station": station, "actuals": actual_records, "forecasts": forecast_groups,
+        "history_pending": history_pending,
         "coverage": coverage, "forecast_storage": "cassandra" if storage_backend() == "cassandra" else str(forecast_path),
         "diagnostics": diagnostics,
     }

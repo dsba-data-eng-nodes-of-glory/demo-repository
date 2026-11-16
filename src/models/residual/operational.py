@@ -26,7 +26,7 @@ WIND_CAP = 'Wind_onshore_installed_capacity [MW]'
 
 
 def utc(values: Any) -> pd.DatetimeIndex:
-    return pd.DatetimeIndex(pd.to_datetime(values, utc=True, errors='coerce', format='mixed'))
+    return pd.DatetimeIndex(pd.to_datetime(values, utc=True, errors='coerce', format='mixed')).as_unit("ns")
 
 
 def _run(records: list[dict] | pd.DataFrame, column: str, origin: pd.Timestamp, kind: str | None = None) -> pd.Series:
@@ -99,7 +99,9 @@ def _source_frame(path: str, mtime: int, size: int, kind: str) -> pd.DataFrame:
     value_col = SOLAR if kind == 'solar' else WIND
     cap_col = SOLAR_CAP if kind == 'solar' else WIND_CAP
     frame = pd.read_csv(path, usecols=['utc_timestamp',value_col,cap_col], low_memory=False)
-    frame['utc_timestamp'] = pd.to_datetime(frame['utc_timestamp'], format='mixed', dayfirst=True, utc=True, errors='coerce')
+    frame['utc_timestamp'] = pd.to_datetime(
+        frame['utc_timestamp'], format='mixed', dayfirst=True, utc=True, errors='coerce',
+    ).dt.as_unit("ns")
     for name in (value_col,cap_col):
         frame[name] = pd.to_numeric(frame[name].astype("string").str.replace(",", "", regex=False), errors='coerce')
     frame = frame.dropna(subset=['utc_timestamp']).sort_values('utc_timestamp').drop_duplicates('utc_timestamp', keep='last')
@@ -127,7 +129,9 @@ def _station_renewable_history(root: Path, cfg: dict, kind: str, origin: pd.Time
 
 
 def build_residual_history(root: Path, cfg: dict, origin_utc: str | pd.Timestamp,
-                           demand_actuals: list[dict], rows: int = 450) -> tuple[pd.DataFrame,float,float]:
+                           demand_actuals: list[dict], rows: int = 450, *,
+                           renewable_history: dict[str, pd.DataFrame] | None = None,
+                           renewable_context: dict[str, pd.DataFrame] | None = None) -> tuple[pd.DataFrame,float,float]:
     origin = pd.Timestamp(origin_utc)
     origin = origin.tz_localize('UTC') if origin.tzinfo is None else origin.tz_convert('UTC')
     df = pd.DataFrame(demand_actuals)
@@ -142,8 +146,18 @@ def build_residual_history(root: Path, cfg: dict, origin_utc: str | pd.Timestamp
     df = df.drop_duplicates('timestamp', keep='last').set_index('timestamp')[['demand']].sort_index().tail(rows)
     if df.empty:
         raise ValueError('No actual demand data before forecast origin')
-    s = _station_renewable_history(root,cfg,'solar',origin,rows)
-    w = _station_renewable_history(root,cfg,'wind',origin,rows)
+    sources = []
+    for kind in ("solar", "wind"):
+        if renewable_context is None:
+            registered = _station_renewable_history(root, cfg, kind, origin, rows)
+        else:
+            registered = renewable_context[kind].loc[lambda frame: frame.index <= origin].tail(rows)
+        observed = (renewable_history or {}).get(kind)
+        if observed is not None:
+            registered = pd.concat([registered, observed.loc[observed.index <= origin]]).sort_index(kind="stable")
+            registered = registered.loc[~registered.index.duplicated(keep="last")].tail(rows)
+        sources.append(registered)
+    s, w = sources
     sc = s['solar_capacity_mw'].dropna()
     wc = w['wind_capacity_mw'].dropna()
     if sc.empty or wc.empty or sc.iloc[-1] <= 0 or wc.iloc[-1] <= 0:
@@ -157,9 +171,11 @@ def build_residual_history(root: Path, cfg: dict, origin_utc: str | pd.Timestamp
     # Strictly no time interpolation or future observed renewable use.
     hist['residual'] = hist['demand'] - hist['solar'] - hist['wind']
     hist.index.name = 'timestamp_utc'
+    if hist.empty or hist.index[-1] != origin:
+        raise ValueError('Aligned demand and generation history must end at the forecast origin')
     if len(hist) < 194:
         raise ValueError(f'At least 194 aligned previous observed quarter hours needed; got {len(hist)}')
-    if len(hist.index) > 1 and not np.all(np.diff(hist.index.asi8) == STEP.value):
+    if len(hist.index) > 1 and not np.all(np.diff(hist.index.as_unit("ns").asi8) == STEP.value):
         raise ValueError('Recent residual-load observations contain gaps; scoring suspended')
     return hist,float(sc.iloc[-1]),float(wc.iloc[-1])
 

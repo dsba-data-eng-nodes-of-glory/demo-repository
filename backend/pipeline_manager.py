@@ -6,6 +6,7 @@ separately; station topic creation is performed through Kafka AdminClient.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,8 +17,9 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, RLock, Thread
 from typing import Any
 
 import yaml
@@ -28,6 +30,7 @@ from scripts.station_replay_helper import (
     delete_station_output_rows,
 )
 
+LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -75,15 +78,32 @@ def resolve_root_path(value: str | Path) -> Path:
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
+@dataclass
+class ServiceRestart:
+    command: list[str]
+    name: str
+    station: str | None
+    process: subprocess.Popen | None
+    started_at: float
+    next_attempt: float | None = None
+    failures: int = 0
+
+
 class PipelineManager:
     """Own independent local processes for every station and service."""
 
     SERVICE_NAMES = ("spark", "predictor", "producer", "training")
+    RESTART_DELAYS = (2, 4, 8, 16, 30, 30)
+    STABLE_SECONDS = 120
 
     def __init__(self) -> None:
         self.processes: dict[str, subprocess.Popen] = {}
         self.log_handles: dict[str, Any] = {}
         self.lock = Lock()
+        self.lifecycle_lock = RLock()
+        self._supervised: dict[str, ServiceRestart] = {}
+        self._supervisor_stop = Event()
+        self._supervisor_thread: Thread | None = None
         # Java version detection starts a subprocess on Windows. Status panels
         # must never repeat that check for every station on every refresh.
         self._runtime_status_cache: dict[str, Any] | None = None
@@ -146,14 +166,105 @@ class PipelineManager:
     def log_path(name: str, station: str | None = None) -> Path:
         return LOG_DIR / (f"{station}_{name}.log" if station else f"{name}.log")
 
+    def _watch_services(self) -> None:
+        while not self._supervisor_stop.wait(1):
+            try:
+                self._restart_failed_services()
+            except Exception:
+                LOG.exception("Service supervisor check failed.")
+
+    def _supervise(self, name: str, command: list[str], station: str | None = None) -> None:
+        key = self.process_key(name, station)
+        with self.lock:
+            process = self.processes.get(key)
+            if process is None:
+                return
+            previous = self._supervised.get(key)
+            if previous is None or previous.process is not process:
+                self._supervised[key] = ServiceRestart(command, name, station, process, time.monotonic())
+            if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
+                self._supervisor_stop.clear()
+                self._supervisor_thread = Thread(target=self._watch_services, name="pipeline-supervisor", daemon=True)
+                self._supervisor_thread.start()
+
+    def shutdown_supervisor(self) -> None:
+        self._supervisor_stop.set()
+        with self.lock:
+            self._supervised.clear()
+            thread = self._supervisor_thread
+        if thread is not None:
+            thread.join(timeout=3)
+
+    def _restart_failed_services(self) -> None:
+        with self.lock:
+            services = list(self._supervised.items())
+        for key, service in services:
+            with self.lock:
+                if self._supervised.get(key) is not service:
+                    continue
+                code = service.process.poll() if service.process is not None else -1
+                if code is None or (service.name == "producer" and code == 0):
+                    continue
+                now = time.monotonic()
+                if service.next_attempt is None:
+                    if now - service.started_at >= self.STABLE_SECONDS:
+                        service.failures = 0
+                    if service.failures >= len(self.RESTART_DELAYS):
+                        handle = self.log_handles.pop(key, None)
+                        if handle:
+                            handle.close()
+                        continue
+                    service.next_attempt = now + self.RESTART_DELAYS[service.failures]
+                    LOG.warning("%s exited (%s). Automatic retry %d in %s seconds.",
+                                key, code, service.failures + 1, self.RESTART_DELAYS[service.failures])
+                    continue
+                if now < service.next_attempt:
+                    continue
+            # Resolve the runtime without holding the process lock, then recheck
+            # that a concurrent manual stop did not cancel the restart.
+            try:
+                runtime = self.get_runtime_environment()
+                with self.lock:
+                    if self._supervised.get(key) is not service or self._supervisor_stop.is_set():
+                        continue
+                    service.failures += 1
+                    service.next_attempt = None
+                    service.started_at = time.monotonic()
+                    service.process = None
+                    self._spawn_locked(service.name, service.command, service.station, runtime)
+                    service.process = self.processes[key]
+                LOG.info("Automatically restarted %s (attempt %d).", key, service.failures)
+            except Exception:
+                with self.lock:
+                    if self._supervised.get(key) is service and service.next_attempt is not None:
+                        service.failures += 1
+                        service.next_attempt = None
+                        service.started_at = time.monotonic()
+                LOG.exception("Could not restart %s.", key)
+
     def status(self) -> dict[str, Any]:
         with self.lock:
             processes = {}
             for key, proc in self.processes.items():
+                code = proc.poll()
+                service = self._supervised.get(key)
+                name = key.rsplit(":", 1)[-1]
+                state = "running" if code is None else "stopped"
+                if code is not None and service is not None:
+                    if name == "producer" and code == 0:
+                        state = "completed"
+                    elif service.next_attempt is None and service.failures >= len(self.RESTART_DELAYS):
+                        state = "failed"
+                    else:
+                        state = "restarting"
                 processes[key] = {
-                    "running": proc.poll() is None,
+                    "running": code is None,
                     "pid": proc.pid,
-                    "return_code": proc.poll(),
+                    "return_code": code,
+                    "state": state,
+                    "restart_attempts": service.failures if service is not None else 0,
+                    "retry_in_seconds": (max(0, round(service.next_attempt - time.monotonic()))
+                                         if service is not None and service.next_attempt is not None else None),
                 }
         now = time.monotonic()
         with self.lock:
@@ -214,36 +325,32 @@ class PipelineManager:
             if existing and existing.poll() is None:
                 return {"name": name, "station": station, "started": False, "message": "Already running", "pid": existing.pid}
 
-            runtime = self.get_runtime_environment()
-            log_path = self.log_path(name, station)
-            log = log_path.open("a", encoding="utf-8")
-            kwargs: dict[str, Any] = {}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            try:
-                proc = subprocess.Popen(
-                    command,
-                    cwd=ROOT,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    env=runtime["env"],
-                    **kwargs,
-                )
-            except Exception:
-                log.close()
-                raise
+            return self._spawn_locked(name, command, station, self.get_runtime_environment())
 
-            old_log = self.log_handles.get(key)
-            if old_log:
-                old_log.close()
-            self.processes[key] = proc
-            self.log_handles[key] = log
-            return {"name": name, "station": station, "started": True, "pid": proc.pid, "log": str(log_path)}
+    def _spawn_locked(self, name: str, command: list[str], station: str | None, runtime: dict) -> dict[str, Any]:
+        key = self.process_key(name, station)
+        log_path = self.log_path(name, station)
+        log_handle = log_path.open("a", encoding="utf-8")
+        kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        try:
+            process = subprocess.Popen(command, cwd=ROOT, stdout=log_handle,
+                                       stderr=subprocess.STDOUT, text=True, env=runtime["env"], **kwargs)
+        except Exception:
+            log_handle.close()
+            raise
+        old_log = self.log_handles.get(key)
+        if old_log:
+            old_log.close()
+        self.processes[key] = process
+        self.log_handles[key] = log_handle
+        return {"name": name, "station": station, "started": True, "pid": process.pid, "log": str(log_path)}
 
     def stop(self, name: str, station: str | None = None) -> dict[str, Any]:
         key = self.process_key(name, station)
         with self.lock:
+            self._supervised.pop(key, None)
             proc = self.processes.get(key)
             if not proc or proc.poll() is not None:
                 handle = self.log_handles.pop(key, None)
@@ -298,19 +405,19 @@ class PipelineManager:
             if missing:
                 partitions = max(1, int(kafka_cfg.get("topic_partitions", 1)))
                 replication_factor = max(1, int(kafka_cfg.get("replication_factor", 1)))
-                futures = admin.create_topics(
-                    new_topics=[NewTopic(name, num_partitions=partitions, replication_factor=replication_factor) for name in missing],
-                    validate_only=False,
-                )
-                for topic, future in futures.items():
-                    try:
-                        future.get(timeout=20)
-                        created.append(topic)
-                    except Exception as exc:
-                        # A concurrent create is acceptable only if the topic now exists.
-                        refreshed = set(admin.list_topics())
-                        if topic not in refreshed:
-                            raise RuntimeError(f"Could not create Kafka topic '{topic}': {exc}") from exc
+                try:
+                    admin.create_topics(
+                        new_topics=[NewTopic(name, num_partitions=partitions, replication_factor=replication_factor)
+                                    for name in missing],
+                        validate_only=False,
+                    )
+                    created.extend(missing)
+                except Exception as exc:
+                    # When another request created the same topics, they are safe to use.
+                    available = set(admin.list_topics())
+                    absent = [name for name in missing if name not in available]
+                    if absent:
+                        raise RuntimeError(f"Could not create Kafka topics {absent}: {exc}") from exc
             refreshed = set(admin.list_topics())
             return {
                 "station": station,
@@ -434,6 +541,10 @@ class PipelineManager:
         return self.start("training", command, station)
 
     def start_pipeline(self, station: str | None = None) -> dict[str, Any]:
+        with self.lifecycle_lock:
+            return self._start_pipeline(station)
+
+    def _start_pipeline(self, station: str | None = None) -> dict[str, Any]:
         config = read_station_config()
         station = station or config.get("active_station")
         stations = config.get("stations", {})
@@ -477,7 +588,11 @@ class PipelineManager:
         if not checkpoint_value:
             raise ValueError(f"Station '{station}' has no active model or legacy model_checkpoint configured.")
         checkpoint = resolve_root_path(checkpoint_value)
-        for label, path in (("stream CSV", stream_file), ("history CSV", history_file), ("model artifact", checkpoint)):
+        use_csv_producer = entry.get("stream_input", "csv_replay") != "kafka"
+        required_files = [("history CSV", history_file), ("model artifact", checkpoint)]
+        if use_csv_producer:
+            required_files.append(("stream CSV", stream_file))
+        for label, path in required_files:
             if not path.is_file():
                 raise FileNotFoundError(f"Station '{station}' {label} not found: {path}")
 
@@ -494,35 +609,40 @@ class PipelineManager:
                            "--model", str(checkpoint), *history_arg,
                            "--output", str(resolve_root_path(entry["forecasts_file"])),
                            "--actual-output", str(resolve_root_path(entry["actuals_file"]))]),
-            ("producer", [python, "-u", "-m", "src.producers.csv_producer", "--station", station, *history_arg,
-                           "--delay", str(float(entry.get("stream_delay_seconds", 1.0))),
-                           "--checkpoint-every", str(producer_checkpoint_every)]),
         ]
+        if use_csv_producer:
+            commands.append((
+                "producer", [python, "-u", "-m", "src.producers.csv_producer", "--station", station, *history_arg,
+                             "--delay", str(float(entry.get("stream_delay_seconds", 1.0))),
+                             "--checkpoint-every", str(producer_checkpoint_every)],
+            ))
         started: list[str] = []
+        quality_command = [python, "-u", "-m", "src.quality.dlq_consumer"]
+        quality_external = os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true"
         try:
-            quality_external = os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true"
-            quality_proc = self.processes.get(self.process_key("quality"))
-            if not quality_external and (not quality_proc or quality_proc.poll() is not None):
-                self.start("quality", [python, "-u", "-m", "src.quality.dlq_consumer"])
-                started.append("quality")
-                time.sleep(2)
+            if not quality_external:
+                result = self.start("quality", quality_command)
+                if result.get("started"):
+                    started.append("quality")
+                    time.sleep(2)
             for name, command in commands:
-                result = self.start(name, command, station)
+                with self.lock:
+                    watched = self._supervised.get(self.process_key(name, station))
+                    if watched is not None and watched.process is not None:
+                        if watched.process.poll() is None or (name == "producer" and watched.process.poll() == 0):
+                            continue
+                    # An explicit activation gives a failed service a fresh retry budget.
+                    previous = self._supervised.pop(self.process_key(name, station), None)
+                try:
+                    result = self.start(name, command, station)
+                except Exception:
+                    if previous is not None:
+                        with self.lock:
+                            self._supervised[self.process_key(name, station)] = previous
+                    raise
                 if result.get("started"):
                     started.append(name)
-                # Give Spark more time to initialize before predictor and producer start.
-                startup_wait = {"spark": 15, "predictor": 5, "producer": 2}.get(name, 2)
-                time.sleep(startup_wait)
-                proc = self.processes.get(self.process_key(name, station))
-                if proc and proc.poll() is not None:
-                    # The CSV producer is a finite replay job. Exit code 0 is
-                    # expected when it has published the final source row, or
-                    # when a restart finds that the saved cursor is already at
-                    # EOF. Do not tear down the long-running Spark/predictor
-                    # services just because the finite producer completed.
-                    if name == "producer" and proc.returncode == 0:
-                        continue
-                    raise RuntimeError(f"{station} {name} exited during startup with code {proc.returncode}. Check logs/{station}_{name}.log")
+                    time.sleep({"spark": 15, "predictor": 5, "producer": 2}[name])
             registry = read_station_config()
             registry["active_station"] = station
             active_stations = set(registry.get("active_stations", []) or [])
@@ -532,6 +652,10 @@ class PipelineManager:
             registry["stations"][station]["status"] = "active"
             registry["stations"][station]["topics_ready"] = True
             write_station_config(registry)
+            for name, command in commands:
+                self._supervise(name, command, station)
+            if not quality_external:
+                self._supervise("quality", quality_command)
             return {"station": station, "started": started, "topics": topic_result, "status": self.station_status(station)}
         except Exception:
             for name in reversed(started):
@@ -539,6 +663,16 @@ class PipelineManager:
             raise
 
     def stop_pipeline(self, station: str | None = None) -> dict[str, Any]:
+        with self.lifecycle_lock:
+            return self._stop_pipeline(station)
+
+    def _stop_pipeline(self, station: str | None = None) -> dict[str, Any]:
+        with self.lock:
+            if station is None:
+                self._supervised.clear()
+            else:
+                for service in self.SERVICE_NAMES:
+                    self._supervised.pop(self.process_key(service, station), None)
         results: dict[str, Any] = {}
         if station:
             for name in ("producer", "predictor", "spark", "training"):
@@ -578,7 +712,9 @@ class PipelineManager:
         with self.lock:
             for service in ("spark", "predictor", "producer", "training"):
                 proc = self.processes.get(self.process_key(service, station))
-                if proc and proc.poll() is None:
+                supervisor = self._supervised.get(self.process_key(service, station))
+                if (proc and proc.poll() is None) or (supervisor is not None
+                    and not (service == "producer" and proc and proc.poll() == 0)):
                     active.append(service)
         if active:
             raise RuntimeError(
@@ -870,6 +1006,10 @@ class PipelineManager:
                 temp_path.unlink(missing_ok=True)
 
     def reset_station_pipeline(self, station: str) -> dict[str, Any]:
+        with self.lifecycle_lock:
+            return self._reset_station_pipeline(station)
+
+    def _reset_station_pipeline(self, station: str) -> dict[str, Any]:
         """Reset one station's Kafka/Spark/output state without starting services.
 
         The station's producer, predictor, Spark and training processes must be
@@ -955,6 +1095,16 @@ class PipelineManager:
                     f"Spark {label} checkpoint path is not a directory: {candidate}"
                 )
 
+        from src.models.predictor_recovery import predictor_state_path
+        predictor_state = predictor_state_path(ROOT, station)
+        recovery_files = [predictor_state, predictor_state.with_name(predictor_state.name + "-wal"),
+                          predictor_state.with_name(predictor_state.name + "-shm")]
+        for path in recovery_files:
+            if not path.resolve().is_relative_to(ROOT.resolve()) or path.is_symlink():
+                raise RuntimeError(f"Refusing to reset unsafe predictor recovery path: {path}")
+            if path.exists() and not path.is_file():
+                raise RuntimeError(f"Predictor recovery path is not a file: {path}")
+
         topic_result = self._ensure_reset_topics(
             station, raw_topic, featured_topic
         )
@@ -1024,6 +1174,10 @@ class PipelineManager:
         if producer_progress_removed:
             producer_progress_path.unlink()
 
+        predictor_recovery_removed = any(path.exists() for path in recovery_files)
+        for path in recovery_files:
+            path.unlink(missing_ok=True)
+
         # Record the reset state but keep every service stopped. Starting the
         # station is a separate, explicit dashboard action.
         updated_registry = read_station_config()
@@ -1043,6 +1197,7 @@ class PipelineManager:
             "spark_dlq_checkpoint": str(dlq_checkpoint_path),
             "spark_dlq_checkpoint_removed": dlq_checkpoint_removed,
             "producer_progress_file": str(producer_progress_path),
+            "predictor_recovery_removed": predictor_recovery_removed,
             "producer_progress_removed": producer_progress_removed,
             "processed_output_backup": str(output_backup) if output_backup else None,
             "pipeline_started": False,
@@ -1194,6 +1349,10 @@ class PipelineManager:
             raise RuntimeError("Could not verify external training processes: " + (result.stderr or result.stdout).strip())
 
     def delete_station(self, station: str, confirm_station_id: str) -> dict[str, Any]:
+        with self.lifecycle_lock:
+            return self._delete_station(station, confirm_station_id)
+
+    def _delete_station(self, station: str, confirm_station_id: str) -> dict[str, Any]:
         # Permanently delete one station's registry, data, model, outputs and retained Kafka records.
         if confirm_station_id.strip().lower() != station.strip().lower():
             raise ValueError("Typed confirmation does not match the selected station ID.")

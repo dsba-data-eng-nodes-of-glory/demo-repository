@@ -88,6 +88,9 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
         station_frame_path,
         interval_minutes=int(metadata.get("interval_minutes", station_entry.get("interval_minutes", 15))),
     )
+    if station_entry.get("weather"):
+        from src.ingestion.station_weather import archive_training_span
+        frame = archive_training_span(frame, ["forecast_temperature"])
     n_rows = len(frame)
     split_row = int(n_rows * (1.0 - float(training_options.get("validation_fraction", 0.15))))
     validation_start = pd.Timestamp(frame.iloc[split_row]["utc_timestamp"]).isoformat()
@@ -112,7 +115,7 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
         "validation_fraction": float(training_options.get("validation_fraction", 0.15)),
         "model_size_bytes": int(checkpoint_path.stat().st_size),
         "created_at": utc_now(),
-        "weather_mode": "last_observed_temperature_persistence",
+        "weather_mode": checkpoint.get("weather_mode", "last_observed_temperature_persistence"),
     })
     _write_json(metadata_path, metadata)
 

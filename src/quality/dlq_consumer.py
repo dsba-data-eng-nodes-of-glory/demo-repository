@@ -125,7 +125,7 @@ def main() -> None:
 
                 if committed:
                     consumer.commit({
-                        tp: OffsetAndMetadata(offset, None)
+                        tp: OffsetAndMetadata(offset, "")
                         for tp, offset in committed.items()
                     })
         except KeyboardInterrupt:

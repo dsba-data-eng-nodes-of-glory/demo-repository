@@ -1,7 +1,7 @@
 """Read and validate a multi-model station onboarding workbook.
 
 The workbook contract has three worksheets: Demand, Solar and Wind. Demand is
-shared by the demand forecaster and the demand anomaly autoencoder. This module
+shared by demand forecasting and residual-load anomaly detection. This module
 keeps the model-facing CSV schemas explicit so the existing training scripts
 can consume each model's own canonical column names.
 """
@@ -49,6 +49,12 @@ WIND_COLUMNS = [
     "future_wind_speed",
     "future_wind_direction",
 ]
+
+ENERGY_COLUMNS = {
+    "Demand": ["utc_timestamp", "demand"],
+    "Solar": ["utc_timestamp", "Photovoltaics [MWh]", "Photovoltaics_installed_capacity [MW]"],
+    "Wind": ["utc_timestamp", "Wind onshore [MWh]", "Wind_onshore_installed_capacity [MW]"],
+}
 
 TIMESTAMP_ALIASES = ("utc_timestamp", "timestamp", "datetime", "date_time", "date time")
 DEMAND_ALIASES = ("demand", "demand_mw", "load", "load_mw", "actual_demand", "actual_load_mw")
@@ -246,6 +252,9 @@ def load_station_workbook(
     interval_minutes: int = 15,
     timestamp_format: str = "auto",
     source_timezone: str = "UTC",
+    *,
+    location_from_workbook: bool = False,
+    managed_weather: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     """Load selected worksheet data and enforce model-specific source contracts."""
     workbook_path = Path(path)
@@ -256,13 +265,16 @@ def load_station_workbook(
 
     selected = parse_selected_models(selected_models)
     needed_sheets = sorted({SHEET_FOR_MODEL[item] for item in selected})
+    weather = None
     try:
-        source = pd.read_excel(workbook_path, sheet_name=needed_sheets, engine="openpyxl")
-    except ValueError as exc:
-        # pandas may wrap missing sheet names in a ValueError; retain sheet-aware detail.
-        raise ValueError(f"Could not read required workbook worksheets {needed_sheets}: {exc}") from exc
+        with pd.ExcelFile(workbook_path, engine="openpyxl") as excel:
+            source = pd.read_excel(excel, sheet_name=needed_sheets)
+            if location_from_workbook and "Station Location" in excel.sheet_names:
+                from src.ingestion.station_weather import workbook_weather_config
+                weather = workbook_weather_config(excel.parse("Station Location"))
     except Exception as exc:
-        raise ValueError(f"Could not read the Excel workbook: {exc}") from exc
+        raise ValueError(f"Could not read station workbook: {exc}") from exc
+    managed_weather = managed_weather or weather is not None
 
     result: dict[str, pd.DataFrame] = {}
     diagnostics: dict[str, Any] = {
@@ -271,13 +283,15 @@ def load_station_workbook(
         "interval_minutes": int(interval_minutes),
         "source_timezone": source_timezone,
     }
+    if weather is not None:
+        diagnostics["weather"] = weather
 
     if 'residual_anomaly' in selected and not {'demand_forecast','solar_forecast','wind_forecast'}.issubset(selected):
         raise ValueError('Residual-load anomaly needs Demand, Solar and Wind forecasting components all enabled.')
     demand_models = {"demand_forecast", "residual_anomaly"}.intersection(selected)
     if demand_models:
         demand_required = ["utc_timestamp", "demand"]
-        if "demand_forecast" in selected:
+        if "demand_forecast" in selected and not managed_weather:
             demand_required.append("temperature")
         demand_aliases = {
             "utc_timestamp": TIMESTAMP_ALIASES,
@@ -300,7 +314,7 @@ def load_station_workbook(
 
     if "solar_forecast" in selected:
         solar = _read_sheet(
-            source, "Solar", SOLAR_COLUMNS, timestamp_format, source_timezone,
+            source, "Solar", ENERGY_COLUMNS["Solar"] if managed_weather else SOLAR_COLUMNS, timestamp_format, source_timezone,
             interval_minutes, {"utc_timestamp": TIMESTAMP_ALIASES},
         )
         nonnegative = [
@@ -308,6 +322,8 @@ def load_station_workbook(
             "forecast_shortwave_radiation_mean_prev_hour_w_m2",
         ]
         bounded = ["cloud_cover_mean_pct", "forecast_cloud_cover_mean_pct"]
+        if managed_weather:
+            nonnegative, bounded = ["Photovoltaics [MWh]"], []
         if (solar[nonnegative] < 0).any().any():
             raise ValueError("Worksheet 'Solar': generation and radiation values must be nonnegative.")
         if ((solar[bounded] < 0) | (solar[bounded] > 100)).any().any():
@@ -324,11 +340,13 @@ def load_station_workbook(
 
     if "wind_forecast" in selected:
         wind = _read_sheet(
-            source, "Wind", WIND_COLUMNS, timestamp_format, source_timezone,
+            source, "Wind", ENERGY_COLUMNS["Wind"] if managed_weather else WIND_COLUMNS, timestamp_format, source_timezone,
             interval_minutes, {"utc_timestamp": TIMESTAMP_ALIASES},
         )
         nonnegative = ["Wind onshore [MWh]", "wind_speed_100m_mean_ms", "future_wind_speed"]
         directional = ["wind_direction_100m_circular_mean_deg", "future_wind_direction"]
+        if managed_weather:
+            nonnegative, directional = ["Wind onshore [MWh]"], []
         if (wind[nonnegative] < 0).any().any():
             raise ValueError("Worksheet 'Wind': generation and wind-speed values must be nonnegative.")
         if ((wind[directional] < 0) | (wind[directional] > 360)).any().any():
