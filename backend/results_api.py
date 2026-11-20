@@ -6,7 +6,7 @@ last rows rather than loading the entire file on every dashboard refresh.
 from __future__ import annotations
 
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from threading import RLock
 import time
@@ -17,12 +17,12 @@ import pandas as pd
 import yaml
 from fastapi import APIRouter, HTTPException, Query
 
-from backend.pipeline_manager import ROOT, read_station_config
-from src.ingestion.csv_tail import csv_tail
+from backend.pipeline_manager import ROOT, manager, read_station_config
+from src.ingestion.csv_tail import csv_tail, csv_tail_through
 from src.ingestion.file_loader import parse_utc_timestamps
 from src.storage.forecast_store import storage_backend, read_actuals as cassandra_read_actuals, read_forecasts as cassandra_read_forecasts, read_latest_forecast as cassandra_read_latest_forecast, read_quality_events
 from src.storage.renewable_store import read_renewable_forecasts, read_renewable_actuals
-from src.storage.hierarchy_rollup import LeafResults, roll_up
+from src.storage.hierarchy_rollup import METRICS, LeafResults, latest_demand_timestamp, roll_up
 from src.storage.live_actuals import live_actuals_path, read_live_actuals
 from src.storage.station_hierarchy import group_stations
 
@@ -35,7 +35,7 @@ STATION_CONFIG_FILE = ROOT / "config/stations.yaml"
 # Small in-process cache. File mtime/size invalidates entries as files change.
 _CACHE: OrderedDict[tuple, tuple[float, tuple[int, int], pd.DataFrame]] = OrderedDict()
 _CACHE_LOCK = RLock()
-_CACHE_MAX_ITEMS = 12
+_CACHE_MAX_ITEMS = 32
 _RENEWABLE_BASE_CACHE: OrderedDict[tuple, tuple[pd.DataFrame, dict]] = OrderedDict()
 _RENEWABLE_CACHE_MAX_ITEMS = 8
 _RENEWABLE_CACHE_LOCK = RLock()
@@ -49,6 +49,9 @@ _HISTORICAL_ACTUALS_CACHE_MAX_ITEMS = 8
 
 _LOG = logging.getLogger(__name__)
 _ROLLUP_READERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="group-read")
+_GROUP_LOCK = RLock()
+_GROUP_RESULTS: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
+_GROUP_PENDING: dict[tuple, Future] = {}
 
 
 def _station_output_path(station: str, kind: str) -> Path:
@@ -114,7 +117,8 @@ def _read_csv_cached(path: Path, ttl_seconds: float = 300.0) -> pd.DataFrame:
     return frame
 
 
-def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0) -> pd.DataFrame:
+def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0, *,
+                   time_column: str = "utc_timestamp", end_time: str | None = None) -> pd.DataFrame:
     """Read only the final max_rows CSV records using reverse block reads.
 
     This is intended for the flat, one-record-per-line CSV files written by the
@@ -124,12 +128,14 @@ def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0) -> pd.Da
         return pd.DataFrame()
 
     max_rows = int(max_rows)
-    key, cached = _cache_get(path, ("tail", max_rows), ttl_seconds)
+    key, cached = _cache_get(path, ("tail", max_rows, time_column, end_time), ttl_seconds)
     if cached is not None:
         return cached
 
     try:
-        frame = pd.read_csv(csv_tail(path, max_rows))
+        rows = (csv_tail_through(path, max_rows, time_column, end_time)
+                if end_time else csv_tail(path, max_rows))
+        frame = pd.read_csv(rows)
     except (OSError, ValueError, pd.errors.ParserError, UnicodeDecodeError):
         return pd.DataFrame()
 
@@ -151,6 +157,9 @@ def _read_station_rows(
     station: str,
     limit: int,
     scan_rows: int | None = None,
+    *,
+    time_column: str = "utc_timestamp",
+    end_time: str | None = None,
 ) -> pd.DataFrame:
     """Read recent rows for one station without loading a large CSV in full."""
     if not path.exists() or path.stat().st_size == 0:
@@ -158,8 +167,12 @@ def _read_station_rows(
 
     limit = max(1, min(int(limit), 20000))
     # Scan extra rows in case several stations share a single append-only file.
-    scan_rows = scan_rows or min(200000, max(50000, limit * 5))
-    frame = _read_csv_tail(path, scan_rows)
+    if scan_rows is None:
+        if path in (ACTUAL_FILE, FORECAST_FILE):
+            scan_rows = min(200000, max(50000, limit * 5))
+        else:
+            scan_rows = limit
+    frame = _read_csv_tail(path, scan_rows, time_column=time_column, end_time=end_time)
     if frame.empty or "station_id" not in frame.columns:
         return pd.DataFrame()
     frame = frame[frame["station_id"].astype(str) == str(station)]
@@ -433,18 +446,38 @@ def summary(station: str | None = None):
     return {"available": True, "rows": None, "latest_forecast": latest}
 
 
+def _predictor_runs(stations) -> dict:
+    """Identify a new activation or restart without polling the full status API."""
+    with manager.lock:
+        return {
+            station: process.pid if process.poll() is None else "stopped"
+            for station in stations
+            if (process := manager.processes.get(manager.process_key("predictor", station))) is not None
+        }
+
+
 @router.get("/forecasts")
 def forecasts(
     station: str,
     limit: int = Query(default=5000, ge=1, le=20000),
+    include_live_progress: bool = False,
 ):
-    if storage_backend() == "cassandra":
+    use_db = storage_backend() == "cassandra"
+    if use_db:
         records = cassandra_read_forecasts(station, limit)
-        return {"records": records, "message": None if records else "No forecast records found for this station"}
-    frame = _read_station_rows(_station_output_path(station, "forecasts"), station, limit)
-    if frame.empty:
-        return {"records": [], "message": "No forecast records found for this station"}
-    return {"records": _json_safe_records(frame)}
+    else:
+        frame = _read_station_rows(_station_output_path(station, "forecasts"), station, limit)
+        records = _json_safe_records(frame)
+    result = {"records": records}
+    if use_db or not records:
+        result["message"] = None if records else "No forecast records found for this station"
+    if include_live_progress:
+        result["predictor_run"] = _predictor_runs((station,)).get(station)
+        recent = (cassandra_read_actuals(station, 4) if use_db else _json_safe_records(
+            _read_station_rows(_station_output_path(station, "actuals"), station, 4)))
+        latest = latest_demand_timestamp(recent)
+        result["live_through_utc"] = latest.isoformat() if latest is not None else None
+    return result
 
 
 @router.get("/actuals")
@@ -478,51 +511,143 @@ def actuals(
     return {"records": _json_safe_records(frame)}
 
 
-def _operational_leaf(station: str, entry: dict, window: int, *, include_forecasts: bool) -> LeafResults:
-    """Read processed measurements instead of looking ahead into replay uploads."""
+def _operational_leaf(
+    station: str, entry: dict, window: int, *, include_forecasts: bool,
+    end_time: str | None = None, demand_only: bool = False,
+) -> LeafResults:
+    """Read saved results at the requested time, before limiting the row count."""
     limit = window * 2
     use_cassandra = storage_backend() == "cassandra"
     configured_actuals = entry.get("actuals_file")
     actual_path = ROOT / configured_actuals if configured_actuals else ACTUAL_FILE
-    demand = (cassandra_read_actuals(station, limit) if use_cassandra else
+    cutoff = {"end_time": end_time} if end_time else {}
+    demand = (cassandra_read_actuals(station, limit, **cutoff) if use_cassandra else
               _json_safe_records(_read_station_rows(actual_path, station, limit,
-                                                   scan_rows=limit if configured_actuals else None)))
+                                                   scan_rows=limit if configured_actuals else None, **cutoff)))
     live = {}
     try:
-        live = read_live_actuals(live_actuals_path(ROOT, station), limit)
+        live = read_live_actuals(live_actuals_path(ROOT, station), limit, **cutoff)
         demand.extend(live["records"])
     except sqlite3.Error:
         _LOG.warning("Live reader storage is temporarily unavailable for %s.", station, exc_info=True)
-    generation = read_renewable_actuals(station, limit=limit * 2) if (entry.get("renewables") or {}).get("enabled") else []
+    if demand_only:
+        return LeafResults(demand, [], {}, live.get("recovery"))
+
+    renewables = (entry.get("renewables") or {}).get("enabled")
+    if renewables and use_cassandra:
+        generation = read_renewable_actuals(station, limit=limit * 2, **cutoff)
+    elif renewables:
+        generation_path = ROOT / "data" / "processed" / "stations" / station / "renewable_actuals.csv"
+        generation = _json_safe_records(_read_station_rows(generation_path, station, limit * 2,
+                                                            scan_rows=limit * 2, **cutoff))
+    else:
+        generation = []
     if not include_forecasts:
         return LeafResults(demand, generation, {}, live.get("recovery"))
 
+    forecasts = _operational_forecasts(station, entry, end_time)
+    return LeafResults(demand, generation, forecasts, live.get("recovery"))
+
+
+def _operational_forecasts(station: str, entry: dict, end_time: str | None) -> dict[str, list[dict]]:
+    use_cassandra = storage_backend() == "cassandra"
+    cutoff = {"end_time": end_time} if end_time else {}
+    renewables = (entry.get("renewables") or {}).get("enabled")
     horizon = int(entry.get("horizon_steps", 96))
-    # Read the same bounded number of recent runs per component. Include extra
-    # origins so one faster stream can wait for a slower child's latest run.
     forecast_rows = min(10000, horizon * 20)
     configured_forecasts = entry.get("forecasts_file")
     forecast_path = ROOT / configured_forecasts if configured_forecasts else FORECAST_FILE
-    demand_forecasts = (cassandra_read_forecasts(station, forecast_rows) if use_cassandra else
+    csv_cutoff = {"time_column": "forecast_origin_utc", **cutoff} if cutoff else {}
+    demand_forecasts = (cassandra_read_forecasts(station, forecast_rows, **cutoff) if use_cassandra else
                         _json_safe_records(_read_station_rows(forecast_path, station, forecast_rows,
-                                                             scan_rows=forecast_rows if configured_forecasts else None)))
-    if not (entry.get("renewables") or {}).get("enabled"):
+                                                             scan_rows=forecast_rows if configured_forecasts else None,
+                                                             **csv_cutoff)))
+    if not renewables:
         renewable_rows = []
     elif use_cassandra:
-        renewable_rows = read_renewable_forecasts(station, limit=forecast_rows * 2)
+        renewable_rows = read_renewable_forecasts(station, limit=forecast_rows * 2, **cutoff)
     else:
         frame = _read_station_rows(_renewable_file(station, entry), station, forecast_rows * 2,
-                                   scan_rows=forecast_rows * 2)
+                                   scan_rows=forecast_rows * 2, **csv_cutoff)
         renewable_rows = _json_safe_records(frame)
-    return LeafResults(demand, generation, {
+    return {
         "demand_mw": demand_forecasts,
         "solar_mwh": [row for row in renewable_rows if row.get("generation_type") == "solar"],
         "wind_mwh": [row for row in renewable_rows if row.get("generation_type") == "wind"],
-    }, live.get("recovery"))
+    }
 
 
-@router.get("/hierarchy")
-def hierarchy_results(node: str, window: int = Query(288, ge=1, le=2016), include_forecasts: bool = True):
+def _older_group_forecasts(members: dict, results: dict[str, LeafResults], origins: dict) -> bool:
+    """If newer batches don't overlap, look back from the lagging predictor."""
+    components = METRICS[:3]
+    heads = {
+        (station, metric): max((row["forecast_origin_utc"] for row in data.forecasts.get(metric, [])
+                                if row.get("forecast_origin_utc")), default=None)
+        for station, data in results.items() for metric in components
+    }
+    tasks = set()
+    for metric in METRICS:
+        if origins[metric]:
+            continue
+        wanted = components if metric == "residual_mwh" else (metric,)
+        series = {(station, kind): heads[station, kind] for station in members for kind in wanted}
+        if all(series.values()):
+            cutoff = min(series.values())
+            tasks.update((station, cutoff) for (station, _), head in series.items() if head > cutoff)
+
+    def read(task):
+        station, cutoff = task
+        try:
+            return _operational_forecasts(station, members[station], cutoff)
+        except (OSError, ValueError, pd.errors.ParserError):
+            _LOG.warning("Older forecast results are temporarily unavailable for %s.", station, exc_info=True)
+            return {}
+
+    for (station, _), found in zip(tasks, _ROLLUP_READERS.map(read, tasks)):
+        for metric, rows in found.items():
+            results[station].forecasts.setdefault(metric, []).extend(rows)
+    return bool(tasks)
+
+
+def _hierarchy_seed(entry: dict, start: pd.Timestamp, window: int) -> LeafResults:
+    """Read bounded, cached history from configured seed files."""
+    def read(value, column):
+        if not value:
+            return pd.DataFrame()
+        path = ROOT / value
+        key, cached = _cache_get(path, ("hierarchy_seed", column, window), 300)
+        if cached is None:
+            frame = _read_csv_tail(path, window * 2, ttl_seconds=300)
+            if frame.empty:
+                return frame
+            frame.columns = frame.columns.str.strip()
+            if column == "actual_demand" and column not in frame and "demand" in frame:
+                frame = frame.rename(columns={"demand": "actual_demand"})
+            if not {"utc_timestamp", column}.issubset(frame.columns):
+                return pd.DataFrame()
+            cached = pd.DataFrame({
+                "utc_timestamp": parse_utc_timestamps(frame["utc_timestamp"]),
+                column: pd.to_numeric(frame[column].astype("string").str.replace(",", "", regex=False),
+                                      errors="coerce"),
+            }).dropna().sort_values("utc_timestamp")
+            _cache_put(key, path, cached)
+        return cached[cached["utc_timestamp"] < start].tail(window)
+
+    demand = _json_safe_records(read(entry.get("history_file"), "actual_demand"))
+    generation = []
+    renewables = entry.get("renewables") or {}
+    if renewables.get("enabled"):
+        for kind, column in (("solar", "Photovoltaics [MWh]"), ("wind", "Wind onshore [MWh]")):
+            frame = read((renewables.get(kind) or {}).get("train_file"), column)
+            if not frame.empty:
+                generation.extend(_json_safe_records(
+                    frame.rename(columns={column: "actual_generation_mwh"}).assign(generation_type=kind)
+                ))
+    return LeafResults(demand, generation, {})
+
+
+def hierarchy_results(node: str, window: int = Query(288, ge=1, le=2016), include_forecasts: bool = True,
+                      include_history: bool = False):
     """Aggregate a parent or a leaf on demand from bounded operational reads."""
     stations = read_station_config().get("stations", {})
     members = {node: stations[node]} if node in stations else group_stations(stations, node)
@@ -538,27 +663,103 @@ def hierarchy_results(node: str, window: int = Query(288, ge=1, le=2016), includ
         include_forecasts = False
     horizon = min(horizons)
 
-    def read(station: str):
+    def read(station: str, *, demand_only: bool = False, end_time: str | None = None):
         try:
-            return _operational_leaf(station, members[station], window, include_forecasts=include_forecasts)
+            return _operational_leaf(
+                station, members[station], 2 if demand_only else window,
+                include_forecasts=include_forecasts, demand_only=demand_only, end_time=end_time,
+            )
         except (OSError, ValueError, pd.errors.ParserError):
             _LOG.warning("Operational results are temporarily unavailable for %s.", station, exc_info=True)
             return LeafResults([], [], {})
 
-    results = dict(zip(members, _ROLLUP_READERS.map(read, members)))
-    totals = roll_up(members, results, window, interval, horizon)
+    def read_aligned(station: str):
+        edge = edges.get(station)
+        cutoff = as_of.isoformat() if as_of is not None and edge is not None and edge > as_of else None
+        return read(station, end_time=cutoff)
+
+    edges = {}
+    as_of = None
+    if len(members) > 1:
+        heads = _ROLLUP_READERS.map(lambda station: read(station, demand_only=True), members)
+        edges = {station: latest_demand_timestamp(data.demand) for station, data in zip(members, heads)}
+        if all(edge is not None for edge in edges.values()):
+            as_of = min(edges.values())
+    results = dict(zip(members, _ROLLUP_READERS.map(read_aligned, members)))
+    starts = {station: pd.to_datetime(entry.get("expected_stream_start_utc"), utc=True, errors="coerce")
+              for station, entry in members.items() if entry.get("expected_stream_start_utc")}
+    seed = {}
+    if include_history:
+        observed = as_of if len(members) > 1 else latest_demand_timestamp(next(iter(results.values())).demand)
+        if observed is not None:
+            left = observed - pd.Timedelta(minutes=interval * (window - 1))
+            wanted = [station for station, start in starts.items() if pd.notna(start) and start > left]
+            seed = dict(zip(wanted, _ROLLUP_READERS.map(
+                lambda station: _hierarchy_seed(members[station], starts[station], window), wanted
+            )))
+    options = {"as_of": as_of, "history": seed} if seed else {"as_of": as_of}
+    totals = roll_up(members, results, window, interval, horizon, **options)
+    if (len(members) > 1 and include_forecasts and
+            _older_group_forecasts(members, results, totals["forecast_origins_utc"])):
+        totals = roll_up(members, results, window, interval, horizon, **options)
     latest = totals.pop("latest_demand_utc")
+    latest.update({station: edge.isoformat() for station, edge in edges.items() if edge is not None})
+    totals["aligned_through_utc"] = as_of.isoformat() if as_of is not None else None
     recovering = [leaf.recovery for leaf in results.values()
                   if leaf.recovery and leaf.recovery["processed"] < leaf.recovery["total"]]
     return {
         **totals, "node": node, "interval_minutes": interval, "leaf_count": len(members),
-        "forecast_compatible": forecast_compatible,
+        "forecast_compatible": forecast_compatible, "horizon_steps": horizon,
+        "replay_start_utc": max(starts.values()).isoformat()
+        if starts and all(pd.notna(start) for start in starts.values()) else None,
+        "predictor_runs": _predictor_runs(members) if include_history else {},
         "recovery": {key: sum(item[key] for item in recovering) for key in ("total", "processed")}
         if recovering else None,
         "substations": [{"station_id": station, "name": entry.get("display_name") or station,
                          "latest_demand_utc": latest[station],
                          "active": bool(entry.get("enabled"))} for station, entry in members.items()],
     }
+
+
+@router.get("/hierarchy")
+def cached_hierarchy_results(node: str, window: int = Query(288, ge=1, le=2016), include_forecasts: bool = True,
+                             include_history: bool = False):
+    """Share a single rollup between dashboards polling the same view."""
+    try:
+        registry_version = _file_signature(STATION_CONFIG_FILE)
+    except OSError:
+        registry_version = None
+    key = (node, window, include_forecasts, include_history, registry_version)
+    with _GROUP_LOCK:
+        cached = _GROUP_RESULTS.get(key)
+        if cached is not None and time.monotonic() - cached[0] < 1.0:
+            _GROUP_RESULTS.move_to_end(key)
+            return cached[1]
+        pending = _GROUP_PENDING.get(key)
+        owner = pending is None
+        if owner:
+            pending = _GROUP_PENDING[key] = Future()
+    if not owner:
+        try:
+            return pending.result(timeout=3.5)
+        except FutureTimeout as exc:
+            raise HTTPException(status_code=503, detail="A new hierarchy reading is still being calculated.") from exc
+    try:
+        result = (hierarchy_results(node, window, include_forecasts, include_history=True) if include_history
+                  else hierarchy_results(node, window, include_forecasts))
+        with _GROUP_LOCK:
+            _GROUP_RESULTS[key] = (time.monotonic(), result)
+            _GROUP_RESULTS.move_to_end(key)
+            while len(_GROUP_RESULTS) > 12:
+                _GROUP_RESULTS.popitem(last=False)
+        pending.set_result(result)
+        return result
+    except Exception as exc:
+        pending.set_exception(exc)
+        raise
+    finally:
+        with _GROUP_LOCK:
+            _GROUP_PENDING.pop(key, None)
 
 
 @router.get("/quality/events")
@@ -596,8 +797,7 @@ def _load_configured_renewable_actuals(station: str, end_time: str | None = None
     for kind in ("solar", "wind"):
         kind_cfg = cfg.get(kind, {}) or {}
         paths: list[Path] = []
-        for key in ("train_file", "test_file"):
-            value = kind_cfg.get(key)
+        for value in (kind_cfg.get("train_file"), kind_cfg.get("replay_file") or kind_cfg.get("test_file")):
             if not value:
                 continue
             path = Path(value)
@@ -769,7 +969,6 @@ def _latest_renewable_run(
 # Cold loading multi-year solar/wind reference CSVs may take several
 # seconds on an HDD. Opt-in dashboard requests warm that cache off-thread,
 # while ordinary API and test calls retain the original synchronous contract.
-from concurrent.futures import ThreadPoolExecutor
 _RENEWABLE_WARM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix='renewable-cache')
 _RENEWABLE_WARM_LOCK = RLock()
 _RENEWABLE_WARM_JOBS: dict[str, object] = {}

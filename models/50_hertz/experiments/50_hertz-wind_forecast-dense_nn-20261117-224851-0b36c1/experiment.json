@@ -1,0 +1,27 @@
+{
+  "experiment_id": "50_hertz-wind_forecast-dense_nn-20261117-224851-0b36c1",
+  "station": "50_hertz",
+  "algorithm": "dense_nn",
+  "component": "wind_forecast",
+  "parameters": {
+    "epochs": 25,
+    "batch_size": 256,
+    "hidden_1": 256,
+    "hidden_2": 128,
+    "hidden_3": 64,
+    "dropout": 0.1,
+    "learning_rate": 0.001,
+    "weight_decay": 1e-05,
+    "patience": 5,
+    "max_train_origins": 512,
+    "max_validation_origins": 128,
+    "random_state": 42
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/50_hertz/50_hertz_wind_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "abe45edb6f230821f3af38fae70f3d51fa44e5fd0c1ec32c2534036d8ead5b7d",
+  "created_at": "2026-11-17T17:18:51Z"
+}

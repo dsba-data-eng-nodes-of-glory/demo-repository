@@ -3,8 +3,12 @@
 
 import argparse
 import json
+import logging
+import os
+import signal
 import time
 from pathlib import Path
+from threading import Event
 
 import yaml
 
@@ -13,7 +17,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
     from_json,
-    to_timestamp,
+    try_to_timestamp,
     hour,
     minute,
     dayofweek,
@@ -51,37 +55,36 @@ def load_yaml(relative_path):
         return yaml.safe_load(f)
 
 
-def main():
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--station",
-        required=True,
-        help="Station key in config/stations.yaml",
+def create_spark(spark_cfg, name):
+    master_url = os.getenv("SPARK_MASTER_URL", spark_cfg.get("master", "local[2]"))
+    shuffle_partitions = int(os.getenv("SPARK_SHUFFLE_PARTITIONS", spark_cfg.get("shuffle_partitions", 2)))
+    spark_major = int(str(pyspark.__version__).split(".", 1)[0])
+    scala_binary = str(spark_cfg.get("scala_binary") or ("2.13" if spark_major >= 4 else "2.12"))
+    kafka_connector = spark_cfg.get("kafka_connector") or (
+        f"org.apache.spark:spark-sql-kafka-0-10_{scala_binary}:{pyspark.__version__}"
     )
+    builder = (SparkSession.builder.appName(name).master(master_url)
+               .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
+               .config("spark.sql.session.timeZone", "UTC")
+               .config("spark.sql.adaptive.enabled", "false")
+               .config("spark.ui.enabled", str(spark_cfg.get("ui_enabled", False)).lower())
+               .config("spark.scheduler.mode", "FAIR"))
+    if master_url.startswith("local"):
+        builder = builder.config("spark.driver.memory", str(spark_cfg.get("driver_memory", "640m")))
+    connector_jars = os.getenv("ELECTRICITY_SPARK_KAFKA_JARS")
+    if connector_jars:
+        builder = builder.config("spark.jars", connector_jars)
+    else:
+        builder = builder.config("spark.jars.packages", kafka_connector)
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
 
-    args = parser.parse_args()
 
-    # ---------------------------------------------------------
-    # 1. Load configuration
-    # ---------------------------------------------------------
-
-    kafka_cfg = load_yaml("config/kafka.yaml")
-    station_cfg = load_yaml("config/stations.yaml")
-    spark_cfg = load_yaml("config/spark.yaml")
-
-    stations = station_cfg.get("stations", {})
-
-    if args.station not in stations:
-        raise ValueError(
-            f"Unknown station '{args.station}'. "
-            f"Configured stations: {list(stations)}"
-        )
-
-    station = stations[args.station]
+def start_station_query(spark, station_id, station, kafka_cfg, spark_cfg):
     managed_weather = bool(station.get("weather"))
-
+    kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", kafka_cfg.get("bootstrap_servers"))
+    max_offsets = int(os.getenv("SPARK_MAX_OFFSETS_PER_TRIGGER", spark_cfg.get("max_offsets_per_trigger", 500)))
     # ---------------------------------------------------------
     # 2. Define incoming Kafka message schema
     # ---------------------------------------------------------
@@ -102,40 +105,6 @@ def main():
         StructField("data_mode", StringType(), True),
         StructField("replay_cycle", IntegerType(), True),
     ])
-
-    # ---------------------------------------------------------
-    # 3. Create Spark session
-    # ---------------------------------------------------------
-
-    import os
-    master_url = os.getenv("SPARK_MASTER_URL", spark_cfg.get("master", "local[2]"))
-    kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", kafka_cfg.get("bootstrap_servers"))
-    shuffle_partitions = int(os.getenv("SPARK_SHUFFLE_PARTITIONS", spark_cfg.get("shuffle_partitions", 2)))
-    max_offsets = int(os.getenv("SPARK_MAX_OFFSETS_PER_TRIGGER", spark_cfg.get("max_offsets_per_trigger", 500)))
-    spark_major = int(str(pyspark.__version__).split(".", 1)[0])
-    scala_binary = str(spark_cfg.get("scala_binary") or ("2.13" if spark_major >= 4 else "2.12"))
-    kafka_connector = spark_cfg.get("kafka_connector") or (
-        f"org.apache.spark:spark-sql-kafka-0-10_{scala_binary}:{pyspark.__version__}"
-    )
-
-    spark = (
-        SparkSession.builder
-        .appName(
-            f"{spark_cfg.get('app_name', 'electricity-feature-extraction')}"
-            f"-{args.station}"
-        )
-        .master(master_url)
-        .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
-        .config("spark.sql.session.timeZone", "UTC")
-        .config(
-            "spark.jars.packages",
-            kafka_connector,
-        )
-        .getOrCreate()
-    )
-
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
-    spark.sparkContext.setLogLevel("WARN")
 
     # ---------------------------------------------------------
     # 4. Read raw Kafka topic
@@ -180,7 +149,7 @@ def main():
 
     def build_batch_outputs(batch_df):
         """Apply validation/features once to the supplied micro-batch."""
-        ts = to_timestamp(col("utc_timestamp"))
+        ts = try_to_timestamp(col("utc_timestamp"))
         temperature_is_valid = (
             col("temperature").isNotNull()
             & (~isnan(col("temperature")))
@@ -195,7 +164,7 @@ def main():
             interval_us = int(station["interval_minutes"]) * 60 * 10**6
             on_station_grid = pmod(unix_micros(ts), lit(interval_us)) == lit(int(offset) * 10**6)
         valid_condition = coalesce(
-            (col("station_id") == lit(args.station))
+            (col("station_id") == lit(station_id))
             & col("utc_timestamp").isNotNull()
             & col("demand").isNotNull()
             & temperature_is_valid
@@ -213,11 +182,9 @@ def main():
             lit(False),
         )
 
-        valid = batch_df.filter(valid_condition)
-        invalid = batch_df.filter(~valid_condition).withColumn(
-            "quality_reason",
+        quality_reason = (
             when(col("station_id").isNull(), lit("invalid_json_or_missing_station"))
-            .when(col("station_id") != lit(args.station), lit("station_mismatch"))
+            .when(col("station_id") != lit(station_id), lit("station_mismatch"))
             .when(col("utc_timestamp").isNull() | ts.isNull(), lit("invalid_timestamp"))
             .when(
                 ts > current_timestamp() + expr(f"INTERVAL {max(0, future_skew_minutes)} MINUTES"),
@@ -239,7 +206,7 @@ def main():
                 | (col("temperature") == lit(float("-inf"))),
                 lit("non_finite_temperature"),
             )
-            .otherwise(lit("invalid_record")),
+            .otherwise(lit("invalid_record"))
         )
 
         minute_of_day = hour(ts) * lit(60) + minute(ts)
@@ -248,50 +215,28 @@ def main():
         year_day_zero = dayofyear(ts) - lit(1)
         two_pi = lit(2.0 * 3.141592653589793)
 
-        featured = (
-            valid
-            .withColumn("timestamp_utc", ts)
-            .withColumn("hour_sin", sin(two_pi * minute_of_day / lit(1440.0)))
-            .withColumn("hour_cos", cos(two_pi * minute_of_day / lit(1440.0)))
-            .withColumn("weekday_sin", sin(two_pi * weekday_zero / lit(7.0)))
-            .withColumn("weekday_cos", cos(two_pi * weekday_zero / lit(7.0)))
-            .withColumn("year_sin", sin(two_pi * year_day_zero / lit(365.2425)))
-            .withColumn("year_cos", cos(two_pi * year_day_zero / lit(365.2425)))
-            .select(
-                "station_id",
-                "utc_timestamp",
-                "timestamp_utc",
-                "demand",
-                "temperature",
-                "forecast_temperature",
-                "solar_mwh",
-                "solar_capacity_mw",
-                "wind_mwh",
-                "wind_capacity_mw",
-                "hour_sin",
-                "hour_cos",
-                "weekday_sin",
-                "weekday_cos",
-                "year_sin",
-                "year_cos",
-                "is_simulated",
-                "data_mode",
-                "replay_cycle",
-            )
+        features = struct(
+            "station_id", "utc_timestamp", ts.alias("timestamp_utc"),
+            "demand", "temperature", "forecast_temperature",
+            "solar_mwh", "solar_capacity_mw", "wind_mwh", "wind_capacity_mw",
+            sin(two_pi * minute_of_day / lit(1440.0)).alias("hour_sin"),
+            cos(two_pi * minute_of_day / lit(1440.0)).alias("hour_cos"),
+            sin(two_pi * weekday_zero / lit(7.0)).alias("weekday_sin"),
+            cos(two_pi * weekday_zero / lit(7.0)).alias("weekday_cos"),
+            sin(two_pi * year_day_zero / lit(365.2425)).alias("year_sin"),
+            cos(two_pi * year_day_zero / lit(365.2425)).alias("year_cos"),
+            "is_simulated", "data_mode", "replay_cycle",
         )
-        featured_output = featured.selectExpr(
-            "CAST(station_id AS STRING) AS key",
-            "to_json(struct(*)) AS value",
+        dead_letter = struct(
+            lit(station_id).alias("station_id"), col("station_id").alias("source_station_id"),
+            quality_reason.alias("quality_reason"), "source_topic",
+            "source_partition", "source_offset", "raw_value",
         )
-        dlq_output = invalid.selectExpr(
-            f"CAST('{args.station}' AS STRING) AS key",
-            "to_json(named_struct("
-            f"'station_id', '{args.station}', 'source_station_id', station_id, "
-            "'quality_reason', quality_reason, "
-            "'source_topic', source_topic, 'source_partition', source_partition, "
-            "'source_offset', source_offset, 'raw_value', raw_value)) AS value",
+        return batch_df.select(
+            lit(station_id).alias("key"),
+            when(valid_condition, lit(station["featured_topic"])).otherwise(lit(dlq_topic)).alias("topic"),
+            when(valid_condition, to_json(features)).otherwise(to_json(dead_letter)).alias("value"),
         )
-        return featured_output, dlq_output
 
     # ---------------------------------------------------------
     # 7. Single Structured Streaming source query, two Kafka sinks
@@ -300,78 +245,120 @@ def main():
     checkpoint_dir = spark_cfg.get(
         "checkpoint_location", "checkpoints/spark_features"
     )
-    checkpoint_path = ROOT / f"{checkpoint_dir}_{args.station}"
+    checkpoint_path = ROOT / f"{checkpoint_dir}_{station_id}"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     def publish_microbatch(batch_df, batch_id: int) -> None:
-        """Publish featured and DLQ records from the same cached source batch.
-
-        Keeping both output writes inside one foreachBatch callback eliminates
-        the second Kafka source query and duplicate parse/validation plan. The
-        source checkpoint advances only after both sink writes complete.
-        If either write fails, Spark retries this batch on restart (at-least-once
-        delivery); downstream event/actual stores are idempotent by source key
-        or timestamp.
-        """
-        batch_df.persist()
-        try:
-            featured_output, dlq_output = build_batch_outputs(batch_df)
-            (
-                featured_output.write
-                .format("kafka")
-                .option("kafka.bootstrap.servers", kafka_bootstrap)
-                .option("topic", station["featured_topic"])
-                .save()
-            )
-            (
-                dlq_output.write
-                .format("kafka")
-                .option("kafka.bootstrap.servers", kafka_bootstrap)
-                .option("topic", dlq_topic)
-                .save()
-            )
-            print(
-                f"Spark batch completed: batchId={batch_id} | "
-                "featured+DLQ sinks acknowledged",
-                flush=True,
-            )
-        finally:
-            batch_df.unpersist()
+        # The Kafka sink routes each row via its topic column. A single write
+        # completes before Spark commits the source checkpoint for this batch.
+        (build_batch_outputs(batch_df).write.format("kafka")
+         .option("kafka.bootstrap.servers", kafka_bootstrap).save())
+        print(f"{station_id}: Spark batch {batch_id} acknowledged (featured/DLQ)", flush=True)
 
     query = (
         parsed.writeStream
         .foreachBatch(publish_microbatch)
         .option("checkpointLocation", str(checkpoint_path))
         .outputMode("append")
+        .trigger(processingTime=str(spark_cfg.get("trigger_interval", "1 second")))
         .start()
     )
 
     print(
-        f"Spark streaming started for '{args.station}': "
+        f"Spark streaming started for '{station_id}': "
         f"{station['raw_topic']} -> {station['featured_topic']} | DLQ={dlq_topic} "
-        "(one source query, shared micro-batch)",
+        "(one query, one Kafka write per batch)",
         flush=True,
     )
+    return query
+
+
+def run_shared(spark, control_dir: Path, kafka_cfg, spark_cfg, stop_requested: Event) -> None:
+    from src.spark.control import read_control, write_control
+
+    logger = logging.getLogger(__name__)
+    queries = {}
+    status = {}
+    retries = {}
+    report_path = control_dir / "status.json"
+    desired_path = control_dir / "desired.json"
+
+    def publish():
+        write_control(report_path, {"pid": os.getpid(), "stations": status})
+
+    def stop_query(station):
+        query = queries.pop(station, None)
+        if query is not None and query.isActive:
+            query.stop()
+
+    publish()
     try:
-        while True:
-            if not query.isActive:
-                raise RuntimeError("Spark source/output query stopped unexpectedly.")
-            query.awaitTermination(10000)
-            progress = query.lastProgress
-            if progress:
-                print(
-                    "Spark progress: " + json.dumps(
-                        {
-                            "batchId": progress.get("batchId"),
-                            "inputRowsPerSecond": progress.get("inputRowsPerSecond"),
-                            "processedRowsPerSecond": progress.get("processedRowsPerSecond"),
-                            "numInputRows": progress.get("numInputRows"),
-                        }
-                    ),
-                    flush=True,
-                )
+        while control_dir.is_dir() and not stop_requested.is_set():
+            desired = read_control(desired_path)
+            changed = False
+            for station, item in list(status.items()):
+                if desired.get(station) != item["token"]:
+                    stop_query(station)
+                    retries.pop(station, None)
+                    status.pop(station)
+                    changed = True
+            for station, token in desired.items():
+                query = queries.get(station)
+                if query is not None and query.isActive:
+                    continue
+                if time.monotonic() < retries.get(station, 0):
+                    continue
+                try:
+                    if query is not None:
+                        failure = query.exception()
+                        logger.warning("%s: Spark query terminated: %s", station, failure)
+                        queries.pop(station)
+                    entry = load_yaml("config/stations.yaml")["stations"][station]
+                    queries[station] = start_station_query(spark, station, entry, kafka_cfg, spark_cfg)
+                    status[station] = {"token": token, "state": "running"}
+                    retries.pop(station, None)
+                except Exception as exc:
+                    status[station] = {"token": token, "state": "restarting", "error": str(exc)[:500]}
+                    retries[station] = time.monotonic() + 5
+                    logger.exception("%s: Could not start Spark query; retrying in 5s.", station)
+                changed = True
+            if changed:
+                publish()
+            stop_requested.wait(0.35)
     finally:
-        query.stop()
+        for station in list(queries):
+            stop_query(station)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--station", help="Station key in config/stations.yaml")
+    mode.add_argument("--control-dir", type=Path, help="FastAPI shared Spark control directory")
+    args = parser.parse_args()
+    kafka_cfg = load_yaml("config/kafka.yaml")
+    spark_cfg = load_yaml("config/spark.yaml")
+    name = spark_cfg.get("app_name", "electricity-feature-extraction")
+    stop_requested = Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop_requested.set())
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, lambda *_: stop_requested.set())
+    spark = create_spark(spark_cfg, f"{name}-{args.station or 'shared'}")
+    try:
+        if args.control_dir is not None:
+            run_shared(spark, args.control_dir, kafka_cfg, spark_cfg, stop_requested)
+        else:
+            station = load_yaml("config/stations.yaml")["stations"][args.station]
+            query = start_station_query(spark, args.station, station, kafka_cfg, spark_cfg)
+            try:
+                while not stop_requested.is_set():
+                    if query.awaitTermination(0.5):
+                        raise RuntimeError("Spark source/output query stopped unexpectedly.")
+            finally:
+                if query.isActive:
+                    query.stop()
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

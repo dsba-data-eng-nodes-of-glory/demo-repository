@@ -192,7 +192,7 @@ class AmprionRenewableForecaster:
         return _combine_loaded(paths, loader, self.interval_minutes)
 
     def _load_solar(self, cfg: dict[str, Any]) -> None:
-        paths = [_path(self.root, cfg.get("train_file")), _path(self.root, cfg.get("test_file"))]
+        paths = [_path(self.root, cfg.get("train_file")), _path(self.root, cfg.get("replay_file") or cfg.get("test_file"))]
         if self.weather is not None and cfg.get("data_file"):
             paths = [_path(self.root, cfg["data_file"])]
         paths = [p for p in paths if p is not None]
@@ -207,7 +207,7 @@ class AmprionRenewableForecaster:
                  len(self.solar_frame), self.solar_frame.utc_timestamp.min(), self.solar_frame.utc_timestamp.max(), diagnostics)
 
     def _load_wind(self, cfg: dict[str, Any]) -> None:
-        paths = [_path(self.root, cfg.get("train_file")), _path(self.root, cfg.get("test_file"))]
+        paths = [_path(self.root, cfg.get("train_file")), _path(self.root, cfg.get("replay_file") or cfg.get("test_file"))]
         if self.weather is not None and cfg.get("data_file"):
             paths = [_path(self.root, cfg["data_file"])]
         paths = [p for p in paths if p is not None]
@@ -381,6 +381,10 @@ class AmprionRenewableForecaster:
         with torch.inference_mode():
             scaled = self.wind_model(torch.from_numpy(x_scaled).to(self.device)).cpu().numpy().reshape(-1)
         values = np.maximum(scaled * float(cp["target_std"]) + float(cp["target_mean"]), 0.0)
+        if cp.get("wind_persistence_blend"):
+            from src.models.train_renewable import wind_persistence_blend
+            last_actual = float(frame.iloc[self.history_steps - 1][wind_features.TARGET_COLUMN])
+            values = wind_persistence_blend(values, last_actual, cp["wind_persistence_blend"])
         if len(values) != self.horizon_steps or not np.isfinite(values).all():
             raise RuntimeError("Wind model returned invalid forecast values")
         return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, mode)

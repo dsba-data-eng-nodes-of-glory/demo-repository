@@ -1,0 +1,589 @@
+diff --git a/dashboard/hierarchy_monitoring.py b/dashboard/hierarchy_monitoring.py
+index c2cac10..d365eed 100644
+--- a/dashboard/hierarchy_monitoring.py
++++ b/dashboard/hierarchy_monitoring.py
+@@ -5,6 +5,8 @@ import pandas as pd
+ import plotly.graph_objects as go
+ import streamlit as st
+ 
++from dashboard.monitoring_units import interval_unit_label, unit_factor
++
+ METRICS = {
+     "demand_mw": ("Demand", "MW"),
+     "solar_mwh": ("Solar", "MWh"),
+@@ -13,12 +15,12 @@ METRICS = {
+ }
+ 
+ 
+-def _trace(rows: list[dict], metric: str, forecast: bool) -> go.Scatter:
++def _trace(rows: list[dict], metric: str, forecast: bool, factor: float, suffix: str) -> go.Scatter:
+     points = [row[metric] for row in rows]
+     completeness = ["Complete" if point["reporting"] == point["expected"] else "Partial" for point in points]
+     return go.Scatter(
+         x=[row["utc_timestamp"] for row in rows],
+-        y=[point["value"] for point in points], mode="lines+markers",
++        y=[point["value"] * factor if point["value"] is not None else None for point in points], mode="lines+markers",
+         name="Forecast sum" if forecast else "Actual sum", connectgaps=False,
+         line={"color": "#fb923c" if forecast else "#38bdf8", "dash": "dash" if forecast else "solid"},
+         marker={
+@@ -27,14 +29,14 @@ def _trace(rows: list[dict], metric: str, forecast: bool) -> go.Scatter:
+             "size": [8 if status == "Partial" else 4 for status in completeness],
+         },
+         customdata=[(status, point["reporting"], point["expected"]) for status, point in zip(completeness, points)],
+-        hovertemplate="%{x|%d %b %H:%M UTC}<br>%{y:,.2f}<br>%{customdata[0]} · "
+-                      "%{customdata[1]}/%{customdata[2]} substations<extra></extra>",
++        hovertemplate="%{x|%d %b %H:%M UTC}<br>%{y:,.2f} " + suffix +
++                      "<br>%{customdata[0]} · %{customdata[1]}/%{customdata[2]} substations<extra></extra>",
+     )
+ 
+ 
+ def render_group(
+     payload: dict, node: dict, metric: str | None = None, *,
+-    include_forecasts: bool = True, show_forecast_table: bool = False,
++    include_forecasts: bool = True, show_forecast_table: bool = False, display_unit: str = "MWh",
+ ) -> None:
+     st.subheader(node["name"])
+     actuals = payload.get("actuals", [])
+@@ -64,7 +66,7 @@ def render_group(
+ 
+     for name in (metric,) if metric else METRICS:
+         _render_metric(actuals, forecasts, origins.get(name), leaf_count, node["id"], name,
+-                       payload["interval_minutes"], include_forecasts, show_forecast_table)
++                       payload["interval_minutes"], include_forecasts, show_forecast_table, display_unit)
+ 
+     with st.expander("Substation reporting details"):
+         if st.checkbox("Show latest demand by substation", key=f"reporting_{node['id']}"):
+@@ -74,9 +76,11 @@ def render_group(
+ def _render_metric(
+     actuals: list[dict], forecasts: list[dict], origin: str | None, leaf_count: int,
+     node_id: str, metric: str, interval: int, include_forecasts: bool, show_forecast_table: bool,
++    display_unit: str,
+ ) -> None:
+-    label, unit = METRICS[metric]
+-    suffix = f"{unit} / {interval} min" if unit == "MWh" else unit
++    label, source_unit = METRICS[metric]
++    suffix = interval_unit_label(display_unit, interval)
++    factor = unit_factor(source_unit, display_unit, interval)
+     st.subheader(f"{label} · actual vs forecast")
+ 
+     latest = actuals[-1][metric] if actuals else {"value": None, "reporting": 0}
+@@ -94,7 +98,7 @@ def _render_metric(
+     for (caption, value), column in zip(summary, st.columns(4, gap="small")):
+         if caption == "Latest actual" and 0 < latest["reporting"] < leaf_count:
+             caption = f"Latest actual · partial ({latest['reporting']}/{leaf_count})"
+-        column.metric(caption, "—" if value is None else f"{value:,.2f} {suffix}")
++        column.metric(caption, "—" if value is None else f"{value * factor:,.2f} {display_unit}")
+ 
+     if origin:
+         st.caption(f"Forecast origin · {pd.Timestamp(origin):%d %b %H:%M UTC}")
+@@ -102,9 +106,9 @@ def _render_metric(
+         st.caption("The latest shared forecast ends at or before the last observation.")
+     chart = go.Figure()
+     if any(row[metric]["value"] is not None for row in actuals):
+-        chart.add_trace(_trace(actuals, metric, False))
++        chart.add_trace(_trace(actuals, metric, False, factor, suffix))
+     if forecast_rows:
+-        chart.add_trace(_trace(forecast_rows, metric, True))
++        chart.add_trace(_trace(forecast_rows, metric, True, factor, suffix))
+     elif include_forecasts:
+         st.caption(f"Waiting for a complete {label.lower()} forecast at a shared origin.")
+     if chart.data:
+@@ -113,7 +117,7 @@ def _render_metric(
+             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,27,48,.50)",
+             margin={"t": 58, "b": 72, "l": 64, "r": 16},
+             xaxis={"title": "Time (UTC)", "automargin": True},
+-            yaxis={"title": f"{label} ({suffix})", "automargin": True},
++            yaxis={"title": f"{label} ({suffix})", "automargin": True, "uirevision": display_unit},
+             legend={"orientation": "h", "x": 0, "xanchor": "left", "y": 1.02, "yanchor": "bottom"},
+             uirevision=f"{node_id}:{metric}",
+         )
+@@ -121,5 +125,5 @@ def _render_metric(
+     else:
+         st.info(f"Waiting for {label.lower()} readings from the registered substations.")
+     if show_forecast_table and forecast_rows:
+-        st.dataframe([{"Forecast time (UTC)": row["utc_timestamp"], f"{label} ({suffix})": row[metric]["value"]}
++        st.dataframe([{"Forecast time (UTC)": row["utc_timestamp"], f"{label} ({suffix})": row[metric]["value"] * factor}
+                       for row in forecast_rows], use_container_width=True, hide_index=True)
+diff --git a/dashboard/monitoring_units.py b/dashboard/monitoring_units.py
+new file mode 100644
+index 0000000..d45d41e
+--- /dev/null
++++ b/dashboard/monitoring_units.py
+@@ -0,0 +1,13 @@
++"""Display conversions between interval energy and average power."""
++
++
++def unit_factor(source: str, target: str, interval_minutes: int) -> float:
++    """Convert a source value to the selected unit at the observation cadence."""
++    if source == target:
++        return 1.0
++    hours = interval_minutes / 60
++    return hours if source == "MW" else 1 / hours
++
++
++def interval_unit_label(unit: str, interval_minutes: int) -> str:
++    return f"MWh / {interval_minutes} min" if unit == "MWh" else unit
+diff --git a/dashboard/pages/monitoring.py b/dashboard/pages/monitoring.py
+index 1e1d555..72dc822 100644
+--- a/dashboard/pages/monitoring.py
++++ b/dashboard/pages/monitoring.py
+@@ -32,6 +32,8 @@ except ModuleNotFoundError:
+     from dashboard.residual_plot import residual_figures, residual_summary
+     from dashboard.replay_display import filter_actuals_to_cutoff, read_last_acked_timestamp, resolve_actuals_display_cutoff
+ 
++from dashboard.monitoring_units import interval_unit_label, unit_factor
++
+ @st.cache_data(ttl=1, show_spinner=False)
+ def api_get(api_url: str, endpoint: str, params: dict | None = None) -> dict:
+     response = requests.get(
+@@ -87,12 +89,6 @@ def number_column(frame: pd.DataFrame, column: str, factor: float = 1.0) -> pd.D
+     return result.dropna(subset=[column])
+ 
+ 
+-def fmt_mw(value) -> str:
+-    if value is None or pd.isna(value):
+-        return "—"
+-    return f"{float(value):,.0f} MW"
+-
+-
+ def fmt_utc(value) -> str:
+     if value is None or pd.isna(value):
+         return "—"
+@@ -111,6 +107,10 @@ st.title("⚡ Live Monitoring")
+ # ---------------------------------------------------------------------
+ with st.sidebar:
+     st.header("Monitoring Controls")
++    display_unit = st.radio(
++        "Display unit", ("MWh", "MW"), horizontal=True, key="monitoring_display_unit",
++        help="MWh shows energy per observation interval. MW shows average power over that interval.",
++    )
+     auto_refresh = st.checkbox("Enable auto-refresh", value=True)
+     # Migrate one existing Streamlit session to the new default. Subsequent user
+     # choices are kept, so an explicit 5/10/15-second selection is respected.
+@@ -201,6 +201,7 @@ def render_live_monitoring_panel(
+     auto_refresh: bool,
+     refresh_seconds: int,
+     show_diagnostics: bool = False,
++    display_unit: str = "MWh",
+ ) -> None:
+     """Render the live monitoring panel in isolation from the app shell.
+ 
+@@ -230,7 +231,14 @@ def render_live_monitoring_panel(
+     station_interval_minutes = int(stations[station].get("interval_minutes", 15))
+     station_horizon_steps = int(stations[station].get("horizon_steps", 96))
+     station_forecast_horizon_hours = float(stations[station].get("forecast_horizon_hours", 24))
+-    demand_factor = demand_to_mw_factor(stations[station], station_interval_minutes)
++    unit_text = interval_unit_label(display_unit, station_interval_minutes)
++    demand_factor = demand_to_mw_factor(stations[station], station_interval_minutes) * unit_factor(
++        "MW", display_unit, station_interval_minutes,
++    )
++    energy_factor = unit_factor("MWh", display_unit, station_interval_minutes)
++
++    def format_value(value) -> str:
++        return f"{value:,.2f} {display_unit}" if pd.notna(value) else "—"
+ 
+     # ---------------------------------------------------------------------
+     # Load saved actuals and forecasts through FastAPI
+@@ -394,10 +402,10 @@ def render_live_monitoring_panel(
+ 
+     st.subheader("Demand · current forecast")
+     k1, k2, k3, k4 = st.columns(4, gap="small")
+-    k1.metric("Latest actual", fmt_mw(latest_actual))
+-    k2.metric("Next forecast", fmt_mw(first_forecast))
+-    k3.metric("24h peak", fmt_mw(peak_forecast))
+-    k4.metric("24h average", fmt_mw(average_forecast))
++    k1.metric("Latest actual", format_value(latest_actual))
++    k2.metric("Next forecast", format_value(first_forecast))
++    k3.metric("24h peak", format_value(peak_forecast))
++    k4.metric("24h average", format_value(average_forecast))
+     if forecast_origin is not None:
+         st.caption(f"Forecast origin · {fmt_utc(forecast_origin)}")
+     if show_diagnostics and not latest_run.empty and "forecast_issued_at_utc" in latest_run.columns:
+@@ -442,7 +450,7 @@ def render_live_monitoring_panel(
+                         line=dict(color="#1976D2", width=3.5),
+                         connectgaps=False,
+                         hovertemplate=(
+-                            "Actual: %{y:,.0f} MW<br>"
++                            f"Actual: %{{y:,.2f}} {unit_text}<br>"
+                             "Time: %{x|%d %b %H:%M UTC}<extra></extra>"
+                         ),
+                     )
+@@ -469,7 +477,7 @@ def render_live_monitoring_panel(
+                     line=dict(color="#F57C00", width=3.5, dash="dash"),
+                     connectgaps=False,
+                     hovertemplate=(
+-                        "Forecast: %{y:,.0f} MW<br>"
++                        f"Forecast: %{{y:,.2f}} {unit_text}<br>"
+                         "Time: %{x|%d %b %H:%M UTC}<extra></extra>"
+                     ),
+                 )
+@@ -576,7 +584,8 @@ def render_live_monitoring_panel(
+             automargin=True,
+         )
+         fig.update_yaxes(
+-            title_text="Electricity demand (MW)",
++            title_text=f"Electricity demand ({unit_text})",
++            uirevision=display_unit,
+             showgrid=True,
+             gridcolor="#284365",
+             zeroline=False,
+@@ -597,12 +606,14 @@ def render_live_monitoring_panel(
+             )
+         summary = residual_summary(residual_payload)
+         r1,r2,r3,r4 = st.columns(4,gap='small')
+-        fmt=lambda x: '—' if x is None else f'{x:,.0f}'
+-        r1.metric('Next residual',fmt(summary['next']))
+-        r2.metric('24h peak',fmt(summary['peak']))
+-        r3.metric('Peak 30m ramp',fmt(summary['ramp']))
++        for col, label, key in ((r1, 'Next residual', 'next'), (r2, '24h peak', 'peak'),
++                                (r3, 'Peak 30m ramp', 'ramp')):
++            raw = summary[key]
++            col.metric(label, format_value(raw * energy_factor if raw is not None else None))
+         r4.metric('Spike intervals',str(summary['flagged']))
+-        residual_fig, _ = residual_figures(residual_payload)
++        residual_fig, _ = residual_figures(
++            residual_payload, display_unit=display_unit, interval_minutes=station_interval_minutes,
++        )
+         st.plotly_chart(residual_fig,use_container_width=True,config={'displayModeBar':False})
+         with st.expander('Earlier residual-load forecast assessments',expanded=False):
+             history = pd.DataFrame([{'origin_utc':item.get('origin_utc'),
+@@ -647,18 +658,17 @@ def render_live_monitoring_panel(
+         renewable_summary = build_renewable_summaries(renewable_actuals, renewable_forecasts)
+         for kind, label in (("solar", "Solar"), ("wind", "Wind Energy")):
+             stats = renewable_summary[kind]
+-            st.markdown(f"**{label}** · MWh per {station_interval_minutes}-minute interval")
+-            r1, r2, r3, r4 = st.columns(4, gap="small")
+-            def fmt_mwh(value):
+-                return f"{value:,.0f} MWh" if value is not None else "—"
+-            r1.metric("Latest actual", fmt_mwh(stats["latest_actual"]))
+-            r2.metric("Next forecast", fmt_mwh(stats["first_forecast"]))
+-            r3.metric("Forecast peak", fmt_mwh(stats["peak_forecast"]))
+-            r4.metric("Forecast average", fmt_mwh(stats["average_forecast"]))
++            st.markdown(f"**{label}** · {unit_text}")
++            columns = st.columns(4, gap="small")
++            for col, caption, key in zip(columns, ("Latest actual", "Next forecast", "Forecast peak", "Forecast average"),
++                                         ("latest_actual", "first_forecast", "peak_forecast", "average_forecast")):
++                raw = stats[key]
++                col.metric(caption, format_value(raw * energy_factor if raw is not None else None))
+ 
+         renewable_fig, renewable_counts = build_renewable_figure(
+             renewable_actuals, renewable_forecasts,
+             chart_start=chart_start, chart_end=chart_end,
++            display_unit=display_unit, interval_minutes=station_interval_minutes,
+         )
+         renewable_series_added = any(renewable_counts.values())
+         if renewable_series_added:
+@@ -736,16 +746,19 @@ def render_live_monitoring_panel(
+                 if col in latest_run.columns
+             ]
+ 
++            selected_columns = latest_run[display_columns]
+             st.dataframe(
+-                latest_run[display_columns],
++                selected_columns,
+                 use_container_width=True,
+                 hide_index=True,
++                column_config={"predicted_demand": f"Predicted demand ({unit_text})"},
+             )
+ 
++            download = selected_columns.assign(demand_unit=display_unit, interval_minutes=station_interval_minutes)
+             st.download_button(
+                 "Download Latest Forecast Run",
+-                data=latest_run[display_columns].to_csv(index=False).encode("utf-8"),
+-                file_name=f"{station}_latest_forecast.csv",
++                data=download.to_csv(index=False).encode("utf-8"),
++                file_name=f"{station}_latest_forecast_{display_unit.lower()}.csv",
+                 mime="text/csv",
+             )
+         else:
+@@ -794,7 +807,7 @@ def render_live_monitoring_panel(
+                 history_fig.update_layout(
+                     title=f"Forecast run generated {selected_label}",
+                     xaxis_title="Target timestamp (UTC)",
+-                    yaxis_title="Predicted demand (MW)",
++                    yaxis_title=f"Predicted demand ({unit_text})",
+                     hovermode="x unified",
+                     height=380,
+                     template="plotly_dark",
+@@ -814,6 +827,7 @@ def render_live_monitoring_panel(
+                 latest_run,
+                 use_container_width=True,
+                 hide_index=True,
++                column_config={"predicted_demand": f"Predicted demand ({unit_text})"},
+             )
+         else:
+             st.info("No forecast steps are available.")
+@@ -883,7 +897,7 @@ if use_hierarchy_view:
+             st.warning(f"Hierarchy readings are temporarily unavailable: {exc}")
+             return
+         render_group(payload, selected_node, group_metric, include_forecasts=include_forecasts,
+-                     show_forecast_table=show_forecast_table)
++                     show_forecast_table=show_forecast_table, display_unit=display_unit)
+ 
+     render_hierarchy_monitoring()
+ else:
+@@ -891,4 +905,4 @@ else:
+         run_every=float(refresh_seconds) if auto_refresh else None
+     )(render_live_monitoring_panel)
+     fragment_runner(api, station, stations, history_hours, show_forecast_table, auto_refresh,
+-                    refresh_seconds, show_diagnostics)
++                    refresh_seconds, show_diagnostics, display_unit)
+diff --git a/dashboard/renewable_plot.py b/dashboard/renewable_plot.py
+index 7dbe63f..b716e57 100644
+--- a/dashboard/renewable_plot.py
++++ b/dashboard/renewable_plot.py
+@@ -7,6 +7,8 @@ import pandas as pd
+ import plotly.graph_objects as go
+ from plotly.subplots import make_subplots
+ 
++from dashboard.monitoring_units import interval_unit_label, unit_factor
++
+ 
+ def _utc(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+     if frame.empty or column not in frame.columns:
+@@ -22,6 +24,8 @@ def build_renewable_figure(
+     *,
+     chart_start: Any = None,
+     chart_end: Any = None,
++    display_unit: str = "MWh",
++    interval_minutes: int = 15,
+ ) -> tuple[go.Figure, dict[str, int]]:
+     """Build one panel with separate Solar PV and Wind rows on a shared UTC axis.
+ 
+@@ -29,6 +33,8 @@ def build_renewable_figure(
+     signal its own y-range, so it cannot be visually flattened by wind output.
+     Returns exact displayed trace counts for dashboard diagnostics and tests.
+     """
++    unit_text = interval_unit_label(display_unit, interval_minutes)
++    factor = unit_factor("MWh", display_unit, interval_minutes)
+     actuals = pd.DataFrame(actual_records).copy()
+     actuals = _utc(actuals, "utc_timestamp")
+     forecasts = forecast_records or {}
+@@ -56,11 +62,11 @@ def build_renewable_figure(
+                 actual_part = actual_part[actual_part["utc_timestamp"] <= end]
+             if not actual_part.empty:
+                 fig.add_trace(go.Scatter(
+-                    x=actual_part["utc_timestamp"], y=actual_part[actual_col],
++                    x=actual_part["utc_timestamp"], y=actual_part[actual_col] * factor,
+                     mode="lines", name=f"{label} actual", legendgroup=kind,
+                     line=dict(color=line_color, width=2.5), connectgaps=False,
+                     hovertemplate=(
+-                        f"{label} actual: %{{y:,.2f}} MWh / 15 min<br>"
++                        f"{label} actual: %{{y:,.2f}} {unit_text}<br>"
+                         "%{x|%d %b %H:%M UTC}<extra></extra>"
+                     ),
+                 ), row=row, col=1)
+@@ -91,11 +97,11 @@ def build_renewable_figure(
+         if not forecast_part.empty:
+             fig.add_trace(go.Scatter(
+                 x=forecast_part["forecast_timestamp_utc"],
+-                y=forecast_part["predicted_generation_mwh"],
++                y=forecast_part["predicted_generation_mwh"] * factor,
+                 mode="lines", name=f"{label} forecast", legendgroup=kind,
+                 line=dict(color=line_color, width=2.5, dash="dash"), connectgaps=False,
+                 hovertemplate=(
+-                    f"{label} forecast: %{{y:,.2f}} MWh / 15 min<br>"
++                    f"{label} forecast: %{{y:,.2f}} {unit_text}<br>"
+                     "%{x|%d %b %H:%M UTC}<extra></extra>"
+                 ),
+             ), row=row, col=1)
+@@ -116,11 +122,11 @@ def build_renewable_figure(
+         )
+         fig.update_xaxes(showticklabels=False, row=1, col=1)
+         fig.update_yaxes(
+-            title_text="Solar (MWh / 15 min)", showgrid=True,
++            title_text=f"Solar ({unit_text})", uirevision=display_unit, showgrid=True,
+             gridcolor="#263D58", rangemode="tozero", row=1, col=1,
+         )
+         fig.update_yaxes(
+-            title_text="Wind (MWh / 15 min)", showgrid=True,
++            title_text=f"Wind Energy ({unit_text})", uirevision=display_unit, showgrid=True,
+             gridcolor="#263D58", rangemode="tozero", row=2, col=1,
+         )
+     return fig, counts
+diff --git a/dashboard/residual_plot.py b/dashboard/residual_plot.py
+index bb162d4..44c3edc 100644
+--- a/dashboard/residual_plot.py
++++ b/dashboard/residual_plot.py
+@@ -4,6 +4,8 @@ import pandas as pd
+ import numpy as np
+ import plotly.graph_objects as go
+ 
++from dashboard.monitoring_units import interval_unit_label, unit_factor
++
+ 
+ def _frame(payload: dict) -> pd.DataFrame:
+     data = pd.DataFrame(payload.get('records') or [])
+@@ -16,18 +18,23 @@ def _frame(payload: dict) -> pd.DataFrame:
+     return data.dropna(subset=['timestamp_utc']).sort_values('timestamp_utc')
+ 
+ 
+-def residual_figures(payload: dict) -> tuple[go.Figure,go.Figure]:
++def residual_figures(
++    payload: dict, *, display_unit: str = "MWh", interval_minutes: int = 15,
++) -> tuple[go.Figure,go.Figure]:
+     """Forecast residual vs normal baseline and separate statistical/AE scores."""
+     f = _frame(payload)
+     level=go.Figure()
+     score=go.Figure()
+     if f.empty:return level,score
++    unit_text = interval_unit_label(display_unit, interval_minutes)
++    columns = ['residual_load', 'expected_residual_load']
++    f[columns] *= unit_factor("MWh", display_unit, interval_minutes)
+     level.add_trace(go.Scatter(x=f['timestamp_utc'],y=f['residual_load'],name='Forecast residual load',
+                                mode='lines',line=dict(color='#38bdf8',width=2.7)))
+     level.add_trace(go.Scatter(x=f['timestamp_utc'],y=f['expected_residual_load'],name='Historical expected',
+                                mode='lines',line=dict(color='#a78bfa',dash='dash',width=2)))
+-    add_spike_intervals(level,payload,f,'timestamp_utc','residual_load')
+-    level.update_layout(title='Residual Load Spike Detection · next 24 hours',yaxis_title='Residual load (source MWh/15 min)',
++    add_spike_intervals(level,payload,f,'timestamp_utc','residual_load',interval_minutes)
++    level.update_layout(title='Residual Load Spike Detection · next 24 hours',yaxis_title=f'Residual load ({unit_text})',
+                         xaxis_title='Forecast target time (UTC)')
+     for value,name,color in (('statistical_score','Statistical deviation','#38bdf8'),
+                              ('autoencoder_score','Autoencoder score','#fbbf24')):
+diff --git a/tests/test_monitoring_display_units.py b/tests/test_monitoring_display_units.py
+new file mode 100644
+index 0000000..d57c57b
+--- /dev/null
++++ b/tests/test_monitoring_display_units.py
+@@ -0,0 +1,140 @@
++import csv
++import json
++from io import StringIO
++from pathlib import Path
++from urllib.parse import urlsplit
++
++import requests
++import streamlit as st
++from streamlit.testing.v1 import AppTest
++
++from dashboard.residual_plot import residual_figures
++from src.storage.station_hierarchy import build_tree
++
++
++ROOT = Path(__file__).resolve().parents[1]
++ORIGIN = "2026-10-03T13:45:00Z"
++TARGET = "2026-10-03T14:00:00Z"
++
++
++def test_monitoring_defaults_to_energy_and_switches_individual_and_group_views(monkeypatch):
++    stations = {
++        "demo_energy": {"hierarchy_path": [{"name": "Demo Grid", "level": "Country"}],
++                        "interval_minutes": 15, "horizon_steps": 1,
++                        "residual_demand_unit": "mwh_per_interval", "residual_model_checkpoint": "demo.pt"},
++        "demo_power": {"interval_minutes": 30, "horizon_steps": 1, "residual_demand_unit": "mw"},
++    }
++    registry = {"active_station": "demo_energy", "stations": stations}
++    tree = build_tree(stations)
++    group = next(node for node in tree if node["children"])["id"]
++    downloads = []
++    original_download = st.download_button
++
++    def capture_download(*args, **kwargs):
++        downloads.append(kwargs["data"].decode())
++        return original_download(*args, **kwargs)
++
++    def get(url, params=None, **kwargs):
++        path = urlsplit(url).path
++        station = (params or {}).get("station")
++        if path == "/stations":
++            body = registry
++        elif path == "/stations/hierarchy":
++            body = {"nodes": tree}
++        elif path == "/results/actuals":
++            body = {"records": [{"utc_timestamp": ORIGIN,
++                                 "actual_demand": 6000 if station == "demo_power" else 3033}]}
++        elif path == "/results/forecasts":
++            target = "2026-10-03T14:15:00Z" if station == "demo_power" else TARGET
++            body = {"records": [{
++                "forecast_origin_utc": ORIGIN, "forecast_issued_at_utc": ORIGIN, "forecast_timestamp_utc": target,
++                "forecast_run_id": "run", "horizon_step": 1,
++                "predicted_demand": 6500 if station == "demo_power" else 3120,
++            }]}
++        elif path == "/results/renewables" and station == "demo_energy":
++            body = {"actuals": [{"utc_timestamp": ORIGIN, "solar_actual_mwh": 10, "wind_actual_mwh": 20}],
++                    "forecasts": {kind: [{"forecast_timestamp_utc": TARGET, "forecast_origin_utc": ORIGIN,
++                                         "predicted_generation_mwh": value}]
++                                  for kind, value in (("solar", 12), ("wind", 24))}}
++        elif path == "/results/residual/forecast":
++            body = residual_payload()
++        elif path == "/results/hierarchy":
++            levels = {"demand_mw": 12132, "solar_mwh": 10, "wind_mwh": 20, "residual_mwh": 3003}
++            reading = {key: {"value": value, "reporting": 1, "expected": 1} for key, value in levels.items()}
++            body = {"leaf_count": 1, "interval_minutes": 15, "substations": [],
++                    "actuals": [{"utc_timestamp": ORIGIN, **reading}],
++                    "forecasts": [{"utc_timestamp": TARGET, **reading}]}
++        else:
++            body = {}
++        response = requests.Response()
++        response.status_code = 200
++        response._content = json.dumps(body).encode()
++        return response
++
++    def run(page):
++        page.run()
++        assert not page.exception, page.exception
++        return page
++
++    monkeypatch.setattr(requests, "get", get)
++    monkeypatch.setattr(st, "download_button", capture_download)
++    script = str(ROOT / "dashboard" / "pages" / "monitoring.py")
++    page = run(AppTest.from_file(script))
++    assert page.radio(key="monitoring_display_unit").value == "MWh"
++    assert [value.value for value in page.metric if value.label == "Latest actual"] == [
++        "3,033.00 MWh", "10.00 MWh", "20.00 MWh",
++    ]
++    next(item for item in page.checkbox if item.label == "Show technical details").check()
++    run(page)
++    exported = next(csv.DictReader(StringIO(downloads[-1])))
++    assert (float(exported["predicted_demand"]), exported["demand_unit"], exported["interval_minutes"]) == (3120, "MWh", "15")
++    page.radio(key="monitoring_display_unit").set_value("MW")
++    run(page)
++    assert [value.value for value in page.metric if value.label == "Latest actual"] == [
++        "12,132.00 MW", "40.00 MW", "80.00 MW",
++    ]
++    assert next(value.value for value in page.metric if value.label == "Next residual") == "12,336.00 MW"
++    assert next(value.value for value in page.metric if value.label == "Peak 30m ramp") == "32.00 MW"
++    exported = next(csv.DictReader(StringIO(downloads[-1])))
++    assert (float(exported["predicted_demand"]), exported["demand_unit"]) == (12480, "MW")
++
++    page = AppTest.from_file(script)
++    page.query_params["station"] = group
++    run(page)
++    assert [value.value for value in page.metric if value.label == "Latest actual"] == [
++        "3,033.00 MWh", "10.00 MWh", "20.00 MWh", "3,003.00 MWh",
++    ]
++    page.radio(key="monitoring_display_unit").set_value("MW")
++    run(page)
++    assert [value.value for value in page.metric if value.label == "Latest actual"] == [
++        "12,132.00 MW", "40.00 MW", "80.00 MW", "12,012.00 MW",
++    ]
++    assert all("(MW)" in json.loads(chart.proto.spec)["layout"]["yaxis"]["title"]["text"]
++               for chart in page.get("plotly_chart"))
++
++    page = AppTest.from_file(script)
++    page.query_params["station"] = "demo_power"
++    run(page)
++    assert page.metric[0].value == "3,000.00 MWh"
++    page.radio(key="monitoring_display_unit").set_value("MW")
++    run(page)
++    assert page.metric[0].value == "6,000.00 MW"
++
++
++def residual_payload():
++    return {"available": True, "origin_utc": ORIGIN, "records": [{
++        "timestamp_utc": TARGET, "residual_load": 3084, "expected_residual_load": 3000,
++        "residual_ramp_30m": 8, "statistical_score": 2.3, "autoencoder_score": 1.2,
++        "statistical_threshold": 4, "autoencoder_threshold": 5,
++        "upward_highlight": False, "context_valid": True,
++    }]}
++
++
++def test_residual_display_converts_physical_values_and_preserves_scores():
++    payload = residual_payload()
++    level, scores = residual_figures(payload, display_unit="MW")
++    assert list(level.data[0].y) == [12336]
++    assert list(level.data[1].y) == [12000]
++    assert list(scores.data[0].y) == [2.3]
++    assert scores.layout.shapes[0].y0 == 4
++    assert payload["records"][0]["residual_load"] == 3084

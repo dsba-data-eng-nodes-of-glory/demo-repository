@@ -58,7 +58,7 @@ from src.storage.forecast_store import append_actuals, append_forecasts, storage
 from src.quality.validator import validate_event, quality_event
 from src.quality.event_store import record_quality_event
 from src.observability import metrics
-from src.models.tabular_forecasting import build_origin_features
+from src.models.tabular_forecasting import apply_demand_blend, build_origin_features, weekly_demand_baseline
 from src.ingestion.station_weather import FORECAST_WEATHER_MODE, StationWeather, live_origin, station_weather, utc_index
 from src.models.forecast_weather import ForecastWeatherUnavailable, select_forecast_horizon
 
@@ -195,7 +195,7 @@ def load_model(
 
     algorithm = str(active.get("algorithm") or station_entry.get("model_algorithm") or "lstm").lower()
     device = torch.device(model_cfg.get("device", "cpu"))
-    torch.set_num_threads(max(1, int(model_cfg.get("torch_num_threads", 2))))
+    torch.set_num_threads(max(1, int(os.getenv("ELECTRICITY_MODEL_THREADS", model_cfg.get("torch_num_threads", 1)))))
 
     if algorithm in {"random_forest", "gbt", "xgboost"} or checkpoint_path.suffix.lower() in {".joblib", ".pkl"}:
         metadata_value = active.get("metadata_path")
@@ -442,6 +442,14 @@ def generate_forecast(
         if missing:
             raise ValueError(f"Serving feature builder is missing model features: {sorted(missing)}")
         predictions = np.asarray(model.predict(features.reindex(columns=feature_names)), dtype=float).reshape(-1)
+        weight = float(checkpoint.get("weekly_blend_model_weight", 1.0))
+        if weight < 1.0:
+            weekly = weekly_demand_baseline(history_frame, len(future_ts), interval_minutes)
+            if weekly is None:
+                raise ValueError("The seasonal demand blend requires seven days of observations.")
+            predictions = apply_demand_blend(predictions, weekly, weight)
+        elif "weekly_blend_model_weight" in checkpoint:
+            predictions = np.maximum(0.0, predictions)
     elif algorithm in {"dense_nn", "dense", "dense_multioutput"}:
         if weather_lookup is None:
             raise ForecastWeatherUnavailable("No forecast_weather_file is configured for the Dense demand model")
@@ -710,7 +718,7 @@ def run_predictor(args: argparse.Namespace, resources: ExitStack) -> None:
     quality_cfg = storage_cfg.get("quality", {})
     station_order = list(stations).index(args.station) if args.station in stations else 0
     metrics_port = int(observability_cfg.get("predictor_metrics_port", 9102)) + station_order
-    metrics.start_metrics_server(
+    metrics_port = metrics.start_metrics_server(
         metrics_port,
         bool(observability_cfg.get("enabled", True)),
     )
@@ -890,7 +898,10 @@ def run_predictor(args: argparse.Namespace, resources: ExitStack) -> None:
     log.info("Listening to featured topic '%s' for station '%s'.", station["featured_topic"], args.station)
     log.info("History=%d | horizon=%d | interval=%d minutes | forecast cadence=%d observation(s)",
              history_steps, horizon_steps, interval_minutes, forecast_every)
-    log.info("Metrics endpoint: :%s/metrics", metrics_port)
+    if metrics_port:
+        log.info("Metrics endpoint: :%s/metrics", metrics_port)
+    else:
+        log.warning("Prometheus metrics are disabled for this predictor.")
 
     try:
         for message in consumer:

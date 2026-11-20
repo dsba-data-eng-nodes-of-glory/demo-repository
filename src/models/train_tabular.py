@@ -17,12 +17,15 @@ import yaml
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from src.ingestion.station_weather import FORECAST_WEATHER_MODE, archive_training_span
+from src.ingestion.station_weather import FORECAST_WEATHER_MODE
 from src.ingestion.file_loader import load_station_csv
+from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
 from src.models.model_registry import next_version, upsert_experiment, utc_now
 from src.models.forecast_contract import station_forecast_contract
 from src.models.tabular_forecasting import (
     FEATURE_SCHEMA,
+    apply_demand_blend,
+    weekly_demand_baseline,
     build_training_examples,
     json_safe_parameters,
 )
@@ -137,24 +140,28 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
 
     frame = load_station_csv(csv_path, interval_minutes=interval_minutes)
     managed = bool(station_entry.get("weather"))
+    with_test = bool(station_entry.get("replay_start_date"))
+    if with_test:
+        cutoff = pd.Timestamp(station_entry["replay_start_date"], tz="UTC")
+        frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
+    weather_columns = ["forecast_temperature"] if managed else []
     if managed:
-        frame = archive_training_span(frame, ["forecast_temperature"])
+        frame = archived_weather_history(frame, weather_columns, history_steps)
     n_rows = len(frame)
-    split_row = int(n_rows * (1.0 - validation_fraction))
-    if split_row <= history_steps + horizon_steps or n_rows - split_row < horizon_steps:
-        raise ValueError(
-            f"Not enough rows ({n_rows}) for history={history_steps}, horizon={horizon_steps} "
-            "and chronological validation."
-        )
-
-    train_origins = np.arange(history_steps, split_row - horizon_steps + 1, dtype=np.int64)
-    validation_origins = np.arange(split_row, n_rows - horizon_steps + 1, dtype=np.int64)
-    train_origins = sample_origins(train_origins, int(parameters.get("max_train_origins", 300)))
-    validation_origins = sample_origins(
-        validation_origins, int(parameters.get("max_validation_origins", 80))
+    origin_groups, split_row, validation_end_row = forecast_split_origins(
+        frame, history_steps, horizon_steps, interval_minutes, validation_fraction, with_test, weather_columns,
     )
-    if len(train_origins) < 2 or len(validation_origins) < 1:
-        raise ValueError("Not enough train/validation forecast origins after sampling.")
+    train_origins = sample_origins(origin_groups[0], int(parameters.get("max_train_origins", 300)))
+    max_eval = int(parameters.get("max_validation_origins", 80))
+    validation_origins = sample_origins(origin_groups[1], max_eval)
+    if len(train_origins) < 2:
+        raise ValueError("Not enough training forecast origins after sampling.")
+
+    def weekly_predictions(origins: np.ndarray) -> np.ndarray:
+        return np.concatenate([
+            weekly_demand_baseline(frame.iloc[start - history_steps:start], horizon_steps, interval_minutes)
+            for start in origins
+        ])
 
     x_train, y_train, train_origin_ids = build_training_examples(
         frame, train_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
@@ -178,6 +185,19 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     predicted = np.asarray(predicted, dtype=float).reshape(-1)
     if len(predicted) != len(y_valid):
         raise RuntimeError(f"Estimator returned {len(predicted)} predictions for {len(y_valid)} validation rows.")
+    blend = {}
+    if managed and algorithm == "dense_nn" and weekly_demand_baseline(
+        frame.iloc[train_origins[0] - history_steps:train_origins[0]], horizon_steps, interval_minutes
+    ) is not None:
+        weekly = weekly_predictions(validation_origins)
+        weight = min((0.0, 0.25, 0.5, 0.75, 1.0),
+                     key=lambda value: mean_absolute_error(y_valid, apply_demand_blend(predicted, weekly, value)))
+        blend = {
+            "weekly_blend_model_weight": weight,
+            "unblended_validation_metrics": calculate_metrics(y_valid, np.maximum(0.0, predicted)),
+            "weekly_validation_metrics": calculate_metrics(y_valid, weekly),
+        }
+        predicted = apply_demand_blend(predicted, weekly, weight)
     metrics = calculate_metrics(y_valid, predicted)
 
     # Error profile by lead step is part of the experiment and comparison output.
@@ -188,6 +208,32 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         lead_metrics = calculate_metrics(actual_matrix[:, lead], predicted_matrix[:, lead])
         horizon_metrics.append({"horizon_step": lead + 1, **lead_metrics})
 
+    validation_start = str(pd.Timestamp(frame.iloc[split_row]["utc_timestamp"]).isoformat())
+    validation_end = str(pd.Timestamp(frame.iloc[validation_end_row - 1]["utc_timestamp"]).isoformat())
+    test_metadata = {}
+    if with_test:
+        test_origins = sample_origins(origin_groups[2], max_eval)
+        x_test, y_test, _ = build_training_examples(
+            frame, test_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed,
+        )
+        x_test = x_test.reindex(columns=feature_names)
+        test_predicted = estimator.predict(x_test.to_numpy(dtype=np.float32))
+        test_baselines = {}
+        if blend:
+            weekly = weekly_predictions(test_origins)
+            test_baselines = {
+                "unblended_test_metrics": calculate_metrics(y_test, np.maximum(0.0, test_predicted)),
+                "weekly_test_metrics": calculate_metrics(y_test, weekly),
+            }
+            test_predicted = apply_demand_blend(test_predicted, weekly, blend["weekly_blend_model_weight"])
+        test_metadata = {
+            **test_baselines,
+            "test_metrics": calculate_metrics(y_test, test_predicted),
+            "test_origin_count": len(test_origins),
+            "test_start_utc": frame["utc_timestamp"].iloc[validation_end_row].isoformat(),
+            "test_end_utc": frame["utc_timestamp"].iloc[-1].isoformat(),
+        }
+
     training_seconds = time.perf_counter() - overall_started
     created = utc_now()
     version = next_version(station, algorithm)
@@ -197,8 +243,6 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     metadata_path = artifact_dir / "metadata.json"
     joblib.dump(estimator, artifact_path, compress=3)
 
-    validation_start = str(pd.Timestamp(frame.iloc[split_row]["utc_timestamp"]).isoformat())
-    validation_end = str(pd.Timestamp(frame.iloc[-1]["utc_timestamp"]).isoformat())
     metadata = {
         "experiment_id": experiment_id,
         "station": station,
@@ -215,6 +259,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "history_window_hours": contract["history_window_hours"],
         "forecast_horizon_hours": contract["forecast_horizon_hours"],
         "training_rows": int(n_rows),
+        "eligible_origins_by_split": [len(origins) for origins in origin_groups],
         "training_origins": int(len(train_origins)),
         "training_samples": int(len(y_train)),
         "validation_origins": int(len(validation_origins)),
@@ -225,7 +270,10 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "validation_start_utc": validation_start,
         "validation_end_utc": validation_end,
         "validation_fraction": validation_fraction,
-        "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
+        "evaluation_protocol": "chronological_train_validation_test_sampled_origins_v1"
+        if with_test else "chronological_holdout_sampled_origins_v1",
+        **blend,
+        **test_metadata,
         "parameters": parameters,
         "metrics": metrics,
         "horizon_metrics": horizon_metrics,
@@ -256,6 +304,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "validation_end_utc": validation_end,
         "validation_origin_count": int(len(validation_origins)),
         "evaluation_protocol": metadata["evaluation_protocol"],
+        **blend,
+        **test_metadata,
         "parameters": parameters,
         "metrics": metrics,
         "training_duration_seconds": float(training_seconds),

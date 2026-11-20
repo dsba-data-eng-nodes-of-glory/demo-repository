@@ -1,24 +1,32 @@
-from pathlib import Path
+import pandas as pd
+
+from dashboard import monitoring_chart
+from dashboard.replay_display import filter_actuals_to_cutoff, resolve_actuals_display_cutoff
 
 
-def test_monitoring_waits_for_forecast_before_rendering_any_graph():
-    source = Path(__file__).parents[1] / "dashboard" / "pages" / "monitoring.py"
-    text = source.read_text(encoding="utf-8")
-    assert "if latest_run.empty:" in text
-    branch = text.split("if latest_run.empty:", 1)[1].split("# Fetch the full replay window", 1)[0]
-    assert "forecast-init-card" in branch
-    assert "return" in branch
-    assert "Waiting for the first" in branch
+START = pd.Timestamp("2026-10-01T00:00:00Z")
+STEP = pd.Timedelta(minutes=15)
 
 
-def test_demand_graph_uses_configured_stream_start_not_rolling_history():
-    source = Path(__file__).parents[1] / "dashboard" / "pages" / "monitoring.py"
-    text = source.read_text(encoding="utf-8")
-    assert "history_start = stream_start if stream_start is not None" in text
-    assert '"limit": 20000' in text
+def test_initialization_card_reports_status_and_escapes_station_names(monkeypatch):
+    calls = []
+    monkeypatch.setattr(monitoring_chart.st, "markdown", lambda markup, **kwargs: calls.append((markup, kwargs)))
+    monitoring_chart.render_initializing("Wind <station>", "Waiting for a live origin.")
+    markup, options = calls[0]
+    assert 'role="status"' in markup
+    assert 'class="forecast-init-spinner"' in markup
+    assert "Initializing Wind &lt;station&gt;" in markup
+    assert "Waiting for a live origin." in markup
+    assert options["unsafe_allow_html"]
 
 
-def test_renewable_actuals_share_the_same_stream_start():
-    source = Path(__file__).parents[1] / "dashboard" / "pages" / "monitoring.py"
-    text = source.read_text(encoding="utf-8")
-    assert 'renewable_actuals["utc_timestamp"] >= stream_start' in text
+def test_initial_replay_cutoff_excludes_every_unobserved_interval():
+    limit, reason = resolve_actuals_display_cutoff(START, 15)
+    assert (limit, reason) == (START - STEP, "before_stream_start")
+
+
+def test_live_forecast_origin_is_the_cutoff_for_observations():
+    cutoff, reason = resolve_actuals_display_cutoff(START, 15, replay_timestamp=START + STEP, forecast_origin=START)
+    assert (cutoff, reason) == (START, "forecast_origin")
+    frame = pd.DataFrame({"utc_timestamp": [START - STEP, START, START + STEP], "solar_actual_mwh": [1, 2, 3]})
+    assert filter_actuals_to_cutoff(frame, cutoff)["solar_actual_mwh"].tolist() == [1, 2]

@@ -1,0 +1,41 @@
+{
+  "schema": "residual_ae_v2_capacity",
+  "capacity_features": [
+    "solar_capacity_utilization",
+    "wind_capacity_utilization"
+  ],
+  "input": "/Users/tammurug/go/src/Performance upgrade/data/raw/stations/tennet/tennet_residual_training.csv",
+  "rows": 166464,
+  "feature_names": [
+    "residual_deviation",
+    "residual_ramp_30m",
+    "residual_ramp_1h",
+    "residual_change_24h",
+    "renewable_share",
+    "wind_change_1h",
+    "solar_change_1h",
+    "solar_capacity_utilization",
+    "wind_capacity_utilization",
+    "tod_sin",
+    "tod_cos",
+    "dow_sin",
+    "dow_cos",
+    "year_sin",
+    "year_cos"
+  ],
+  "fit_rows": 133171,
+  "validation_rows": 16646,
+  "calibration_rows": 16647,
+  "training_windows": 5541,
+  "earlystop_windows": 690,
+  "calibration_windows": 16647,
+  "screened_windows": 0,
+  "best_epoch": 80,
+  "best_validation_loss": 0.1967631404598554,
+  "statistical_threshold": 5.397399526948176,
+  "autoencoder_threshold": 35.85928373524877,
+  "calibration_stage1_flags": 167,
+  "calibration_stage2_flags": 167,
+  "calibration_confirmed_flags": 1,
+  "note": "Unlabelled calibration quantiles, not verified precision/recall or grid-incident accuracy"
+}

@@ -9,9 +9,9 @@ def test_initial_queue_deploys_and_retries_components(monkeypatch, tmp_path):
     registry_file = tmp_path / "experiments.json"
     monkeypatch.setattr(pipeline_manager, "STATION_CONFIG", station_file)
     monkeypatch.setattr(model_registry, "REGISTRY_PATH", registry_file)
-    plan = onboarding_training.initial_training(["demand_forecast", "solar_forecast", "residual_anomaly"])
+    plan = onboarding_training.initial_training(["demand_forecast", "solar_forecast", "wind_forecast", "residual_anomaly"])
     assert [(key, task["algorithm"]) for key, task in plan.items()] == [
-        ("demand_forecast", "dense_nn"), ("solar_forecast", "dense_nn"),
+        ("demand_forecast", "dense_nn"), ("solar_forecast", "lstm"), ("wind_forecast", "lstm"),
         ("residual_anomaly", "dense_autoencoder"),
     ]
     pipeline_manager.write_station_config({"stations": {study: {
@@ -67,5 +67,5 @@ def test_initial_queue_deploys_and_retries_components(monkeypatch, tmp_path):
     advance()
     assert station()["initial_training"]["solar_forecast"]["error"] == "Training failed"
     assert station_api.retry_initial_training(study)["queued"] == 1
-    assert station()["initial_training"]["solar_forecast"] == {"algorithm": "dense_nn", "status": "queued"}
+    assert station()["initial_training"]["solar_forecast"] == {"algorithm": "lstm", "status": "queued"}
     assert station()["initial_training"]["demand_forecast"]["status"] == "ready"

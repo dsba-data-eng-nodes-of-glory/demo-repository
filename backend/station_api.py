@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import shutil
 import tempfile
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +26,12 @@ from src.ingestion.workbook_loader import (
     load_station_workbook,
     parse_selected_models,
 )
-from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
+from src.ingestion.station_weather import FORECAST_COLUMNS, station_weather
 from src.models.forecast_weather import ForecastWeatherUnavailable
 from src.models.forecast_contract import derive_forecast_contract
+from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
 from src.storage.station_hierarchy import build_tree, parse_path, validate_path
-from backend.onboarding_training import initial_training, training_pending
+from backend.onboarding_training import DEFAULT_MODELS, initial_training, training_pending
 
 router = APIRouter(prefix="/stations", tags=["stations"])
 
@@ -68,14 +70,18 @@ def _validate_model_row_counts(
     datasets: dict[str, pd.DataFrame],
     selected_models: list[str],
     interval_minutes: int,
-    stream_fraction: float,
-    source_timezone: str,
+    historical: dict[str, pd.DataFrame],
+    replay_start: pd.Timestamp | None,
     history_steps: int,
     horizon_steps: int,
     managed_weather: bool = False,
     live_kafka: bool = False,
+    residual_demand_unit: str = "mwh_per_interval",
 ) -> dict[str, Any]:
     """Fail onboarding early where the shipped trainers cannot form valid splits."""
+    from backend.model_api import training_options_for
+
+    validation_fraction = training_options_for()["validation_fraction"]
     counts: dict[str, Any] = {}
     if any(model in selected_models for model in ("solar_forecast", "wind_forecast", "residual_anomaly")) and interval_minutes != 15:
         raise ValueError(
@@ -84,76 +90,86 @@ def _validate_model_row_counts(
         )
 
     if "demand_forecast" in selected_models:
-        frame = datasets["demand"]
-        split_at = int(len(frame) * (1.0 - stream_fraction))
-        from backend.model_api import training_options_for
-        validation_fraction = training_options_for()["validation_fraction"]
-        minimum_training_rows = max(
-            int((history_steps + horizon_steps + 30) / (1.0 - validation_fraction)) + 1,
-            int((horizon_steps - 1) / validation_fraction) + 1,
-        )
-        usable_rows = split_at
-        if managed_weather:
-            usable_rows = len(archive_training_span(frame.iloc[:split_at], ["forecast_temperature"]))
-        if (usable_rows < minimum_training_rows
-                or usable_rows - int(usable_rows * (1.0 - validation_fraction)) < horizon_steps):
-            raise ValueError(
-                f"Worksheet 'Demand' has {usable_rows:,} usable training rows. At least {minimum_training_rows:,} are required "
-                f"for the demand forecaster with {history_steps} history steps, {horizon_steps} forecast steps "
-                "and the configured chronological validation split. Reduce stream_fraction only if appropriate, or add history."
+        demand_history = historical["demand"]
+        weather_columns = ["forecast_temperature"] if managed_weather else []
+        fit_frame = demand_history
+        try:
+            fit_frame = (archived_weather_history(demand_history, weather_columns, history_steps)
+                         if managed_weather else demand_history)
+            origins, train_end, validation_end = forecast_split_origins(
+                fit_frame, history_steps, horizon_steps, interval_minutes, validation_fraction,
+                replay_start is not None, weather_columns,
             )
-        stream_rows = len(frame) - split_at
+        except ValueError as exc:
+            raise ValueError(f"Worksheet 'Demand' has {len(fit_frame):,} usable historical rows. {exc}") from exc
+        usable_rows = len(fit_frame)
+        stream_rows = len(datasets["demand"]) - len(demand_history) if not live_kafka else 0
         if not live_kafka and stream_rows < horizon_steps:
             raise ValueError(
                 f"Worksheet 'Demand' reserves {stream_rows:,} stream rows; at least {horizon_steps:,} are required."
             )
         counts["demand_forecast"] = {
-            "total_rows": int(len(frame)),
+            "total_rows": len(datasets["demand"]),
             "training_rows": int(usable_rows),
+            "fit_rows": train_end,
+            "eligible_origins_by_split": [len(group) for group in origins],
+            "validation_rows": validation_end - train_end,
+            "test_rows": usable_rows - validation_end,
             "stream_rows": int(stream_rows),
         }
 
     for model_name, dataset_name in (("solar_forecast", "solar"), ("wind_forecast", "wind")):
         if model_name not in selected_models:
             continue
-        frame = datasets[dataset_name]
-        if managed_weather and "demand_forecast" in selected and not live_kafka:
-            # Do not train on generation actuals reserved for the station replay.
-            demand = datasets["demand"]
-            replay_start = demand.utc_timestamp.iloc[int(len(demand) * (1.0 - stream_fraction))]
-            frame = frame.loc[frame.utc_timestamp < replay_start]
-        if managed_weather:
-            frame = archive_training_span(frame, list(FORECAST_COLUMNS[dataset_name].values()))
-        n_rows = len(frame)
-        train_end = int(n_rows * 0.70)
-        val_end = int(n_rows * 0.85)
-        if (
-            train_end <= 672 + 96
-            or val_end - train_end < 96
-            or n_rows - val_end < 96
-        ):
-            raise ValueError(
-                f"Worksheet '{dataset_name.title()}' has {n_rows:,} rows. The current Dense NN trainer needs "
-                "a chronological 70/15/15 split, more than 672 history + 96 forecast rows in training, "
-                "and at least 96 rows each in validation and test. Add more continuous history."
+        frame = historical[dataset_name]
+        weather_columns = list(FORECAST_COLUMNS[dataset_name].values()) if managed_weather else []
+        try:
+            if managed_weather:
+                frame = archived_weather_history(frame, weather_columns, 672)
+            origins, train_end, val_end = forecast_split_origins(
+                frame, 672, 96, 15, validation_fraction, True, weather_columns,
             )
+        except ValueError as exc:
+            raise ValueError(f"Worksheet '{dataset_name.title()}': {exc}") from exc
+        n_rows = len(frame)
         counts[model_name] = {
             "total_rows": int(n_rows),
             "train_rows": int(train_end),
+            "eligible_origins_by_split": [len(group) for group in origins],
             "validation_rows": int(val_end - train_end),
             "test_rows": int(n_rows - val_end),
         }
 
     if "residual_anomaly" in selected_models:
         from src.models.residual.training_data import build_training_frame
-        demand_train = datasets['demand'].iloc[:int(len(datasets['demand'])*(1-stream_fraction))]
-        combined = build_training_frame(demand_train,datasets['solar'],datasets['wind'])
+        combined = build_training_frame(historical["demand"], historical["solar"], historical["wind"],
+                                        residual_demand_unit)
         n=len(combined)
         fit_end=int(n*0.80); cal_start=int(n*0.90)
         if fit_end < 2*365*96 or cal_start-fit_end < 20*96 or n-cal_start < 20*96:
             raise ValueError("Residual Autoencoder needs at least two full years for fit plus 20 days for each validation and calibration split.")
         counts['residual_anomaly']={"total_rows":n,"fit_rows":fit_end,"validation_rows":cal_start-fit_end,"calibration_rows":n-cal_start}
     return counts
+
+
+def _historical_frames(datasets: dict[str, pd.DataFrame], replay_start: pd.Timestamp | None,
+                       stream_fraction: float, stream_input: str, managed_weather: bool) -> dict[str, pd.DataFrame]:
+    if replay_start is not None:
+        return {kind: frame.loc[frame["utc_timestamp"] < replay_start] for kind, frame in datasets.items()}
+
+    # Older API callers still use the fractional upload split.
+    historical = dict(datasets)
+    if "demand" in datasets:
+        demand = datasets["demand"]
+        split_at = int(len(demand) * (1.0 - stream_fraction))
+        historical["demand"] = demand.iloc[:split_at]
+        if managed_weather and stream_input == "csv_replay":
+            old_start = demand["utc_timestamp"].iloc[split_at]
+            for kind in ("solar", "wind"):
+                if kind in datasets:
+                    frame = datasets[kind]
+                    historical[kind] = frame.loc[frame["utc_timestamp"] < old_start]
+    return historical
 
 
 @router.get("")
@@ -202,6 +218,7 @@ async def onboard_station(
     raw_topic: str | None = Form(default=None),
     featured_topic: str | None = Form(default=None),
     hierarchy_path: str = Form(default=""),
+    replay_start_date: date | None = Form(default=None),
 ):
     """Register a station from the multi-sheet Excel training workbook.
 
@@ -214,7 +231,13 @@ async def onboard_station(
         stream_input = "csv_replay"
     if stream_input not in {"csv_replay", "kafka"}:
         raise HTTPException(status_code=422, detail="Choose csv_replay or kafka for stream input.")
-    if not 0.10 <= stream_fraction <= 0.50:
+    stream_fraction = float(stream_fraction) if isinstance(stream_fraction, (int, float)) else 0.20
+    replay_start = None
+    if isinstance(replay_start_date, date):
+        if stream_input != "csv_replay":
+            raise HTTPException(status_code=422, detail="A replay start date applies only to historical CSV replay.")
+        replay_start = pd.Timestamp(replay_start_date, tz="UTC")
+    elif not 0.10 <= stream_fraction <= 0.50:
         raise HTTPException(status_code=422, detail="stream_fraction must be between 0.10 and 0.50.")
     if not file.filename or Path(file.filename).suffix.lower() not in {".xlsx", ".xlsm"}:
         raise HTTPException(status_code=422, detail="Please upload the Station Training Template as an .xlsx workbook.")
@@ -293,6 +316,13 @@ async def onboard_station(
                         raise ValueError("All substation worksheets must use the same UTC interval grid.")
                 parents = validate_path(stations, parents, interval_minutes, grid_offset)
             weather_config = workbook_diagnostics.get("weather")
+            # Validate the shared timestamp before downloading weather.
+            if replay_start is not None and "demand" in datasets:
+                if not datasets["demand"]["utc_timestamp"].eq(replay_start).any():
+                    raise ValueError(
+                        f"Worksheet 'Demand' needs an observation at {replay_start:%Y-%m-%d %H:%M} UTC. "
+                        "Select a date covered by the workbook with a reading at midnight UTC."
+                    )
             if stream_input == "kafka" and not weather_config:
                 raise ValueError("Kafka live input requires the Station Location worksheet.")
             if weather_config and horizon_steps * interval_minutes > 1440:
@@ -305,9 +335,10 @@ async def onboard_station(
                     diagnostics["columns"] = list(frame.columns)
                     columns = list(FORECAST_COLUMNS[kind].values())
                     diagnostics["missing_day_ahead_rows"] = int(frame[columns].isna().any(axis=1).sum())
+            historical = _historical_frames(datasets, replay_start, stream_fraction, stream_input, bool(weather_config))
             model_row_counts = await run_in_threadpool(
-                _validate_model_row_counts, datasets, selected, interval_minutes, stream_fraction,
-                source_timezone or "UTC", history_steps, horizon_steps, bool(weather_config), stream_input == "kafka",
+                _validate_model_row_counts, datasets, selected, interval_minutes, historical, replay_start,
+                history_steps, horizon_steps, bool(weather_config), stream_input == "kafka", residual_demand_unit,
             )
         except ForecastWeatherUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -327,9 +358,8 @@ async def onboard_station(
 
         if demand_frame is not None:
             if "demand_forecast" in selected:
-                split_at = int(len(demand_frame) * (1.0 - stream_fraction))
-                train_frame = demand_frame.iloc[:split_at].copy()
-                stream_frame = demand_frame.iloc[split_at:].copy()
+                train_frame = historical["demand"]
+                stream_frame = demand_frame.iloc[len(train_frame):]
                 history_frame = (demand_frame if stream_input == "kafka" else train_frame).tail(history_steps).copy()
 
                 demand_training = staging_dir / f"{key}_demand_training.csv"
@@ -343,7 +373,7 @@ async def onboard_station(
                 relative_files.update({f"demand_{name}": value for name, value in demand_forecast_paths.items()})
                 model_components["demand_forecast"] = {
                     "enabled": True,
-                    "algorithm": "dense_nn",
+                    "algorithm": DEFAULT_MODELS["demand_forecast"],
                     "status": "pending_training",
                     **demand_forecast_paths,
                     "checkpoint": f"models/{key}/v1/{key}_encoder_decoder_lstm.pt",
@@ -353,19 +383,19 @@ async def onboard_station(
                     raise HTTPException(status_code=422, detail="Worksheet 'Demand' must include temperature when demand_forecast is selected.")
             else:
                 model_components["demand_forecast"] = {
-                    "enabled": False, "algorithm": "lstm", "status": "deselected"
+                    "enabled": False, "algorithm": DEFAULT_MODELS["demand_forecast"], "status": "deselected"
                 }
 
         else:
-            model_components["demand_forecast"] = {"enabled": False, "algorithm": "lstm", "status": "deselected"}
+            model_components["demand_forecast"] = {"enabled": False, "algorithm": DEFAULT_MODELS["demand_forecast"], "status": "deselected"}
 
         # Residual-load data is derived from all three historical worksheets,
         # not a separate demand-only input. Preserve a validated combined training snapshot.
         if "residual_anomaly" in selected:
             from src.models.residual.training_data import build_training_frame
             # Train only before replay starts; no future test-stream measurements.
-            demand_train=datasets['demand'].iloc[:int(len(datasets['demand'])*(1-stream_fraction))]
-            residual_frame=build_training_frame(demand_train,datasets['solar'],datasets['wind'],residual_demand_unit)
+            residual_frame = build_training_frame(historical["demand"], historical["solar"], historical["wind"],
+                                                  residual_demand_unit)
             residual_file=staging_dir / f"{key}_residual_training.csv"
             residual_rel=_write_csv(residual_frame,residual_file,station_dir)
             relative_files['residual_training_file']=residual_rel
@@ -387,33 +417,35 @@ async def onboard_station(
                 data_rel = _write_csv(frame, data_path, station_dir)
                 relative_files[f"{kind}_data_file"] = data_rel
                 training_rel = data_rel
-                if weather_config and "demand_forecast" in selected and stream_input == "csv_replay":
-                    replay_start = stream_frame.utc_timestamp.iloc[0]
-                    training_rel = _write_csv(frame.loc[frame.utc_timestamp < replay_start],
-                                              staging_dir / f"{key}_{kind}_training.csv", station_dir)
+                replay_rel = None
+                if historical[kind] is not frame:
+                    training_rel = _write_csv(historical[kind], staging_dir / f"{key}_{kind}_training.csv", station_dir)
                     relative_files[f"{kind}_training_file"] = training_rel
-                if kind == "solar":
-                    checkpoint = f"models/{key}/solar_dense_nn/solar_pv_mlp_v4.pt"
-                    metadata = f"models/{key}/solar_dense_nn/solar_mlp_v4_metadata.json"
-                    version = f"{key}-solar-mlp-v4"
-                else:
-                    checkpoint = f"models/{key}/wind_dense_nn/amprion_wind_dense_solar_aligned.pt"
-                    metadata = f"models/{key}/wind_dense_nn/metadata.json"
-                    version = f"{key}-wind-dense-v1"
+                if replay_start is not None:
+                    replay_frame = frame.loc[frame["utc_timestamp"] >= replay_start]
+                    if not replay_frame.empty:
+                        replay_rel = _write_csv(replay_frame, staging_dir / f"{key}_{kind}_replay.csv", station_dir)
+                        relative_files[f"{kind}_replay_file"] = replay_rel
+                algorithm = DEFAULT_MODELS[model_id]
+                checkpoint = f"models/{key}/{kind}_{algorithm}/model.pt"
+                metadata = f"models/{key}/{kind}_{algorithm}/metadata.json"
+                version = f"{key}-{kind}-{algorithm}-v1"
                 renewable_components[kind] = {
                     "enabled": True,
                     # Keep all generation actuals for serving and a pre-replay training source.
                     "train_file": training_rel,
                     "test_file": None,
+                    **({"replay_file": replay_rel} if replay_rel else {}),
                     "data_file": data_rel,
                     "checkpoint": checkpoint,
                     "metadata": metadata,
                     "model_version": version,
+                    "algorithm": algorithm,
                     "status": "pending_training",
                 }
                 model_components[model_id] = {
                     "enabled": True,
-                    "algorithm": "dense_nn",
+                    "algorithm": algorithm,
                     "status": "pending_training",
                     "training_file": training_rel,
                     "checkpoint": checkpoint,
@@ -422,7 +454,7 @@ async def onboard_station(
             else:
                 renewable_components[kind] = {"enabled": False, "status": "deselected"}
                 model_components[model_id] = {
-                    "enabled": False, "algorithm": "dense_nn", "status": "deselected"
+                    "enabled": False, "algorithm": DEFAULT_MODELS[model_id], "status": "deselected"
                 }
 
         # Solar and wind may be trained and deployed independently. Newly
@@ -456,9 +488,10 @@ async def onboard_station(
             "registered_file_size_bytes": int(size_bytes),
             "model_data_diagnostics": workbook_diagnostics,
             "model_row_counts": model_row_counts,
-            "stream_fraction": float(stream_fraction),
+            **({"replay_start_date": replay_start_date.isoformat()} if replay_start is not None
+               else {"stream_fraction": float(stream_fraction)}),
             "residual_demand_unit": residual_demand_unit,
-            "stream_delay_seconds": 2.0 if weather_config else 0.3,
+            "stream_delay_seconds": 2.0 if weather_config or replay_start is not None else 0.3,
             "renewables": {
                 "enabled": any_renewable_selected,
                 "components_enabled": {
@@ -481,8 +514,6 @@ async def onboard_station(
                 "demand_end_utc": pd.Timestamp(demand_frame["utc_timestamp"].iloc[-1]).isoformat(),
             })
         if "demand_forecast" in selected:
-            train_frame = demand_frame.iloc[:int(len(demand_frame) * (1.0 - stream_fraction))]
-            stream_frame = demand_frame.iloc[int(len(demand_frame) * (1.0 - stream_fraction)):]
             checkpoint_rel = f"models/{key}/v1/{key}_encoder_decoder_lstm.pt"
             station_entry.update({
                 "training_file": demand_forecast_paths["training_file"],
@@ -491,14 +522,14 @@ async def onboard_station(
                 "model_checkpoint": checkpoint_rel,
                 "model_metadata": f"models/{key}/v1/metadata.json",
                 "model_version": "v1",
-                "model_algorithm": "dense_nn",
+                "model_algorithm": DEFAULT_MODELS["demand_forecast"],
                 "training_rows": int(len(train_frame)),
                 "history_rows": int(min(history_steps, len(train_frame))),
                 "stream_rows": int(len(stream_frame)) if stream_input == "csv_replay" else 0,
                 "stream_start_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[0]).isoformat(),
                 "stream_end_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[-1]).isoformat(),
             })
-            if weather_config and stream_input == "csv_replay":
+            if stream_input == "csv_replay" and (replay_start is not None or weather_config):
                 station_entry["expected_stream_start_utc"] = station_entry["stream_start_utc"]
         if "residual_anomaly" in selected:
             station_entry["residual_model_checkpoint"] = model_components["residual_anomaly"]["checkpoint"]
@@ -571,6 +602,8 @@ async def onboard_station(
             "topic_warning": topic_warning,
             "renewable_serving_adapter_ready": any_renewable_selected,
             "initial_training": station_entry["initial_training"],
+            "replay_start_date": station_entry.get("replay_start_date"),
+            "stream_start_utc": station_entry.get("stream_start_utc"),
             "next_step": "Initial training and model deployment run automatically. Activate the station when it is ready.",
         }
     except HTTPException:
@@ -598,6 +631,7 @@ def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
     status = {
         "station": station,
         "kafka_tcp_available": bool(snapshot.get("kafka_tcp_available")),
+        "cassandra": snapshot.get("cassandra") or {"backend": "csv", "available": False, "host": None, "port": None},
         "services": services,
         "quality_consumer": processes.get("quality", {"running": False, "pid": None, "return_code": None}),
         "model_checkpoint": str(checkpoint),

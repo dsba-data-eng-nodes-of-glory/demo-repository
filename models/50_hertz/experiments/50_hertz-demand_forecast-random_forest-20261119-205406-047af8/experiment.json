@@ -1,0 +1,22 @@
+{
+  "experiment_id": "50_hertz-demand_forecast-random_forest-20261119-205406-047af8",
+  "station": "50_hertz",
+  "algorithm": "random_forest",
+  "component": "demand_forecast",
+  "parameters": {
+    "n_estimators": 150,
+    "max_depth": 16,
+    "min_samples_leaf": 2,
+    "max_train_origins": 300,
+    "max_validation_origins": 80,
+    "random_state": 42,
+    "n_jobs": 1
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/50_hertz/50_hertz_demand_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "19e4148a0f99a5acf15c7bbe31c6a6ceb361534bf954a4d18ac16883559543c3",
+  "created_at": "2026-11-19T15:24:06Z"
+}

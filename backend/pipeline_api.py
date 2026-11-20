@@ -28,6 +28,14 @@ def start(request: StationRequest | None = None):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/start-all")
+def start_all():
+    try:
+        return manager.start_all_pipelines()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/stop")
 def stop(request: StationRequest | None = None):
     try:

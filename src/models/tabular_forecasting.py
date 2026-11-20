@@ -205,3 +205,15 @@ def json_safe_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
             value = float(value)
         clean[str(key)] = value
     return clean
+
+
+def weekly_demand_baseline(history: pd.DataFrame, horizon: int, interval: int) -> np.ndarray | None:
+    """Use the observation at the same UTC interval seven days earlier."""
+    lookback = _steps_for_duration(10080, interval)
+    if len(history) < lookback or horizon > lookback:
+        return None
+    return history["demand"].to_numpy(dtype=float)[-lookback:][:horizon]
+
+
+def apply_demand_blend(predicted: np.ndarray, baseline: np.ndarray, weight: float) -> np.ndarray:
+    return np.maximum(0.0, weight * predicted + (1.0 - weight) * baseline)

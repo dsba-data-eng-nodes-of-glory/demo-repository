@@ -489,12 +489,15 @@ def write_quality_event(event: dict[str, Any]) -> None:
     _register_bucket(session, str(event["station_id"]), "quality_day", timestamp.date().isoformat())
 
 
-def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
+def read_actuals(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
     session = get_session()
     cfg = _config().get("cassandra", {})
     months = max(1, int(cfg.get("actual_history_months", 12)))
     latest = session.execute(_PREPARED["latest_actual_read"], (station,)).one()
-    if latest is not None and latest.month_bucket:
+    cutoff = _utc_naive(end_time) if end_time else None
+    if cutoff is not None:
+        year, month = cutoff.year, cutoff.month
+    elif latest is not None and latest.month_bucket:
         year, month = (int(part) for part in latest.month_bucket.split("-", 1))
     else:
         now = datetime.now(timezone.utc)
@@ -507,7 +510,8 @@ def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
             month, year = 12, year - 1
     rows: list[dict[str, Any]] = []
     for bucket in buckets:
-        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["actual_read"], (station, bucket)))
+        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["actual_read"], (station, bucket))
+                    if cutoff is None or _utc_naive(row.utc_timestamp) <= cutoff)
         if len(rows) >= limit:
             break
     rows.sort(key=lambda row: row["utc_timestamp"])
@@ -517,18 +521,20 @@ def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
     return rows
 
 
-def read_forecasts(station: str, limit: int = 5000) -> list[dict[str, Any]]:
+def read_forecasts(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
     session = get_session()
     days = max(1, int(_config().get("cassandra", {}).get("forecast_history_days", 14)))
     latest_run = session.execute(_PREPARED["latest_pointer_read"], (station,)).one()
-    anchor_day = (latest_run.forecast_origin_utc.date()
+    cutoff = _utc_naive(end_time) if end_time else None
+    anchor_day = (cutoff.date() if cutoff is not None else latest_run.forecast_origin_utc.date()
                   if latest_run is not None and latest_run.forecast_origin_utc is not None
                   else datetime.now(timezone.utc).date())
     rows: list[dict[str, Any]] = []
     from datetime import timedelta
     for offset in range(days):
         day = anchor_day - timedelta(days=offset)
-        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["forecast_read"], (station, day)))
+        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["forecast_read"], (station, day))
+                    if cutoff is None or _utc_naive(row.forecast_origin_utc) <= cutoff)
         if len(rows) >= limit:
             break
     rows.sort(key=lambda row: (row["forecast_origin_utc"], row["horizon_step"]))
@@ -782,14 +788,17 @@ def read_renewable_actuals(station: str, limit: int = 20000,
         anchor = cutoff or (pointer.latest_timestamp if pointer else None)
         if anchor is None:
             continue
+        kind_rows = []
         for month in _recent_months(_utc_naive(anchor), months):
             for item in session.execute(_PREPARED["renewable_actual_read"], (station, kind, month)):
                 obj = dict(item._asdict())
                 if cutoff and _utc_naive(obj["utc_timestamp"]) > cutoff:
                     continue
-                rows.append(obj)
-            if len(rows) >= 2 * max(1, limit):
+                kind_rows.append(obj)
+            if len(kind_rows) >= max(1, limit // 2):
                 break
+        kind_rows.sort(key=lambda row: _utc_naive(row["utc_timestamp"]))
+        rows.extend(kind_rows[-max(1, limit // 2):])
     rows.sort(key=lambda r: _utc_naive(r["utc_timestamp"]))
     return _iso_rows(rows[-max(1, int(limit)):], ("utc_timestamp",))
 

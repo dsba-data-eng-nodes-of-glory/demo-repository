@@ -4,93 +4,158 @@ from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit.components.v1 import html as component_html
+
+from dashboard.monitoring_chart import ACTUAL_COLOR, FORECAST_COLOR, apply_monitoring_axes, mark_now, render_initializing
+from dashboard.monitoring_progress import eligible_forecast, forecast_cursor, timeline_is_live, utc
+from dashboard.monitoring_units import interval_unit_label, unit_factor
 
 METRICS = {
     "demand_mw": ("Demand", "MW"),
     "solar_mwh": ("Solar", "MWh"),
     "wind_mwh": ("Wind Energy", "MWh"),
-    "residual_mwh": ("Residual load", "MWh"),
+    "residual_mwh": ("Residual Load", "MWh"),
 }
-CLOCK_HTML = """
-<style>
-body { margin:0; font:14px system-ui,sans-serif; text-align:right; color:#90a8c2; }
-strong { color:#38bdf8; font-variant-numeric:tabular-nums; }
-</style>
-<span>Live clock · UTC </span><strong id="clock"></strong>
-<script>
-const clock = document.getElementById("clock");
-function renderClock() { clock.textContent = new Date().toISOString().slice(11, 19); }
-renderClock();
-setInterval(renderClock, 1000);
-</script>
-"""
 
 
-def show_clock() -> None:
-    if hasattr(st, "iframe"):
-        st.iframe(CLOCK_HTML, height=34)
-    else:
-        component_html(CLOCK_HTML, height=34)
+def _covered(row: dict, metric: str, leaf_count: int) -> bool:
+    point = row.get(metric) or {}
+    return point.get("value") is not None and point.get("reporting") == leaf_count
 
 
-def _trace(rows: list[dict], metric: str, forecast: bool) -> go.Scatter:
-    points = [row[metric] for row in rows]
-    completeness = ["Complete" if point["reporting"] == point["expected"] else "Partial" for point in points]
-    return go.Scatter(
-        x=[row["utc_timestamp"] for row in rows],
-        y=[point["value"] for point in points], mode="lines+markers",
-        name="Forecast sum" if forecast else "Actual sum", connectgaps=False,
-        line={"color": "#fb923c" if forecast else "#38bdf8", "dash": "dash" if forecast else "solid"},
-        marker={
-            "color": ["#fbbf24" if status == "Partial" else "#fb923c" if forecast else "#38bdf8"
-                      for status in completeness],
-            "size": [8 if status == "Partial" else 4 for status in completeness],
-        },
-        customdata=[(status, point["reporting"], point["expected"]) for status, point in zip(completeness, points)],
-        hovertemplate="%{x|%d %b %H:%M UTC}<br>%{y:,.2f}<br>%{customdata[0]} · "
-                      "%{customdata[1]}/%{customdata[2]} substations<extra></extra>",
-    )
+def group_cursor(payload: dict, metric: str, include_forecasts: bool) -> pd.Timestamp | None:
+    """Use the moving shared observation or the matching complete forecast."""
+    count = payload["leaf_count"]
+    actuals = {utc(row["utc_timestamp"]) for row in payload.get("actuals", []) if _covered(row, metric, count)}
+    actuals.discard(None)
+    latest = max(actuals, default=None)
+    start = payload.get("replay_start_utc")
+    if not include_forecasts:
+        return eligible_forecast(latest, latest, start)
+    origin = utc((payload.get("forecast_origins_utc") or {}).get(metric))
+    if origin is None or origin not in actuals:
+        return None
+    records = [
+        {"forecast_timestamp_utc": row["utc_timestamp"], "forecast_origin_utc": origin}
+        for row in payload.get("forecasts", []) if _covered(row, metric, count)
+    ]
+    return forecast_cursor(records, latest, start, payload["horizon_steps"], payload["interval_minutes"])
 
 
-def render_group(payload: dict, node: dict, metric: str) -> None:
-    label, unit = METRICS[metric]
-    actuals = payload.get("actuals", [])
-    forecasts = payload.get("forecasts", [])
+def build_group_chart(payload: dict, node_id: str, metric: str, cursor: pd.Timestamp, *,
+                      history_hours: int, include_forecasts: bool, display_unit: str) -> go.Figure:
+    label, source_unit = METRICS[metric]
+    interval = payload["interval_minutes"]
+    suffix = interval_unit_label(display_unit, interval)
+    factor = unit_factor(source_unit, display_unit, interval)
     leaf_count = payload["leaf_count"]
-    origin = payload.get("forecast_origin_utc")
-    latest = actuals[-1] if actuals else None
-    point = latest[metric] if latest else {"value": None, "reporting": 0}
-    st.subheader(f"{node['name']} · {label}")
-    col1, col2, col3 = st.columns(3)
-    suffix = f"{unit} / {payload['interval_minutes']} min" if unit == "MWh" else unit
-    value = "—" if point["value"] is None else f"{point['value']:,.2f} {suffix}"
-    col1.metric("Latest observed total", value)
-    coverage = "Complete" if point["reporting"] == leaf_count else "Partial" if point["reporting"] else "Waiting"
-    col2.metric("Registered substations reporting", f"{point['reporting']} / {leaf_count}", coverage, delta_color="off")
-    col3.metric("Latest interval (UTC)", pd.Timestamp(latest["utc_timestamp"]).strftime("%d %b %H:%M") if latest else "—")
-    if origin and any(row[metric]["value"] is not None for row in forecasts):
-        st.caption(f"Forecast origin · {pd.Timestamp(origin):%d %b %H:%M UTC}")
-    if not payload.get("forecast_compatible", True):
+    chart_start = cursor - pd.Timedelta(hours=history_hours)
+    actuals = [(stamp, row[metric]) for row in payload.get("actuals", [])
+               if (stamp := utc(row["utc_timestamp"])) is not None and chart_start <= stamp <= cursor]
+    hover = "%{x|%d %b %H:%M UTC}<br>%{y:,.2f} " + suffix
+    chart = go.Figure()
+    chart.add_trace(go.Scatter(
+        x=[stamp for stamp, _ in actuals],
+        y=[point["value"] * factor if point["value"] is not None and point["reporting"] == leaf_count else None
+           for _, point in actuals],
+        mode="lines", name=f"Actual {label.lower()}", line=dict(color=ACTUAL_COLOR, width=3.5),
+        connectgaps=False, hovertemplate=hover + "<extra></extra>",
+    ))
+    partial = [(stamp, point) for stamp, point in actuals
+               if point["value"] is not None and 0 < point["reporting"] < leaf_count]
+    if partial:
+        chart.add_trace(go.Scatter(
+            x=[stamp for stamp, _ in partial], y=[point["value"] * factor for _, point in partial],
+            mode="markers", name="Partial actual coverage", visible="legendonly",
+            marker=dict(color="#fbbf24", size=7),
+            customdata=[(point["reporting"], leaf_count) for _, point in partial],
+            hovertemplate=hover + "<br>%{customdata[0]}/%{customdata[1]} substations<extra></extra>",
+        ))
+    chart_end = cursor
+    if include_forecasts:
+        forecast = [(utc(row["utc_timestamp"]), row[metric]["value"] * factor)
+                    for row in payload.get("forecasts", []) if _covered(row, metric, leaf_count)]
+        anchor = next((point["value"] * factor for stamp, point in actuals
+                       if stamp == cursor and point["reporting"] == leaf_count), None)
+        if anchor is not None:
+            forecast.insert(0, (cursor, anchor))
+        if forecast:
+            chart_end = forecast[-1][0]
+            chart.add_trace(go.Scatter(
+                x=[stamp for stamp, _ in forecast], y=[value for _, value in forecast],
+                mode="lines", name="Forecast", line=dict(color=FORECAST_COLOR, width=3.5, dash="dash"),
+                connectgaps=False, hovertemplate=hover + "<extra></extra>",
+            ))
+    mark_now(chart, cursor)
+    ylabel = "Electricity demand" if metric == "demand_mw" else label
+    apply_monitoring_axes(chart, chart_start, chart_end, history_hours, f"{ylabel} ({suffix})",
+                          display_unit, f"hierarchy:{node_id}:{metric}:{history_hours}:{include_forecasts}")
+    return chart
+
+
+def render_group(
+    payload: dict, node: dict, metric: str | None = None, *,
+    progress: dict, history_hours: int, include_forecasts: bool = True,
+    show_forecast_table: bool = False, display_unit: str = "MWh",
+) -> None:
+    st.subheader(node["name"])
+    leaf_count = payload["leaf_count"]
+    substations = payload.get("substations", [])
+    edges = [stamp for row in substations if (stamp := utc(row.get("latest_demand_utc"))) is not None]
+    if len(edges) == leaf_count and len(edges) > 1:
+        lag = max(edges) - min(edges)
+        if lag >= pd.Timedelta(minutes=payload["interval_minutes"]):
+            st.caption(f"Substation replay times differ by {lag}. The charts align to the slowest station.")
+    if include_forecasts and not payload.get("forecast_compatible", True):
         st.caption("A common forecast horizon is needed to sum forecasts for this group.")
-    traces = [_trace(rows, metric, is_forecast) for rows, is_forecast in ((actuals, False), (forecasts, True))
-              if any(row[metric]["value"] is not None for row in rows)]
-    if traces:
-        chart = go.Figure(traces)
-        chart.update_layout(
-            template="plotly_dark", height=430, hovermode="x unified",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,27,48,.50)",
-            xaxis_title="Time (UTC)", yaxis_title=f"{label} ({suffix})",
-            legend={"orientation": "h"}, uirevision=f"{node['id']}:{metric}",
-        )
-        st.plotly_chart(chart, use_container_width=True)
-    else:
-        st.info(f"Waiting for {label.lower()} readings from the registered substations.")
-    if metric == "residual_mwh":
-        st.caption("Residual load uses demand, solar and Wind Energy from the same substation and interval.")
+        include_forecasts = False
     if payload.get("recovery"):
-        progress = payload["recovery"]
-        st.caption(f"Demand recovery · {progress['processed']}/{progress['total']} Kafka records processed")
+        recovery = payload["recovery"]
+        st.caption(f"Demand recovery · {recovery['processed']}/{recovery['total']} Kafka records processed")
+
+    run = tuple(sorted((payload.get("predictor_runs") or {}).items()))
+    for name in (metric,) if metric else METRICS:
+        label, source_unit = METRICS[name]
+        cursor = group_cursor(payload, name, include_forecasts)
+        key = ("hierarchy", node["id"], name, include_forecasts)
+        if not timeline_is_live(progress, key, cursor, run):
+            detail = ("Waiting for a complete shared forecast and a newer aligned forecast origin."
+                      if include_forecasts else "Waiting for the next observation with complete substation coverage.")
+            render_initializing(f"{node['name']} {label}", detail,
+                                f"Shared interval · {cursor:%d %b %H:%M UTC}" if cursor is not None
+                                else f"Demand readings received from {len(edges)}/{leaf_count} substations.")
+            continue
+        _render_metric(payload, node["id"], name, cursor, history_hours, include_forecasts,
+                       show_forecast_table, display_unit, label, source_unit)
+
     with st.expander("Substation reporting details"):
         if st.checkbox("Show latest demand by substation", key=f"reporting_{node['id']}"):
-            st.dataframe(payload["substations"], use_container_width=True, hide_index=True)
+            st.dataframe(substations, use_container_width=True, hide_index=True)
+
+
+def _render_metric(payload, node_id, metric, cursor, history_hours, include_forecasts,
+                   show_forecast_table, display_unit, label, source_unit):
+    st.subheader(f"{label} · actual vs forecast" if include_forecasts else f"{label} · actual")
+    interval = payload["interval_minutes"]
+    factor = unit_factor(source_unit, display_unit, interval)
+    count = payload["leaf_count"]
+    latest = next((row[metric]["value"] for row in payload["actuals"]
+                   if utc(row["utc_timestamp"]) == cursor and _covered(row, metric, count)), None)
+    forecast_rows = [row for row in payload.get("forecasts", []) if _covered(row, metric, count)] if include_forecasts else []
+    values = [row[metric]["value"] for row in forecast_rows]
+    summary = (
+        ("Latest actual", latest),
+        ("Next forecast", values[0] if values else None),
+        ("Forecast peak", max(values) if values else None),
+        ("Forecast average", sum(values) / len(values) if values else None),
+    )
+    for (caption, value), column in zip(summary, st.columns(4, gap="small")):
+        column.metric(caption, "—" if value is None else f"{value * factor:,.2f} {display_unit}")
+    if include_forecasts:
+        st.caption(f"Forecast origin · {cursor:%d %b %H:%M UTC}")
+    chart = build_group_chart(payload, node_id, metric, cursor, history_hours=history_hours,
+                              include_forecasts=include_forecasts, display_unit=display_unit)
+    st.plotly_chart(chart, use_container_width=True, key=f"hierarchy:{node_id}:{metric}")
+    if show_forecast_table and forecast_rows:
+        suffix = interval_unit_label(display_unit, interval)
+        st.dataframe([{"Forecast time (UTC)": row["utc_timestamp"], f"{label} ({suffix})": row[metric]["value"] * factor}
+                      for row in forecast_rows], use_container_width=True, hide_index=True)

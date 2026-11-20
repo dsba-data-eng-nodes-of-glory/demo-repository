@@ -101,8 +101,9 @@ def test_group_api_reads_operational_storage_without_opening_uploads(tmp_path, m
         snapshot = client.get("/results/hierarchy", params=params).json()
         assert snapshot["leaf_count"] == 4
         assert snapshot["actuals"][0]["demand_mw"] == {"value": 100, "reporting": 4, "expected": 4}
-        assert snapshot["actuals"][-1]["utc_timestamp"] == "2026-10-01T00:15:00+00:00"
-        assert snapshot["actuals"][-1]["demand_mw"] == {"value": 60, "reporting": 3, "expected": 4}
+        assert snapshot["aligned_through_utc"] == "2026-10-01T00:00:00+00:00"
+        assert snapshot["actuals"][-1]["demand_mw"] == {"value": 100, "reporting": 4, "expected": 4}
+        assert snapshot["substations"][0]["latest_demand_utc"] == "2026-10-01T00:15:00+00:00"
 
         path = live_actuals_path(tmp_path, "demo-4")
         initialize(path, "demo-4-featured")
@@ -144,3 +145,96 @@ def test_onboarding_contract_creates_only_leaves_and_reuses_the_parent(monkeypat
         assert tree[0]["name"] == "Germany"
         assert tree[0]["leaf_count"] == 2
         assert set(state["stations"]) == {"sub-1", "sub-2"}
+
+
+def test_group_finds_shared_runs_after_fast_station_tail_has_moved_past_them(tmp_path, monkeypatch):
+    from src.storage.station_hierarchy import group_key
+
+    start = pd.Timestamp("2026-10-01T00:00:00Z")
+    step = pd.Timedelta(minutes=15)
+    stations = {}
+    for station, last, demand, unit in [("fast", 300, 40, "mw"), ("slow", 4, 8, "mwh_per_interval")]:
+        folder = tmp_path / "data" / "processed" / "stations" / station
+        folder.mkdir(parents=True)
+        entry = leaf("Country: Germany", unit)
+        entry.update(actuals_file=str(folder / "actuals.csv"), forecasts_file=str(folder / "forecasts.csv"),
+                     renewable_forecasts_file=str(folder / "renewable_forecasts.csv"), renewables={"enabled": True})
+        stations[station] = entry
+        # Each demand offset is an interval when a real observation was saved.
+        actuals = [{"station_id": station, "utc_timestamp": (start + step * i).isoformat(), "actual_demand": demand}
+                   for i in range(last + 1)]
+        pd.DataFrame(actuals).to_csv(entry["actuals_file"], index=False)
+        generation = [
+            {"station_id": station, "utc_timestamp": row["utc_timestamp"], "generation_type": metric,
+             "actual_generation_mwh": value}
+            for row in actuals for metric, value in [("solar", 2), ("wind", 3)]
+        ]
+        pd.DataFrame(generation).to_csv(folder / "renewable_actuals.csv", index=False)
+        forecasts = []
+        renewable = []
+        for i in range(last + 1):
+            origin = start + step * i
+            for lead in range(1, 3):
+                base = {"station_id": station, "forecast_origin_utc": origin.isoformat(),
+                        "forecast_timestamp_utc": (origin + step * lead).isoformat(),
+                        "forecast_run_id": str(i)}
+                forecasts.append({**base, "predicted_demand": demand})
+                if station == "fast" or i < last:
+                    renewable.extend({**base, "generation_type": k, "predicted_generation_mwh": v}
+                                     for k, v in [("solar", 2), ("wind", 3)])
+        pd.DataFrame(forecasts).to_csv(entry["forecasts_file"], index=False)
+        pd.DataFrame(renewable).to_csv(entry["renewable_forecasts_file"], index=False)
+
+    monkeypatch.setattr(results_api, "ROOT", tmp_path)
+    monkeypatch.setattr(results_api, "storage_backend", lambda: "csv")
+    monkeypatch.setattr(results_api, "read_station_config", lambda: {"stations": stations})
+    group = results_api.hierarchy_results(group_key(["Germany"]), window=2, include_forecasts=True)
+    assert group["actuals"][-1]["demand_mw"] == {"value": 72, "reporting": 2, "expected": 2}
+    assert group["substations"][0]["latest_demand_utc"] == (start + step * 300).isoformat()
+    assert set(group["forecast_origins_utc"].values()) == {(start + step * 3).isoformat()}
+    assert len(group["forecasts"]) == 2
+    for point in group["forecasts"]:
+        assert [point[metric]["value"] for metric in ("demand_mw", "solar_mwh", "wind_mwh", "residual_mwh")] == [72, 4, 6, 8]
+
+
+def test_optional_group_seed_adds_pre_replay_history_without_advancing_live_clock(tmp_path, monkeypatch):
+    stations = {}
+    earlier = "2026-09-30T23:45:00Z"
+    start = "2026-10-01T00:00:00Z"
+    for index, station in enumerate(("a", "b"), 1):
+        entry = leaf("Germany", "mwh_per_interval")
+        entry.update(
+            expected_stream_start_utc=start, actuals_file=f"{station}_actuals.csv",
+            history_file=f"{station}_history.csv", renewables={
+                "enabled": True, "solar": {"train_file": f"{station}_solar.csv"},
+                "wind": {"train_file": f"{station}_wind.csv"},
+            },
+        )
+        stations[station] = entry
+        row = {**observation(0, 10 * index), "station_id": station}
+        pd.DataFrame([row]).to_csv(tmp_path / entry["actuals_file"], index=False)
+        for filename, column, value in (
+            (entry["history_file"], "demand", 20 * index),
+            (entry["renewables"]["solar"]["train_file"], "Photovoltaics [MWh]", index),
+            (entry["renewables"]["wind"]["train_file"], "Wind onshore [MWh]", 2 * index),
+        ):
+            pd.DataFrame({"utc_timestamp": [earlier, start], column: [value, 999]}).to_csv(
+                tmp_path / filename, index=False,
+            )
+
+    monkeypatch.setattr(results_api, "ROOT", tmp_path)
+    monkeypatch.setattr(results_api, "storage_backend", lambda: "csv")
+    monkeypatch.setattr(results_api, "read_station_config", lambda: {"stations": stations})
+    group = group_key(["Germany"])
+    without_seed = results_api.hierarchy_results(group, window=4, include_forecasts=False)
+    with_seed = results_api.hierarchy_results(group, window=4, include_forecasts=False, include_history=True)
+    assert len(without_seed["actuals"]) == 1
+    assert with_seed["actuals"][-1] == without_seed["actuals"][-1]
+    assert with_seed["aligned_through_utc"] == pd.Timestamp(start).isoformat()
+    assert with_seed["replay_start_utc"] == pd.Timestamp(start).isoformat()
+    point = with_seed["actuals"][0]
+    assert point["utc_timestamp"] == pd.Timestamp(earlier).isoformat()
+    assert [point[key]["value"] for key in ("demand_mw", "solar_mwh", "wind_mwh", "residual_mwh")] == [
+        240, 3, 6, 51,
+    ]
+    assert all(point[key]["reporting"] == 2 for key in ("demand_mw", "solar_mwh", "wind_mwh", "residual_mwh"))

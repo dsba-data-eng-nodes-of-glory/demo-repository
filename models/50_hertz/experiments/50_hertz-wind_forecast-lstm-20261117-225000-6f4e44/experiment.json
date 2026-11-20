@@ -1,0 +1,23 @@
+{
+  "experiment_id": "50_hertz-wind_forecast-lstm-20261117-225000-6f4e44",
+  "station": "50_hertz",
+  "algorithm": "lstm",
+  "component": "wind_forecast",
+  "parameters": {
+    "epochs": 18,
+    "batch_size": 8,
+    "hidden_size": 64,
+    "learning_rate": 0.001,
+    "patience": 4,
+    "max_train_origins": 256,
+    "max_validation_origins": 64,
+    "random_state": 42
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/50_hertz/50_hertz_wind_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "abe45edb6f230821f3af38fae70f3d51fa44e5fd0c1ec32c2534036d8ead5b7d",
+  "created_at": "2026-11-17T17:20:00Z"
+}

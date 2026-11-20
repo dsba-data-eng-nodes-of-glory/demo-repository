@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
+from dashboard.monitoring_units import interval_unit_label, unit_factor
+
 
 def _frame(payload: dict) -> pd.DataFrame:
     data = pd.DataFrame(payload.get('records') or [])
@@ -16,18 +18,23 @@ def _frame(payload: dict) -> pd.DataFrame:
     return data.dropna(subset=['timestamp_utc']).sort_values('timestamp_utc')
 
 
-def residual_figures(payload: dict) -> tuple[go.Figure,go.Figure]:
+def residual_figures(
+    payload: dict, *, display_unit: str = "MWh", interval_minutes: int = 15,
+) -> tuple[go.Figure,go.Figure]:
     """Forecast residual vs normal baseline and separate statistical/AE scores."""
     f = _frame(payload)
     level=go.Figure()
     score=go.Figure()
     if f.empty:return level,score
+    unit_text = interval_unit_label(display_unit, interval_minutes)
+    columns = ['residual_load', 'expected_residual_load']
+    f[columns] *= unit_factor("MWh", display_unit, interval_minutes)
     level.add_trace(go.Scatter(x=f['timestamp_utc'],y=f['residual_load'],name='Forecast residual load',
                                mode='lines',line=dict(color='#38bdf8',width=2.7)))
     level.add_trace(go.Scatter(x=f['timestamp_utc'],y=f['expected_residual_load'],name='Historical expected',
                                mode='lines',line=dict(color='#a78bfa',dash='dash',width=2)))
-    add_spike_intervals(level,payload,f,'timestamp_utc','residual_load')
-    level.update_layout(title='Residual Load Spike Detection · next 24 hours',yaxis_title='Residual load (source MWh/15 min)',
+    add_spike_intervals(level,payload,f,'timestamp_utc','residual_load',interval_minutes)
+    level.update_layout(title='Residual Load Spike Detection · next 24 hours',yaxis_title=f'Residual load ({unit_text})',
                         xaxis_title='Forecast target time (UTC)')
     for value,name,color in (('statistical_score','Statistical deviation','#38bdf8'),
                              ('autoencoder_score','Autoencoder score','#fbbf24')):

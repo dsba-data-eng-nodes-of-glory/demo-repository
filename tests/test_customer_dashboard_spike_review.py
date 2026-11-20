@@ -19,6 +19,8 @@ def test_pipeline_status_java_check_is_cached_for_dashboard(monkeypatch):
     assert first["runtime"] == second["runtime"]
     assert len(calls) == 1
     assert first["kafka_tcp_available"] is True
+    assert first["cassandra"]["backend"] in {"cassandra", "csv"}
+    assert isinstance(first["cassandra"]["available"], bool)
 
 
 def test_station_overview_uses_one_snapshot_and_lists_four_amprion_components(monkeypatch):

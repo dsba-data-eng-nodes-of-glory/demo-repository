@@ -21,9 +21,10 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
-from src.ingestion.station_weather import FORECAST_WEATHER_MODE, archive_training_span
+from src.ingestion.station_weather import FORECAST_WEATHER_MODE
 from src.ingestion.file_loader import load_station_csv
 from src.features.feature_schema import HISTORY_FEATURES, FUTURE_FEATURES
+from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
 from src.models.forecast_contract import station_forecast_contract
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -247,21 +248,23 @@ def main() -> None:
 
     frame = load_station_csv(csv_path, interval_minutes=interval_minutes)
     managed = bool(station.get("weather"))
+    with_test = bool(station.get("replay_start_date"))
+    if with_test:
+        cutoff = pd.Timestamp(station["replay_start_date"], tz="UTC")
+        frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
+    weather_columns = ["forecast_temperature"] if managed else []
     forecast_temperatures = None
     if managed:
-        frame = archive_training_span(frame, ["forecast_temperature"])
+        frame = archived_weather_history(frame, weather_columns, history_steps)
         forecast_temperatures = frame["forecast_temperature"].to_numpy(dtype=np.float32)
     timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True))
     demand = frame["demand"].to_numpy(dtype=np.float32)
     temperature = frame["temperature"].to_numpy(dtype=np.float32)
     n_rows = len(frame)
 
-    split_row = int(n_rows * (1.0 - args.validation_fraction))
-    if split_row <= history_steps + horizon_steps or n_rows - split_row < horizon_steps:
-        raise ValueError(
-            f"Not enough rows ({n_rows}) for history={history_steps}, horizon={horizon_steps} "
-            "and the selected chronological validation split."
-        )
+    origin_groups, split_row, validation_end_row = forecast_split_origins(
+        frame, history_steps, horizon_steps, interval_minutes, args.validation_fraction, with_test, weather_columns,
+    )
 
     demand_mean = float(np.mean(demand[:split_row]))
     demand_std = float(np.std(demand[:split_row]))
@@ -281,10 +284,8 @@ def main() -> None:
     history_matrix = np.column_stack([hist_map[name] for name in HISTORY_FEATURES]).astype(np.float32)
 
     # Each index is the first target row; its history ends immediately before it.
-    train_indices = np.arange(history_steps, split_row - horizon_steps + 1, dtype=np.int64)
-    val_indices = np.arange(split_row, n_rows - horizon_steps + 1, dtype=np.int64)
-    train_indices = sample_indices(train_indices, args.max_train_windows)
-    val_indices = sample_indices(val_indices, args.max_validation_windows)
+    train_indices = sample_indices(origin_groups[0], args.max_train_windows)
+    val_indices = sample_indices(origin_groups[1], args.max_validation_windows)
     if len(train_indices) < 1 or len(val_indices) < 1:
         raise ValueError("The selected data split produced no training or validation windows.")
 
@@ -366,6 +367,23 @@ def main() -> None:
     if best_state is None:
         raise RuntimeError("Training did not produce a finite validation metric; checkpoint not saved.")
 
+    test_metadata = {}
+    if with_test:
+        test_indices = sample_indices(origin_groups[2], args.max_validation_windows)
+        test_ds = WindowDataset(test_indices, demand_scaled, history_matrix, temperature,
+                                timestamps, temp_mean, temp_std, history_steps,
+                                horizon_steps, interval_minutes, forecast_temperatures)
+        model.load_state_dict(best_state)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        _, mae, rmse, wape, bias, _ = evaluate(model, test_loader, device, demand_mean, demand_std, criterion)
+        test_metadata = {
+            "test_start_utc": timestamps[validation_end_row].isoformat(),
+            "test_end_utc": timestamps[-1].isoformat(),
+            "test_origin_count": len(test_ds),
+            "test_metrics": {"mae_mw": mae, "rmse_mw": rmse, "wape_pct": wape,
+                             "bias_mw": bias, "matched_observations": len(test_ds) * horizon_steps},
+        }
+
     training_duration_seconds = time.perf_counter() - training_started
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -435,10 +453,12 @@ def main() -> None:
         },
         "horizon_metrics": best_horizon_metrics,
         "validation_start_utc": pd.Timestamp(timestamps[split_row]).isoformat(),
-        "validation_end_utc": pd.Timestamp(timestamps[-1]).isoformat(),
+        "validation_end_utc": timestamps[validation_end_row - 1].isoformat(),
         "training_start_utc": pd.Timestamp(timestamps[0]).isoformat(),
         "training_end_utc": pd.Timestamp(timestamps[split_row - 1]).isoformat(),
-        "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
+        "evaluation_protocol": "chronological_train_validation_test_sampled_origins_v1"
+        if with_test else "chronological_holdout_sampled_origins_v1",
+        **test_metadata,
         "training_history": history_log,
         "weather_source": "open_meteo_day_ahead" if managed else "uploaded_historical",
     }

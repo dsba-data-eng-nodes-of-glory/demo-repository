@@ -29,6 +29,38 @@ def post_json(path: str, payload: dict | None = None, timeout: int = 60):
     return response.json()
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def probe_cassandra() -> dict:
+    """Read the pipeline storage file when the API status has no Cassandra field.
+
+    Streamlit may be started with STORAGE_BACKEND=csv. That override applies
+    only to this dashboard process. Station predictors follow config/storage.yaml.
+    """
+    import socket
+    from pathlib import Path
+
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "config" / "storage.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    backend = str(cfg.get("backend") or "csv").strip().lower()
+    status = {"backend": backend, "available": False, "host": None, "port": None}
+    if backend != "cassandra":
+        return status
+    cass = cfg.get("cassandra") or {}
+    hosts = cass.get("hosts") or ["127.0.0.1"]
+    host = str(hosts[0])
+    port = int(cass.get("port") or 9042)
+    status["host"] = host
+    status["port"] = port
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            status["available"] = True
+    except OSError:
+        status["available"] = False
+    return status
+
+
 try:
     registry = get_json("/stations")
 except requests.RequestException as exc:
@@ -76,11 +108,21 @@ def render_live_pipeline_status(selected_station: str) -> None:
         return
     live_services = live.get("services", {})
     live_kafka = bool(live.get("kafka_tcp_available", False))
+    live_cassandra = live.get("cassandra")
+    if not isinstance(live_cassandra, dict) or "backend" not in live_cassandra:
+        live_cassandra = probe_cassandra()
+    cassandra_backend = str(live_cassandra.get("backend") or "csv")
+    cassandra_up = bool(live_cassandra.get("available"))
+    if cassandra_backend == "cassandra":
+        cassandra_chip = ("Cassandra", "Connected" if cassandra_up else "Offline", "good" if cassandra_up else "bad")
+    else:
+        cassandra_chip = ("Cassandra", "Not used", "neutral")
     live_model = bool(live.get("model_ready", False))
     render_status_strip([
         ("Station", str(live.get("lifecycle_status", "unknown")).replace("_", " ").title(),
          "good" if live.get("lifecycle_status") == "active" else "neutral"),
         ("Kafka", "Connected" if live_kafka else "Offline", "good" if live_kafka else "bad"),
+        cassandra_chip,
         ("Demand model", "Ready" if live_model else "Missing", "good" if live_model else "warn"),
         *[(name.title(), item.get("state", "running" if item.get("running") else "stopped").title(),
            "good" if item.get("running") else {"restarting": "warn", "failed": "bad"}.get(item.get("state"), "neutral"))
@@ -89,6 +131,13 @@ def render_live_pipeline_status(selected_station: str) -> None:
     ])
     if not live_kafka:
         st.warning("Kafka is not reachable at 127.0.0.1:9092. Start Kafka before resetting or activating this station.")
+    if cassandra_backend == "cassandra" and not cassandra_up:
+        cassandra_host = live_cassandra.get("host") or "127.0.0.1"
+        cassandra_port = live_cassandra.get("port") or 9042
+        st.warning(
+            f"Cassandra is not reachable at {cassandra_host}:{cassandra_port}. "
+            "Forecasts and actuals stay unavailable until the node is running."
+        )
     if live.get("initial_training_pending"):
         st.info("Initial model training is queued or running. Refresh the controls when it finishes.")
     elif not live_model:

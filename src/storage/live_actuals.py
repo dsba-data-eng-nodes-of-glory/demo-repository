@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 
@@ -49,7 +49,7 @@ def save_readings(path: Path, records: list[tuple[str, float]], position: int | 
             db.execute("UPDATE cursor SET next_offset = ? WHERE singleton = 1", (position,))
 
 
-def read_live_actuals(path: Path, limit: int) -> dict:
+def read_live_actuals(path: Path, limit: int, end_time: str | None = None) -> dict:
     if not path.is_file():
         return {"records": [], "cursor": None, "recovery": None, "first_timestamp": None}
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.3)) as db:
@@ -59,9 +59,17 @@ def read_live_actuals(path: Path, limit: int) -> dict:
         if cursor is None:
             return {"records": [], "cursor": None, "recovery": None, "first_timestamp": None}
         first_timestamp = db.execute("SELECT MIN(timestamp) FROM readings").fetchone()[0]
+        where = ""
+        params = (limit,)
+        if end_time:
+            cutoff = datetime.fromisoformat(end_time.replace("Z", "+00:00")).astimezone(timezone.utc)
+            # Both seconds-only and fractional UTC timestamps are stored.
+            after = cutoff + timedelta(microseconds=1)
+            where = "WHERE timestamp < ? "
+            params = (after.isoformat(timespec="microseconds").replace(".000000+00:00", "+00:00"), limit)
         rows = db.execute(
             "SELECT timestamp AS utc_timestamp, demand AS actual_demand, received_at "
-            "FROM readings ORDER BY timestamp DESC LIMIT ?", (limit,),
+            f"FROM readings {where}ORDER BY timestamp DESC LIMIT ?", params,
         ).fetchall()
     current, start, end = cursor
     recovery = None

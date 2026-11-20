@@ -1,0 +1,23 @@
+{
+  "experiment_id": "50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7",
+  "station": "50_hertz",
+  "algorithm": "lstm",
+  "component": "solar_forecast",
+  "parameters": {
+    "epochs": 18,
+    "batch_size": 8,
+    "hidden_size": 64,
+    "learning_rate": 0.001,
+    "patience": 4,
+    "max_train_origins": 256,
+    "max_validation_origins": 64,
+    "random_state": 42
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/50_hertz/50_hertz_solar_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "690bbebdf88291c9c26feb7bf55511852cfe711035ab3b9bb0a2d9bae7598d90",
+  "created_at": "2026-11-17T17:14:41Z"
+}

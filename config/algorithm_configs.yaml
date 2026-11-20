@@ -104,7 +104,7 @@ anomaly_algorithms:
     train_stride: 24
     stat_quantile: 0.99
     ae_quantile: 0.99
-    validation_fraction: 0.10
+    validation_fraction: 0.1
     seed: 42
     num_threads: 2
     train_fraction: 0.8

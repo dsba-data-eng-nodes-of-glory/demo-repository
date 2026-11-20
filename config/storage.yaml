@@ -1,6 +1,6 @@
-# Keep CSV as the default until Cassandra has been started and verified.
-# Change backend to cassandra to activate the Cassandra implementation.
-backend: csv
+# Operational reads and writes use the local Cassandra node.
+# Set backend to csv to fall back to the station CSV files.
+backend: cassandra
 
 cassandra:
   hosts:

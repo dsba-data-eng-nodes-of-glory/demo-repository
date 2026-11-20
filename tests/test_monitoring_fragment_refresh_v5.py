@@ -26,4 +26,4 @@ def test_monitoring_keeps_two_second_refresh_option():
 
 def test_demand_actual_fetch_keeps_72_hour_chart_and_24_hour_context_buffer():
     source = (ROOT / "dashboard" / "pages" / "monitoring.py").read_text(encoding="utf-8")
-    assert 'actual_params = {"station": station, "limit": 600}' in source
+    assert '"limit": 600, "recent_only": True' in source

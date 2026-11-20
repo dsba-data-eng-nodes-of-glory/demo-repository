@@ -8,8 +8,8 @@ from src.models.model_registry import get_experiment
 
 DEFAULT_MODELS = {
     "demand_forecast": "dense_nn",
-    "solar_forecast": "dense_nn",
-    "wind_forecast": "dense_nn",
+    "solar_forecast": "lstm",
+    "wind_forecast": "lstm",
     "residual_anomaly": "dense_autoencoder",
 }
 PENDING = {"queued", "running"}

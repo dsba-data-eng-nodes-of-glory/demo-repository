@@ -1,0 +1,28 @@
+{
+  "experiment_id": "50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6",
+  "station": "50_hertz",
+  "algorithm": "dense_autoencoder",
+  "component": "residual_anomaly",
+  "parameters": {
+    "epochs": 80,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "hidden_dim": 256,
+    "bottleneck_dim": 32,
+    "patience": 5,
+    "train_stride": 24,
+    "stat_quantile": 0.99,
+    "ae_quantile": 0.99,
+    "validation_fraction": 0.1,
+    "seed": 42,
+    "num_threads": 2,
+    "train_fraction": 0.8
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/50_hertz/50_hertz_residual_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "12cf24c3b60c2b57707a53015252c75e9b57478f453a0a1df398bf73772e25fa",
+  "created_at": "2026-11-17T16:14:05Z"
+}

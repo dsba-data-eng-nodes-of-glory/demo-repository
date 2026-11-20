@@ -8,3 +8,7 @@ java_home: "C:/Program Files/Microsoft/jdk-17.0.20.101-hotspot"
 shuffle_partitions: 2
 kafka_connector: null  # Auto-match connector version/Scala binary to installed PySpark
 max_offsets_per_trigger: 500  # Bound local micro-batch work and Kafka offset fetches
+shared_worker: true   # One Spark JVM, with a separate query and checkpoint per station.
+driver_memory: 640m
+ui_enabled: false
+trigger_interval: "1 second"

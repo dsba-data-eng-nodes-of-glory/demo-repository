@@ -1,0 +1,22 @@
+{
+  "experiment_id": "50_hertz-demand_forecast-dense_nn-20261117-214217-50ee1e",
+  "station": "50_hertz",
+  "algorithm": "dense_nn",
+  "component": "demand_forecast",
+  "parameters": {
+    "hidden_layer_sizes": "128,64",
+    "max_iter": 160,
+    "learning_rate_init": 0.001,
+    "alpha": 0.0001,
+    "random_state": 42,
+    "max_train_origins": 240,
+    "max_validation_origins": 60
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/50_hertz/50_hertz_demand_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "19e4148a0f99a5acf15c7bbe31c6a6ceb361534bf954a4d18ac16883559543c3",
+  "created_at": "2026-11-17T16:12:17Z"
+}

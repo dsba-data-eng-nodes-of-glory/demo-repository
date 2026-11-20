@@ -17,12 +17,15 @@ import sys
 import tempfile
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from typing import Any
 
 import yaml
+
+from src.spark.control import read_control, write_control
 
 from scripts.station_replay_helper import (
     prepare_station_outputs,
@@ -37,14 +40,24 @@ LOG_DIR.mkdir(exist_ok=True)
 SPARK_CONFIG = ROOT / "config" / "spark.yaml"
 STATION_CONFIG = ROOT / "config" / "stations.yaml"
 KAFKA_CONFIG = ROOT / "config" / "kafka.yaml"
+STORAGE_CONFIG = ROOT / "config" / "storage.yaml"
 
 
 STATION_REGISTRY_LOCK = RLock()
+_REGISTRY_CACHE_LOCK = Lock()
+_REGISTRY_CACHE: tuple[tuple, dict] | None = None
 
 
 def read_station_config() -> dict[str, Any]:
-    with STATION_CONFIG.open(encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    global _REGISTRY_CACHE
+    path = STATION_CONFIG
+    with _REGISTRY_CACHE_LOCK:
+        stat = path.stat()
+        signature = (path, stat.st_mtime_ns, stat.st_size)
+        if _REGISTRY_CACHE is None or _REGISTRY_CACHE[0] != signature:
+            with path.open(encoding="utf-8") as handle:
+                _REGISTRY_CACHE = (signature, yaml.safe_load(handle) or {})
+        return deepcopy(_REGISTRY_CACHE[1])
 
 
 def write_station_config(config: dict[str, Any]) -> None:
@@ -81,6 +94,19 @@ def resolve_root_path(value: str | Path) -> Path:
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
+def _tail_log(path: Path, lines: int) -> str:
+    try:
+        with path.open("rb") as handle:
+            end = handle.seek(0, os.SEEK_END)
+            start = max(0, end - 128 * 1024)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            return "\n".join(handle.read().decode("utf-8", errors="replace").splitlines()[-lines:])
+    except FileNotFoundError:
+        return ""
+
+
 @dataclass
 class ServiceRestart:
     command: list[str]
@@ -111,6 +137,11 @@ class PipelineManager:
         # must never repeat that check for every station on every refresh.
         self._runtime_status_cache: dict[str, Any] | None = None
         self._runtime_status_cache_at = 0.0
+        self._cassandra_status_cache: dict[str, Any] | None = None
+        self._cassandra_status_cache_at = 0.0
+        self._java_version: tuple[Path, str] | None = None
+        self._spark_dir: Path | None = None
+        self._spark_requests: dict[str, str] = {}
 
     def get_runtime_environment(self) -> dict[str, Any]:
         env = os.environ.copy()
@@ -134,15 +165,18 @@ class PipelineManager:
             raise RuntimeError(f"Java executable not found: {java_exe}")
         env["JAVA_HOME"] = str(java_home_path)
         env["PATH"] = str(java_home_path / "bin") + os.pathsep + env.get("PATH", "")
-        result = subprocess.run([str(java_exe), "-version"], capture_output=True, text=True, timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError("Java version check failed: " + result.stderr)
+        cached_version = self._java_version
+        if cached_version is None or cached_version[0] != java_exe:
+            result = subprocess.run([str(java_exe), "-version"], capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                raise RuntimeError("Java version check failed: " + result.stderr)
+            self._java_version = cached_version = (java_exe, result.stderr + result.stdout)
         return {
             "env": env,
             "python_executable": str(python_exe),
             "java_home": str(java_home_path),
             "java_executable": str(java_exe),
-            "java_version": result.stderr + result.stdout,
+            "java_version": cached_version[1],
         }
 
     def kafka_available(self, host: str | None = None, port: int | None = None) -> bool:
@@ -160,6 +194,47 @@ class PipelineManager:
                 return True
         except OSError:
             return False
+
+    def cassandra_status(self) -> dict[str, Any]:
+        """Report whether the configured operational store is reachable.
+
+        The dashboard polls station status every few seconds. A TCP probe is
+        cached so a stopped Cassandra node cannot stall that refresh, and the
+        API process does not open a driver session just to paint the chip.
+        """
+        now = time.monotonic()
+        with self.lock:
+            cached = self._cassandra_status_cache
+            if cached is not None and now - self._cassandra_status_cache_at < 5.0:
+                return dict(cached)
+        from src.storage.forecast_store import storage_backend
+
+        backend = storage_backend()
+        status: dict[str, Any] = {
+            "backend": backend,
+            "available": False,
+            "host": None,
+            "port": None,
+        }
+        if backend == "cassandra":
+            cfg: dict[str, Any] = {}
+            if STORAGE_CONFIG.exists():
+                with STORAGE_CONFIG.open(encoding="utf-8") as handle:
+                    cfg = (yaml.safe_load(handle) or {}).get("cassandra") or {}
+            hosts = [host.strip() for host in os.getenv("CASSANDRA_CONTACT_POINTS", "").split(",") if host.strip()]
+            host = hosts[0] if hosts else str((cfg.get("hosts") or ["127.0.0.1"])[0])
+            port = int(os.getenv("CASSANDRA_PORT") or cfg.get("port") or 9042)
+            status["host"] = host
+            status["port"] = port
+            try:
+                with socket.create_connection((host, port), timeout=1):
+                    status["available"] = True
+            except OSError:
+                status["available"] = False
+        with self.lock:
+            self._cassandra_status_cache = dict(status)
+            self._cassandra_status_cache_at = time.monotonic()
+        return status
 
     @staticmethod
     def process_key(name: str, station: str | None = None) -> str:
@@ -278,6 +353,9 @@ class PipelineManager:
                     "retry_in_seconds": (max(0, round(service.next_attempt - time.monotonic()))
                                          if service is not None and service.next_attempt is not None else None),
                 }
+        shared_process = processes.get("spark_shared")
+        for station, state in self._shared_query_status(shared_process).items():
+            processes[self.process_key("spark", station)] = state
         now = time.monotonic()
         with self.lock:
             cached = self._runtime_status_cache
@@ -300,6 +378,7 @@ class PipelineManager:
             runtime = cached
         return {
             "kafka_tcp_available": self.kafka_available(),
+            "cassandra": self.cassandra_status(),
             "runtime": runtime,
             "processes": processes,
         }
@@ -319,6 +398,7 @@ class PipelineManager:
         return {
             "station": station,
             "kafka_tcp_available": snapshot["kafka_tcp_available"],
+            "cassandra": snapshot.get("cassandra") or {"backend": "csv", "available": False},
             "services": selected,
             "quality_consumer": snapshot["processes"].get("quality", {"running": False, "pid": None, "return_code": None}),
             "model_checkpoint": str(checkpoint),
@@ -336,8 +416,12 @@ class PipelineManager:
             existing = self.processes.get(key)
             if existing and existing.poll() is None:
                 return {"name": name, "station": station, "started": False, "message": "Already running", "pid": existing.pid}
-
-            runtime = {"env": os.environ.copy()} if name == "training" else self.get_runtime_environment()
+        runtime = (self.get_runtime_environment() if name in ("spark", "spark_shared")
+                   else {"env": os.environ.copy()})
+        with self.lock:
+            existing = self.processes.get(key)
+            if existing and existing.poll() is None:
+                return {"name": name, "station": station, "started": False, "message": "Already running", "pid": existing.pid}
             return self._spawn_locked(name, command, station, runtime)
 
     def _spawn_locked(self, name: str, command: list[str], station: str | None, runtime: dict) -> dict[str, Any]:
@@ -347,9 +431,14 @@ class PipelineManager:
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        env = runtime["env"]
+        if name == "predictor":
+            threads = os.getenv("ELECTRICITY_MODEL_THREADS", "1")
+            env = {**env, "OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads,
+                   "OPENBLAS_NUM_THREADS": threads, "NUMEXPR_NUM_THREADS": threads}
         try:
             process = subprocess.Popen(command, cwd=ROOT, stdout=log_handle,
-                                       stderr=subprocess.STDOUT, text=True, env=runtime["env"], **kwargs)
+                                       stderr=subprocess.STDOUT, text=True, env=env, **kwargs)
         except Exception:
             log_handle.close()
             raise
@@ -361,6 +450,10 @@ class PipelineManager:
         return {"name": name, "station": station, "started": True, "pid": process.pid, "log": str(log_path)}
 
     def stop(self, name: str, station: str | None = None) -> dict[str, Any]:
+        if name == "spark" and station is not None and (
+            station in self._spark_requests or station in self._shared_query_status()
+        ):
+            return self._stop_shared_query(station)
         key = self.process_key(name, station)
         with self.lock:
             self._supervised.pop(key, None)
@@ -370,19 +463,96 @@ class PipelineManager:
                 if handle:
                     handle.close()
                 return {"name": name, "station": station, "stopped": False, "message": "Not running"}
-            try:
-                if os.name == "nt":
-                    proc.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    proc.terminate()
-                proc.wait(timeout=10)
-            except Exception:
+        try:
+            if os.name == "nt":
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            if os.name == "nt" and name in ("spark", "spark_shared"):
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, timeout=10, check=False)
+            if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=5)
-            handle = self.log_handles.pop(key, None)
-            if handle:
-                handle.close()
-            return {"name": name, "station": station, "stopped": True}
+            proc.wait(timeout=5)
+        with self.lock:
+            if self.processes.get(key) is proc:
+                handle = self.log_handles.pop(key, None)
+                if handle:
+                    handle.close()
+        return {"name": name, "station": station, "stopped": True}
+
+    def _shared_query_status(self, process: dict | None = None) -> dict:
+        directory = self._spark_dir
+        if directory is None:
+            return {}
+        if process is None:
+            with self.lock:
+                child = self.processes.get("spark_shared")
+                if child and child.poll() is None:
+                    process = {"running": True, "state": "running", "pid": child.pid}
+                else:
+                    process = {"running": False, "state": "stopped", "pid": None}
+        try:
+            report = read_control(directory / "status.json") if process["running"] else {}
+        except OSError:
+            report = {}
+        reported = report.get("stations", {}) if report.get("pid") == process.get("pid") else {}
+        requested = self._spark_requests.copy()
+        states = {}
+        for station in requested.keys() | reported.keys():
+            item = reported.get(station, {})
+            state = "stopping" if station not in requested else (
+                item["state"] if item.get("token") == requested[station] else
+                ("starting" if process["running"] else process["state"])
+            )
+            states[station] = {
+                "running": state == "running", "state": state, "pid": process.get("pid"),
+                "return_code": process.get("return_code"), "shared_worker": True,
+            }
+            if item.get("error") and item.get("token") == requested.get(station):
+                states[station]["message"] = item["error"]
+        return states
+
+    def _start_shared_query(self, station: str) -> bool:
+        if self._spark_dir is None:
+            self._spark_dir = Path(tempfile.mkdtemp(prefix="electricity-spark-"))
+        directory = self._spark_dir
+        new = station not in self._spark_requests
+        if new:
+            self._spark_requests[station] = uuid.uuid4().hex
+        command = [sys.executable, "-u", "-m", "src.spark.streaming", "--control-dir", str(directory)]
+        try:
+            write_control(directory / "desired.json", self._spark_requests)
+            worker = self.start("spark_shared", command)
+            if worker["started"]:
+                self._supervise("spark_shared", command)
+            return new or worker["started"]
+        except Exception:
+            if new:
+                self._spark_requests.pop(station, None)
+                write_control(directory / "desired.json", self._spark_requests)
+            raise
+
+    def _stop_shared_query(self, station: str) -> dict:
+        directory = self._spark_dir
+        previous = self._spark_requests.pop(station, None)
+        try:
+            write_control(directory / "desired.json", self._spark_requests)
+        except OSError:
+            if previous is not None:
+                self._spark_requests[station] = previous
+            raise
+        if not self._spark_requests:
+            self.stop("spark_shared")
+        else:
+            deadline = time.monotonic() + 12
+            while station in self._shared_query_status() and time.monotonic() < deadline:
+                time.sleep(0.1)
+        pending = station in self._shared_query_status()
+        return {"name": "spark", "station": station, "stopped": not pending,
+                "message": "Shared Spark query is stopping" if pending else "Shared Spark query stopped"}
 
     def ensure_station_topics(self, station: str) -> dict[str, Any]:
         """Create missing station topics. Never deletes or truncates topics."""
@@ -558,8 +728,28 @@ class PipelineManager:
             return self._start_pipeline(station)
 
     def _start_pipeline(self, station: str | None = None) -> dict[str, Any]:
+        station = station or read_station_config().get("active_station")
+        commands, topics = self._prepare_pipeline(station)
+        started: list[str] = []
+        quality_command = self._quality_command()
+        try:
+            if quality_command and self.start("quality", quality_command).get("started"):
+                started.append("quality")
+            self._launch_services(station, commands, started)
+            self._activate_pipelines({station: commands}, quality_command)
+            return {"station": station, "started": started, "topics": topics, "status": self.station_status(station)}
+        except Exception:
+            self._stop_launched_services(station, started)
+            raise
+
+    @staticmethod
+    def _quality_command() -> list[str] | None:
+        if os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true":
+            return None
+        return [sys.executable, "-u", "-m", "src.quality.dlq_consumer"]
+
+    def _prepare_pipeline(self, station: str | None) -> tuple[list[tuple[str, list[str]]], dict[str, Any]]:
         config = read_station_config()
-        station = station or config.get("active_station")
         stations = config.get("stations", {})
         if station not in stations:
             raise ValueError(f"Station '{station}' is not configured.")
@@ -636,51 +826,153 @@ class PipelineManager:
                              "--delay", str(float(entry.get("stream_delay_seconds", 1.0))),
                              "--checkpoint-every", str(producer_checkpoint_every)],
             ))
-        started: list[str] = []
-        quality_command = [python, "-u", "-m", "src.quality.dlq_consumer"]
-        quality_external = os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true"
-        try:
-            if not quality_external:
-                result = self.start("quality", quality_command)
-                if result.get("started"):
-                    started.append("quality")
-                    time.sleep(2)
-            for name, command in commands:
-                with self.lock:
-                    watched = self._supervised.get(self.process_key(name, station))
-                    if watched is not None and watched.process is not None:
-                        if watched.process.poll() is None or (name == "producer" and watched.process.poll() == 0):
-                            continue
-                    # An explicit activation gives a failed service a fresh retry budget.
-                    previous = self._supervised.pop(self.process_key(name, station), None)
-                try:
-                    result = self.start(name, command, station)
-                except Exception:
-                    if previous is not None:
-                        with self.lock:
-                            self._supervised[self.process_key(name, station)] = previous
-                    raise
-                if result.get("started"):
+        return commands, topic_result
+
+    def _launch_services(
+        self, station: str, commands: list[tuple[str, list[str]]], started: list[str], *,
+        ready_file: Path | None = None,
+    ) -> None:
+        for name, command in commands:
+            if name == "spark" and "src.spark.streaming" in command and read_spark_config().get("shared_worker", True):
+                if self._start_shared_query(station):
                     started.append(name)
-                    time.sleep({"spark": 15, "predictor": 5, "producer": 2, "live_actuals": 0}[name])
-            registry = read_station_config()
-            registry["active_station"] = station
-            active_stations = set(registry.get("active_stations", []) or [])
+                continue
+            with self.lock:
+                key = self.process_key(name, station)
+                watched = self._supervised.get(key)
+                if watched is not None and watched.process is not None:
+                    code = watched.process.poll()
+                    if code is None or (name == "producer" and code == 0):
+                        continue
+                # An explicit activation gives a failed service a fresh retry budget.
+                previous = self._supervised.pop(key, None)
+            launch_command = command
+            if name == "producer" and ready_file is not None:
+                launch_command = [*command, "--group-ready-file", str(ready_file)]
+            try:
+                result = self.start(name, launch_command, station)
+            except Exception:
+                if previous is not None:
+                    with self.lock:
+                        self._supervised[key] = previous
+                raise
+            if result.get("started"):
+                started.append(name)
+
+    def _activate_pipelines(self, launches: dict[str, list[tuple[str, list[str]]]],
+                            quality_command: list[str] | None) -> None:
+        if not launches:
+            return
+        registry = read_station_config()
+        active_stations = set(registry.get("active_stations") or [])
+        for station in launches:
             active_stations.add(station)
-            registry["active_stations"] = sorted(active_stations)
-            registry["stations"][station]["enabled"] = True
-            registry["stations"][station]["status"] = "active"
-            registry["stations"][station]["topics_ready"] = True
-            write_station_config(registry)
+            registry["stations"][station].update(enabled=True, status="active", topics_ready=True)
+        if len(launches) == 1 or registry.get("active_station") not in active_stations:
+            registry["active_station"] = next(iter(launches))
+        registry["active_stations"] = sorted(active_stations)
+        write_station_config(registry)
+        for station, commands in launches.items():
             for name, command in commands:
-                self._supervise(name, command, station)
-            if not quality_external:
-                self._supervise("quality", quality_command)
-            return {"station": station, "started": started, "topics": topic_result, "status": self.station_status(station)}
-        except Exception:
-            for name in reversed(started):
-                self.stop(name, None if name == "quality" else station)
-            raise
+                # A later restart resumes directly from its durable cursor.
+                if name != "spark" or station not in self._spark_requests:
+                    self._supervise(name, command, station)
+        if quality_command:
+            self._supervise("quality", quality_command)
+
+    def _stop_launched_services(self, station: str, started: list[str]) -> None:
+        for name in reversed(started):
+            self.stop(name, None if name == "quality" else station)
+
+    def _wait_for_replay_group(self, ready_files: dict[str, Path], *, released: bool = False) -> dict[str, str]:
+        pending = dict(ready_files)
+        errors = {}
+        deadline = time.monotonic() + (15 if released else 75)
+        while pending:
+            with self.lock:
+                for station, ready_file in list(pending.items()):
+                    process = self.processes.get(self.process_key("producer", station))
+                    code = process.poll() if process is not None else -1
+                    if code is not None:
+                        pending.pop(station)
+                        if code != 0:
+                            errors[station] = f"CSV producer exited with code {code}. Check {self.log_path('producer', station).name}."
+                    elif ready_file.is_file() != released:
+                        pending.pop(station)
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        phase = "acknowledge the group start" if released else "finish CSV and Kafka startup"
+        errors.update({station: f"CSV producer did not {phase} before the timeout. Check the producer log."
+                       for station in pending})
+        return errors
+
+    def start_all_pipelines(self) -> dict[str, dict]:
+        """Activate registered stations and release their new CSV producers together."""
+        with self.lifecycle_lock, tempfile.TemporaryDirectory(prefix="electricity-start-") as location:
+            results: dict[str, dict] = {}
+            launches: dict[str, list[tuple[str, list[str]]]] = {}
+            started_by_station: dict[str, list[str]] = {}
+            ready_files: dict[str, Path] = {}
+            gate = Path(location)
+            quality_command = self._quality_command()
+            quality_started = False
+            completed = False
+            try:
+                stations = read_station_config().get("stations", {})
+                for slot, station in enumerate(sorted(stations)):
+                    started: list[str] = []
+                    try:
+                        commands, _ = self._prepare_pipeline(station)
+                        if quality_command and not launches:
+                            quality_started |= self.start("quality", quality_command).get("started", False)
+                        ready_file = gate / f"{slot}.ready"
+                        self._launch_services(station, commands, started, ready_file=ready_file)
+                    except Exception as exc:
+                        self._stop_launched_services(station, started)
+                        results[station] = {"status": "failed", "message": str(exc)}
+                        continue
+                    launches[station] = commands
+                    started_by_station[station] = started
+                    if "producer" in started:
+                        ready_files[station] = ready_file
+
+                errors = self._wait_for_replay_group(ready_files)
+                with self.lock:
+                    for station in launches:
+                        for service in ("spark", "predictor"):
+                            worker = self.processes.get(self.process_key(service, station))
+                            if worker is not None and (code := worker.poll()) is not None:
+                                errors.setdefault(station, f"{service.title()} exited with code {code}. "
+                                                  f"Check {self.log_path(service, station).name}.")
+                for station in errors:
+                    self._stop_launched_services(station, started_by_station.pop(station))
+                    launches.pop(station)
+                    ready_files.pop(station, None)
+                if ready_files:
+                    # One release timestamp is read by each waiting producer.
+                    marker = gate / "release.tmp"
+                    marker.write_text(str(time.time() + 0.3), encoding="ascii")
+                    marker.replace(gate / "release")
+                    release_errors = self._wait_for_replay_group(ready_files, released=True)
+                    for station in release_errors:
+                        self._stop_launched_services(station, started_by_station.pop(station))
+                        launches.pop(station)
+                    errors.update(release_errors)
+                results.update({station: {"status": "failed", "message": error} for station, error in errors.items()})
+                self._activate_pipelines(launches, quality_command)
+                results.update({
+                    station: {"status": "started" if started else "already_running", "services": started}
+                    for station, started in started_by_station.items()
+                })
+                completed = True
+                return {"stations": results}
+            finally:
+                if not completed:
+                    for station, started in started_by_station.items():
+                        self._stop_launched_services(station, started)
+                if quality_started and (not completed or not launches):
+                    self.stop("quality")
 
     def stop_pipeline(self, station: str | None = None) -> dict[str, Any]:
         with self.lifecycle_lock:
@@ -711,7 +1003,12 @@ class PipelineManager:
                     results["quality"] = self.stop("quality")
             return {"station": station, "results": results}
 
-        # Backwards-compatible global stop: stop all managed station processes.
+        # Global shutdown owns the shared worker as well as station processes.
+        if self._spark_dir is not None:
+            self._spark_requests.clear()
+            self.stop("spark_shared")
+            shutil.rmtree(self._spark_dir, ignore_errors=True)
+            self._spark_dir = None
         with self.lock:
             keys = list(self.processes.keys())
         for key in keys:
@@ -729,6 +1026,8 @@ class PipelineManager:
     def _assert_station_stopped(self, station: str) -> None:
         """Refuse destructive reset while this station has streaming services alive."""
         active = []
+        if station in self._spark_requests or station in self._shared_query_status():
+            active.append("shared Spark query")
         with self.lock:
             for service in self.SERVICE_NAMES:
                 proc = self.processes.get(self.process_key(service, station))
@@ -816,39 +1115,96 @@ class PipelineManager:
                     + (result.stderr or result.stdout).strip()
                 )
 
+    _KAFKA_TOOL_NAMES = {
+        "kafka-topics": ("kafka-topics.bat", "kafka-topics.sh", "kafka-topics"),
+        "kafka-delete-records": ("kafka-delete-records.bat", "kafka-delete-records.sh", "kafka-delete-records"),
+    }
+
+    @classmethod
+    def _kafka_tool_order(cls, tool: str) -> tuple[str, ...]:
+        names = cls._KAFKA_TOOL_NAMES[tool]
+        if os.name == "nt":
+            return names
+        return tuple(name for name in names if not name.endswith(".bat"))
+
+    @classmethod
+    def _directory_has_kafka_tools(cls, directory: Path) -> bool:
+        return all(
+            any((directory / name).is_file() for name in cls._kafka_tool_order(tool))
+            for tool in cls._KAFKA_TOOL_NAMES
+        )
+
+    @staticmethod
+    def _kafka_directory_options(base: Path) -> list[Path]:
+        options = [base]
+        if base.name.lower() != "windows":
+            options.extend((base / "bin" / "windows", base / "windows", base / "bin"))
+        return options
+
     def _kafka_cli_dir(self) -> Path:
         kafka_cfg = read_kafka_config()
         configured = kafka_cfg.get("kafka_cli_dir") or os.environ.get("KAFKA_HOME")
+        candidates: list[Path] = []
         if configured:
-            base = Path(configured).expanduser()
-            if base.name.lower() != "windows" and (base / "bin" / "windows").is_dir():
-                base = base / "bin" / "windows"
-            elif base.name.lower() != "windows" and (base / "windows").is_dir():
-                base = base / "windows"
+            base = Path(str(configured)).expanduser()
+            if not base.is_absolute():
+                base = ROOT / base
+            candidates.extend(self._kafka_directory_options(base))
+        elif os.name == "nt":
+            candidates.append(Path(r"C:\kafka_2.13-4.3.1\bin\windows"))
         else:
-            base = Path(r"C:\kafka_2.13-4.3.1\bin\windows")
-        if not base.is_absolute():
-            base = ROOT / base
-        base = base.resolve()
-        required = ("kafka-topics.bat", "kafka-delete-records.bat")
-        missing = [name for name in required if not (base / name).is_file()]
-        if missing:
-            raise FileNotFoundError(
-                "Kafka command-line tools were not found. Configure kafka_cli_dir "
-                "in config/kafka.yaml or set KAFKA_HOME. Expected folder: "
-                f"{base}; missing: {', '.join(missing)}"
-            )
-        if os.name != "nt":
-            raise RuntimeError("Dashboard Reset & Replay currently requires the Windows Kafka .bat tools.")
-        return base
+            for raw in (
+                "/opt/homebrew/opt/kafka/bin",
+                "/usr/local/opt/kafka/bin",
+                "/opt/kafka/bin",
+            ):
+                candidates.append(Path(raw))
+            for tool in ("kafka-topics", "kafka-topics.sh"):
+                found = shutil.which(tool)
+                if found:
+                    candidates.append(Path(found).resolve().parent)
+        searched: list[Path] = []
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in searched:
+                continue
+            searched.append(resolved)
+            if self._directory_has_kafka_tools(resolved):
+                return resolved
+        expected = ", ".join(str(path) for path in searched) or "(no candidate directories)"
+        required = ", ".join(
+            " or ".join(self._kafka_tool_order(tool)) for tool in self._KAFKA_TOOL_NAMES
+        )
+        raise FileNotFoundError(
+            "Kafka command-line tools were not found. Configure kafka_cli_dir "
+            "in config/kafka.yaml or set KAFKA_HOME. Expected folder: "
+            f"{expected}; missing: {required}"
+        )
+
+    def _kafka_script(self, tool: str) -> Path:
+        directory = self._kafka_cli_dir()
+        for name in self._kafka_tool_order(tool):
+            path = directory / name
+            if path.is_file():
+                return path
+        raise FileNotFoundError(f"Kafka tool {tool} was not found in {directory}.")
 
     @staticmethod
     def _run_bat(path: Path, args: list[str], timeout: int = 60) -> str:
-        command = subprocess.list2cmdline([str(path), *args])
+        if os.name == "nt":
+            command: str | list[str] = subprocess.list2cmdline([str(path), *args])
+            shell = True
+        else:
+            # Run the script directly so topic names are arguments, not shell text.
+            command = [str(path), *args]
+            shell = False
         result = subprocess.run(
             command,
             cwd=ROOT,
-            shell=True,
+            shell=shell,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -862,10 +1218,9 @@ class PipelineManager:
 
     def _ensure_reset_topics(self, station: str, raw_topic: str, featured_topic: str) -> dict[str, Any]:
         """Create missing topics and refuse partition layouts the reset cannot clear safely."""
-        cli = self._kafka_cli_dir()
         kafka_cfg = read_kafka_config()
         bootstrap = str(kafka_cfg.get("bootstrap_servers", "127.0.0.1:9092"))
-        topics_cli = cli / "kafka-topics.bat"
+        topics_cli = self._kafka_script("kafka-topics")
         listing = self._run_bat(topics_cli, ["--bootstrap-server", bootstrap, "--list"])
         existing = {line.strip() for line in listing.splitlines() if line.strip()}
         created: list[str] = []
@@ -992,7 +1347,6 @@ class PipelineManager:
 
     def _clear_topic_records(self, raw_topic: str, featured_topic: str) -> str:
         """Advance both selected topic log-start offsets to their current high watermarks."""
-        cli = self._kafka_cli_dir()
         bootstrap = str(read_kafka_config().get("bootstrap_servers", "127.0.0.1:9092"))
         payload = {
             "partitions": [
@@ -1010,7 +1364,7 @@ class PipelineManager:
                 json.dump(payload, handle, indent=2)
                 temp_path = Path(handle.name)
             output = self._run_bat(
-                cli / "kafka-delete-records.bat",
+                self._kafka_script("kafka-delete-records"),
                 ["--bootstrap-server", bootstrap, "--offset-json-file", str(temp_path)],
                 timeout=120,
             )
@@ -1504,10 +1858,11 @@ class PipelineManager:
     def read_log(self, name: str, station: str | None = None, lines: int = 100) -> str:
         if name not in self.SERVICE_NAMES:
             raise ValueError("Unknown process log. Use spark, predictor, producer, training or live_actuals.")
-        path = self.log_path(name, station)
-        if not path.exists():
-            return ""
-        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])
+        if name == "spark" and station and read_spark_config().get("shared_worker", True):
+            shared_log = self.log_path("spark_shared")
+            if shared_log.exists():
+                return _tail_log(shared_log, lines)
+        return _tail_log(self.log_path(name, station), lines)
 
 
 manager = PipelineManager()

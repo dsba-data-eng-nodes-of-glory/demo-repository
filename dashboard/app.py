@@ -200,6 +200,29 @@ section_title(
 if backend_ok and station_ids:
     if st.button("Refresh station cards"):
         st.rerun()
+    if st.button("Start all stations", type="primary", help="Start the registered stations together."):
+        try:
+            with st.spinner("Preparing stations for a shared start…"):
+                result = api_post("/pipeline/start-all", timeout=240)
+            st.session_state["station_group_start"] = result["stations"]
+            st.rerun()
+        except requests.RequestException as exc:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            st.error(f"Could not start all stations. {detail}")
+
+    batch = st.session_state.pop("station_group_start", None)
+    if batch is not None:
+        started = sum(item["status"] == "started" for item in batch.values())
+        active = sum(item["status"] == "already_running" for item in batch.values())
+        failed = len(batch) - started - active
+        message = f"Started {started} · Already running {active} · Could not start {failed}"
+        if failed:
+            st.warning(message)
+            for station_id, item in batch.items():
+                if item["status"] == "failed":
+                    st.text(f"{stations.get(station_id, {}).get('display_name') or station_id} · {item['message']}")
+        else:
+            st.success(message)
     station_ids.sort(key=lambda key: station_label(key, stations[key]).casefold())
     page_size = 12
     pages = (len(station_ids) + page_size - 1) // page_size

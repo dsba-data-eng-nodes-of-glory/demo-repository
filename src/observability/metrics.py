@@ -23,11 +23,27 @@ except ImportError:  # metrics are optional for local development
     LAST_EVENT_TIMESTAMP = STORAGE_UP = None
 
 
-def start_metrics_server(port: int, enabled: bool = True) -> bool:
+def start_metrics_server(port: int, enabled: bool = True) -> int | None:
+    """Start Prometheus on the requested port, or a nearby free port.
+
+    A port conflict must not stop forecasting. Metrics stay optional when no
+    candidate port can be bound.
+    """
     global _STARTED
     if not enabled or _STARTED or EVENTS_RECEIVED is None:
-        return False
-    start_http_server(int(port), addr="0.0.0.0")
-    _STARTED = True
-    LOG.info("Prometheus metrics available on :%s/metrics", port)
-    return True
+        return None
+    base = int(port)
+    candidates = [base + offset for offset in (0, 100, 200, 300) if 1024 <= base + offset <= 65535]
+    last_error: OSError | None = None
+    for candidate in candidates:
+        try:
+            start_http_server(candidate, addr="0.0.0.0")
+        except OSError as exc:
+            last_error = exc
+            LOG.warning("Prometheus metrics port %s is unavailable (%s).", candidate, exc)
+            continue
+        _STARTED = True
+        LOG.info("Prometheus metrics available on :%s/metrics", candidate)
+        return candidate
+    LOG.warning("Prometheus metrics disabled because no port was available: %s", last_error)
+    return None

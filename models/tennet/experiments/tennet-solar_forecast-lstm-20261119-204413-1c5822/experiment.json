@@ -1,0 +1,23 @@
+{
+  "experiment_id": "tennet-solar_forecast-lstm-20261119-204413-1c5822",
+  "station": "tennet",
+  "algorithm": "lstm",
+  "component": "solar_forecast",
+  "parameters": {
+    "epochs": 18,
+    "batch_size": 8,
+    "hidden_size": 64,
+    "learning_rate": 0.001,
+    "patience": 4,
+    "max_train_origins": 256,
+    "max_validation_origins": 64,
+    "random_state": 42
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/tennet/tennet_solar_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "b63fc72ec6a319c0e1391c3d8bff9ca1f795ab14cebb602f551b6075cb1adc93",
+  "created_at": "2026-11-19T15:14:13Z"
+}

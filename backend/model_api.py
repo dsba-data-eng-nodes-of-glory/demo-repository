@@ -19,6 +19,7 @@ from backend.pipeline_manager import (
     write_station_config,
 )
 from src.models.model_registry import get_experiment, list_experiments, upsert_experiment
+from backend.onboarding_training import DEFAULT_MODELS
 from backend.model_deletion import can_delete, delete_inactive_experiment, station_references
 from backend.training_data import (
     station_component_state, registered_source, list_sources, load_source,
@@ -175,6 +176,7 @@ def model_components(station: str | None = None):
         source_info = None
     return {
         "component_algorithms": config.get("component_algorithms", {}),
+        "component_default_algorithms": DEFAULT_MODELS,
         "enabled": enabled,
         "sources": source_info,
         "legacy_station": bool(station and not read_station_config().get("stations", {}).get(station, {}).get("model_components")),

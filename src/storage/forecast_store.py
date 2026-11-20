@@ -234,16 +234,16 @@ def append_actuals(
         return saved
 
 
-def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
+def read_actuals(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
     if storage_backend() == "cassandra":
         from src.storage.cassandra_store import read_actuals as read
-        return read(station, limit)
+        return read(station, limit, end_time=end_time) if end_time else read(station, limit)
     return []
 
-def read_forecasts(station: str, limit: int = 5000) -> list[dict[str, Any]]:
+def read_forecasts(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
     if storage_backend() == "cassandra":
         from src.storage.cassandra_store import read_forecasts as read
-        return read(station, limit)
+        return read(station, limit, end_time=end_time) if end_time else read(station, limit)
     return []
 
 def read_latest_forecast(station: str) -> list[dict[str, Any]]:

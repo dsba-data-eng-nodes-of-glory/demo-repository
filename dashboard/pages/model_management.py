@@ -113,7 +113,7 @@ def _parameter_widget(label: str, value, key: str, parameter_name: str):
 COMPONENT_LABELS = {
     "demand_forecast": "Demand forecasting",
     "solar_forecast": "Solar forecasting",
-    "wind_forecast": "Wind forecasting",
+    "wind_forecast": "Wind Energy forecasting",
     "residual_anomaly": "Residual Load anomaly autoencoder",
 }
 
@@ -142,8 +142,10 @@ def render_model_lab(station: str, station_label: str, selected_component: str,
         return
     st.markdown(f"**Station:** {station_label} (`{station}`) · **Component:** {COMPONENT_LABELS[selected_component]}")
     algorithm_labels = component_payload.get("labels", {})
+    preferred = (component_payload.get("component_default_algorithms") or {}).get(selected_component)
     algo = st.selectbox(
         "Training algorithm", algorithms,
+        index=algorithms.index(preferred) if preferred in algorithms else 0,
         format_func=lambda key: algorithm_labels.get(key, {}).get("label", key.upper()),
         key=f"training_algorithm_{station}_{selected_component}",
     )

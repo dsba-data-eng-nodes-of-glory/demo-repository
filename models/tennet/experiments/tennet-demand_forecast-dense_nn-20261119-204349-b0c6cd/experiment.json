@@ -1,0 +1,22 @@
+{
+  "experiment_id": "tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd",
+  "station": "tennet",
+  "algorithm": "dense_nn",
+  "component": "demand_forecast",
+  "parameters": {
+    "hidden_layer_sizes": "128,64",
+    "max_iter": 160,
+    "learning_rate_init": 0.001,
+    "alpha": 0.0001,
+    "random_state": 42,
+    "max_train_origins": 240,
+    "max_validation_origins": 60
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/tennet/tennet_demand_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "20dff125dd6a3d9ad342133c17f0e84aa1f36315e10e3299cb4723d06a8112e7",
+  "created_at": "2026-11-19T15:13:49Z"
+}

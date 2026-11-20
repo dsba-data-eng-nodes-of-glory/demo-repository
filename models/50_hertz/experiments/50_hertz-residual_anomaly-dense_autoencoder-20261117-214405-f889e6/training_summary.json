@@ -1,0 +1,41 @@
+{
+  "schema": "residual_ae_v2_capacity",
+  "capacity_features": [
+    "solar_capacity_utilization",
+    "wind_capacity_utilization"
+  ],
+  "input": "C:\\Users\\hp\\Documents\\Nodes of Glory\\Version 4\\data\\raw\\stations\\50_hertz\\50_hertz_residual_training.csv",
+  "rows": 166464,
+  "feature_names": [
+    "residual_deviation",
+    "residual_ramp_30m",
+    "residual_ramp_1h",
+    "residual_change_24h",
+    "renewable_share",
+    "wind_change_1h",
+    "solar_change_1h",
+    "solar_capacity_utilization",
+    "wind_capacity_utilization",
+    "tod_sin",
+    "tod_cos",
+    "dow_sin",
+    "dow_cos",
+    "year_sin",
+    "year_cos"
+  ],
+  "fit_rows": 133171,
+  "validation_rows": 16646,
+  "calibration_rows": 16647,
+  "training_windows": 5541,
+  "earlystop_windows": 690,
+  "calibration_windows": 16647,
+  "screened_windows": 0,
+  "best_epoch": 80,
+  "best_validation_loss": 0.1827747424443563,
+  "statistical_threshold": 4.5018373516233785,
+  "autoencoder_threshold": 22.127550867557545,
+  "calibration_stage1_flags": 167,
+  "calibration_stage2_flags": 167,
+  "calibration_confirmed_flags": 22,
+  "note": "Unlabelled calibration quantiles, not verified precision/recall or grid-incident accuracy"
+}

@@ -21,7 +21,8 @@ import pandas as pd
 from fastapi import HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
+from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+from src.ingestion.station_weather import FORECAST_COLUMNS, station_weather
 from src.models.forecast_weather import ForecastWeatherUnavailable
 
 from src.ingestion.workbook_loader import (
@@ -216,7 +217,17 @@ def prepare_training_upload(upload: Path, component: str, interval: int, timesta
     if managed and component != "residual_anomaly":
         weather = station_weather(root, station, entry)
         weather.enrich({kind: frame})
-        frame = archive_training_span(frame, list(FORECAST_COLUMNS[kind].values()))
+        history = int(entry.get("history_steps") or 672) if kind == "demand" else 672
+        horizon = int(entry.get("horizon_steps") or 96) if kind == "demand" else 96
+        cutoff = entry.get("replay_start_date")
+        training = frame.loc[frame["utc_timestamp"] < pd.Timestamp(cutoff, tz="UTC")] if cutoff else frame
+        weather_columns = list(FORECAST_COLUMNS[kind].values())
+        eligible = archived_weather_history(training, weather_columns, history)
+        from backend.model_api import training_options_for
+        forecast_split_origins(
+            eligible, history, horizon, interval, training_options_for()["validation_fraction"],
+            bool(cutoff) or kind != "demand", weather_columns,
+        )
     _validate_values(component, frame, interval=interval, entry=entry)
     return frame
 

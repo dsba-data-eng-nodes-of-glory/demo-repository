@@ -10,6 +10,7 @@ import copy
 import json
 import math
 import time
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.ingestion.station_weather import archive_training_span
+from src.models.evaluation_splits import archived_weather_history, chronological_split_bounds, forecast_split_origins
 from src.models.model_registry import next_version, utc_now
 from src.models.training.amprion import solar_mlp_features as solar
 from src.models.training.amprion import solar_mlp_model
@@ -48,9 +49,7 @@ def load_frame(kind: str, path: Path) -> pd.DataFrame:
 
 
 def split_origins(n_rows: int, validation_fraction: float, *, max_train: int, max_validation: int):
-    test_fraction = 0.15
-    train_end = int(n_rows * (1 - validation_fraction - test_fraction))
-    val_end = int(n_rows * (1 - test_fraction))
+    train_end, val_end = chronological_split_bounds(n_rows, validation_fraction, with_test=True)
     train = np.arange(HISTORY, train_end - HORIZON + 1, dtype=np.int64)
     valid = np.arange(max(train_end, HISTORY), val_end - HORIZON + 1, dtype=np.int64)
     test = np.arange(max(val_end, HISTORY), n_rows - HORIZON + 1, dtype=np.int64)
@@ -138,7 +137,6 @@ def normalize_sequences(hist: np.ndarray, future: np.ndarray, stats: dict[str, A
 def _fit_torch(model, x_train, y_train, x_val, y_val, params: dict, *, sequence: bool):
     threads = max(1, min(4, int(params.get("num_threads", 2))))
     torch.set_num_threads(threads)
-    torch.manual_seed(int(params.get("random_state", 42)))
     bs = int(params.get("batch_size", 8 if sequence else 128))
     if sequence:
         train_loader = DataLoader(TensorDataset(*(torch.from_numpy(a) for a in (*x_train, y_train))),
@@ -229,6 +227,22 @@ def metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, float | int]
     }
 
 
+def wind_persistence_blend(predicted: np.ndarray, last_actual, settings: dict) -> np.ndarray:
+    """Weight the latest measured generation most heavily at short lead times."""
+    steps = np.arange(predicted.shape[-1], dtype=float)
+    decay = settings["decay_hours"] * 60 / INTERVAL
+    weight = settings["persistence_weight"] * np.exp(-steps / decay)
+    return np.maximum(0.0, (1 - weight) * settings["model_gain"] * predicted + weight * last_actual)
+
+
+def _calibrate_wind(y_valid: np.ndarray, predicted: np.ndarray, last_actual: np.ndarray) -> dict:
+    """Select an adjustment on the validation period, including the model alone."""
+    options = product((1.0, 0.9, 1.1, 0.8, 1.2, 1.3), (0.0, 0.25, 0.5, 0.75, 1.0), (1, 3, 6, 12, 24))
+    settings = (dict(model_gain=gain, persistence_weight=weight, decay_hours=hours)
+                for gain, weight, hours in options)
+    return min(settings, key=lambda cfg: np.abs(y_valid - wind_persistence_blend(predicted, last_actual, cfg)).mean())
+
+
 def run_training(config: dict[str, Any]) -> dict[str, Any]:
     import yaml
     started_at = time.perf_counter()
@@ -252,18 +266,23 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     if not data_path.is_absolute():
         data_path = ROOT / data_path
     frame = load_frame(kind, data_path)
+    if entry.get("replay_start_date"):
+        cutoff = pd.Timestamp(entry["replay_start_date"], tz="UTC")
+        frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
+    weather_columns = []
     if entry.get("weather"):
         weather_columns = ([solar.FORECAST_CLOUD_COLUMN, solar.FORECAST_RADIATION_COLUMN] if kind == "solar"
                            else ["_future_wind_speed", "_future_wind_direction"])
-        frame = archive_training_span(frame, weather_columns)
+        frame = archived_weather_history(frame, weather_columns, HISTORY)
     target_col = solar.TARGET_COLUMN if kind == "solar" else wind.TARGET_COLUMN
     all_targets = frame[target_col].to_numpy(dtype=np.float64)
     count = len(frame)
-    train_starts, valid_starts, test_starts, train_end, val_end = split_origins(
-        count, float(options.get("validation_fraction", 0.15)),
-        max_train=int(params.get("max_train_origins", 256)),
-        max_validation=int(params.get("max_validation_origins", 64)),
+    groups, train_end, val_end = forecast_split_origins(
+        frame, HISTORY, HORIZON, INTERVAL, float(options.get("validation_fraction", 0.15)), True, weather_columns,
     )
+    train_starts = sample_origins(groups[0], int(params.get("max_train_origins", 256)))
+    max_eval = int(params.get("max_validation_origins", 64))
+    valid_starts, test_starts = (sample_origins(starts, max_eval) for starts in groups[1:])
     target_mean = float(np.mean(all_targets[:train_end]))
     target_std = float(np.std(all_targets[:train_end]))
     if target_std < 1e-6:
@@ -272,6 +291,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     artifact_dir = ROOT / "models" / station / "experiments" / exp
     artifact_dir.mkdir(parents=True, exist_ok=True)
     extra: dict[str, Any] = {}
+    if algorithm in {"lstm", "dense_nn"}:
+        torch.manual_seed(int(params.get("random_state", 42)))
 
     if algorithm == "lstm":
         htrain, ftrain, y_train = sequence_arrays(kind, frame, train_starts)
@@ -342,8 +363,17 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                                    "architecture": {"input_size": len(names), "hidden_1": int(params["hidden_1"]),
                                                     "hidden_2": int(params["hidden_2"]), "hidden_3": int(params["hidden_3"]),
                                                     "dropout": float(params["dropout"])}})
-            torch.save(checkpoint, artifact_path)
             extra = {"best_epoch": best_epoch, "feature_schema": f"renewable_{kind}_engineered_dense_v1"}
+            if kind == "wind" and weather_columns:
+                with torch.inference_mode():
+                    val_pred = model(torch.from_numpy(Xv)).numpy() * target_std + target_mean
+                blend = _calibrate_wind(y_valid, np.maximum(val_pred, 0.0), all_targets[val_origins - 1, None])
+                if blend["model_gain"] != 1.0 or blend["persistence_weight"] != 0.0:
+                    checkpoint["wind_persistence_blend"] = blend
+                    extra["wind_persistence_blend"] = blend
+                    extra["unblended_test_metrics"] = metrics(y_test, np.maximum(pred, 0.0))
+                    pred = wind_persistence_blend(np.maximum(pred, 0.0), all_targets[test_origins - 1, None], blend)
+            torch.save(checkpoint, artifact_path)
         else:
             model = _make_tree_model(algorithm, params)
             model.fit(expand_origin_features(Xtrain), y_train.reshape(-1))
@@ -371,6 +401,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "history_steps": HISTORY, "horizon_steps": HORIZON, "interval_minutes": INTERVAL,
         "training_rows": int(train_end), "validation_rows": int(val_end-train_end),
         "test_rows": int(count-val_end), "training_origins": int(len(train_starts)),
+        "eligible_origins_by_split": [len(origins) for origins in groups],
         "validation_origin_count": int(len(valid_starts)), "test_origin_count": int(len(test_starts)),
         "training_start_utc": pd.Timestamp(frame.utc_timestamp.iloc[0]).isoformat(),
         "training_end_utc": pd.Timestamp(frame.utc_timestamp.iloc[train_end-1]).isoformat(),

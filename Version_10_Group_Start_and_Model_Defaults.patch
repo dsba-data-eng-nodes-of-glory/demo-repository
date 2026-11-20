@@ -1,0 +1,2069 @@
+diff --git a/backend/model_api.py b/backend/model_api.py
+index 1178a2f..f6480b9 100644
+--- a/backend/model_api.py
++++ b/backend/model_api.py
+@@ -19,6 +19,7 @@ from backend.pipeline_manager import (
+     write_station_config,
+ )
+ from src.models.model_registry import get_experiment, list_experiments, upsert_experiment
++from backend.onboarding_training import DEFAULT_MODELS
+ from backend.model_deletion import can_delete, delete_inactive_experiment, station_references
+ from backend.training_data import (
+     station_component_state, registered_source, list_sources, load_source,
+@@ -175,6 +176,7 @@ def model_components(station: str | None = None):
+         source_info = None
+     return {
+         "component_algorithms": config.get("component_algorithms", {}),
++        "component_default_algorithms": DEFAULT_MODELS,
+         "enabled": enabled,
+         "sources": source_info,
+         "legacy_station": bool(station and not read_station_config().get("stations", {}).get(station, {}).get("model_components")),
+diff --git a/backend/onboarding_training.py b/backend/onboarding_training.py
+index adae8ac..4bd3597 100644
+--- a/backend/onboarding_training.py
++++ b/backend/onboarding_training.py
+@@ -8,8 +8,8 @@ from src.models.model_registry import get_experiment
+ 
+ DEFAULT_MODELS = {
+     "demand_forecast": "dense_nn",
+-    "solar_forecast": "dense_nn",
+-    "wind_forecast": "dense_nn",
++    "solar_forecast": "lstm",
++    "wind_forecast": "lstm",
+     "residual_anomaly": "dense_autoencoder",
+ }
+ PENDING = {"queued", "running"}
+diff --git a/backend/pipeline_api.py b/backend/pipeline_api.py
+index 955d895..6a131a4 100644
+--- a/backend/pipeline_api.py
++++ b/backend/pipeline_api.py
+@@ -28,6 +28,14 @@ def start(request: StationRequest | None = None):
+         raise HTTPException(status_code=400, detail=str(exc)) from exc
+ 
+ 
++@router.post("/start-all")
++def start_all():
++    try:
++        return manager.start_all_pipelines()
++    except Exception as exc:
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++
++
+ @router.post("/stop")
+ def stop(request: StationRequest | None = None):
+     try:
+diff --git a/backend/pipeline_manager.py b/backend/pipeline_manager.py
+index 208048a..147124f 100644
+--- a/backend/pipeline_manager.py
++++ b/backend/pipeline_manager.py
+@@ -558,8 +558,29 @@ class PipelineManager:
+             return self._start_pipeline(station)
+ 
+     def _start_pipeline(self, station: str | None = None) -> dict[str, Any]:
++        station = station or read_station_config().get("active_station")
++        commands, topics = self._prepare_pipeline(station)
++        started: list[str] = []
++        quality_command = self._quality_command()
++        try:
++            if quality_command and self.start("quality", quality_command).get("started"):
++                started.append("quality")
++                time.sleep(2)
++            self._launch_services(station, commands, started, stagger=True)
++            self._activate_pipelines({station: commands}, quality_command)
++            return {"station": station, "started": started, "topics": topics, "status": self.station_status(station)}
++        except Exception:
++            self._stop_launched_services(station, started)
++            raise
++
++    @staticmethod
++    def _quality_command() -> list[str] | None:
++        if os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true":
++            return None
++        return [sys.executable, "-u", "-m", "src.quality.dlq_consumer"]
++
++    def _prepare_pipeline(self, station: str | None) -> tuple[list[tuple[str, list[str]]], dict[str, Any]]:
+         config = read_station_config()
+-        station = station or config.get("active_station")
+         stations = config.get("stations", {})
+         if station not in stations:
+             raise ValueError(f"Station '{station}' is not configured.")
+@@ -636,51 +657,150 @@ class PipelineManager:
+                              "--delay", str(float(entry.get("stream_delay_seconds", 1.0))),
+                              "--checkpoint-every", str(producer_checkpoint_every)],
+             ))
+-        started: list[str] = []
+-        quality_command = [python, "-u", "-m", "src.quality.dlq_consumer"]
+-        quality_external = os.getenv("QUALITY_CONSUMER_EXTERNAL", "false").lower() == "true"
+-        try:
+-            if not quality_external:
+-                result = self.start("quality", quality_command)
+-                if result.get("started"):
+-                    started.append("quality")
+-                    time.sleep(2)
+-            for name, command in commands:
+-                with self.lock:
+-                    watched = self._supervised.get(self.process_key(name, station))
+-                    if watched is not None and watched.process is not None:
+-                        if watched.process.poll() is None or (name == "producer" and watched.process.poll() == 0):
+-                            continue
+-                    # An explicit activation gives a failed service a fresh retry budget.
+-                    previous = self._supervised.pop(self.process_key(name, station), None)
+-                try:
+-                    result = self.start(name, command, station)
+-                except Exception:
+-                    if previous is not None:
+-                        with self.lock:
+-                            self._supervised[self.process_key(name, station)] = previous
+-                    raise
+-                if result.get("started"):
+-                    started.append(name)
++        return commands, topic_result
++
++    def _launch_services(
++        self, station: str, commands: list[tuple[str, list[str]]], started: list[str], *,
++        stagger: bool = False, ready_file: Path | None = None,
++    ) -> None:
++        for name, command in commands:
++            with self.lock:
++                key = self.process_key(name, station)
++                watched = self._supervised.get(key)
++                if watched is not None and watched.process is not None:
++                    code = watched.process.poll()
++                    if code is None or (name == "producer" and code == 0):
++                        continue
++                # An explicit activation gives a failed service a fresh retry budget.
++                previous = self._supervised.pop(key, None)
++            launch_command = command
++            if name == "producer" and ready_file is not None:
++                launch_command = [*command, "--group-ready-file", str(ready_file)]
++            try:
++                result = self.start(name, launch_command, station)
++            except Exception:
++                if previous is not None:
++                    with self.lock:
++                        self._supervised[key] = previous
++                raise
++            if result.get("started"):
++                started.append(name)
++                if stagger:
+                     time.sleep({"spark": 15, "predictor": 5, "producer": 2, "live_actuals": 0}[name])
+-            registry = read_station_config()
+-            registry["active_station"] = station
+-            active_stations = set(registry.get("active_stations", []) or [])
++
++    def _activate_pipelines(self, launches: dict[str, list[tuple[str, list[str]]]],
++                            quality_command: list[str] | None) -> None:
++        if not launches:
++            return
++        registry = read_station_config()
++        active_stations = set(registry.get("active_stations") or [])
++        for station in launches:
+             active_stations.add(station)
+-            registry["active_stations"] = sorted(active_stations)
+-            registry["stations"][station]["enabled"] = True
+-            registry["stations"][station]["status"] = "active"
+-            registry["stations"][station]["topics_ready"] = True
+-            write_station_config(registry)
++            registry["stations"][station].update(enabled=True, status="active", topics_ready=True)
++        if len(launches) == 1 or registry.get("active_station") not in active_stations:
++            registry["active_station"] = next(iter(launches))
++        registry["active_stations"] = sorted(active_stations)
++        write_station_config(registry)
++        for station, commands in launches.items():
+             for name, command in commands:
++                # A later restart resumes directly from its durable cursor.
+                 self._supervise(name, command, station)
+-            if not quality_external:
+-                self._supervise("quality", quality_command)
+-            return {"station": station, "started": started, "topics": topic_result, "status": self.station_status(station)}
+-        except Exception:
+-            for name in reversed(started):
+-                self.stop(name, None if name == "quality" else station)
+-            raise
++        if quality_command:
++            self._supervise("quality", quality_command)
++
++    def _stop_launched_services(self, station: str, started: list[str]) -> None:
++        for name in reversed(started):
++            self.stop(name, None if name == "quality" else station)
++
++    def _wait_for_replay_group(self, ready_files: dict[str, Path], *, released: bool = False) -> dict[str, str]:
++        pending = dict(ready_files)
++        errors = {}
++        deadline = time.monotonic() + (15 if released else 75)
++        while pending:
++            with self.lock:
++                for station, ready_file in list(pending.items()):
++                    process = self.processes.get(self.process_key("producer", station))
++                    code = process.poll() if process is not None else -1
++                    if code is not None:
++                        pending.pop(station)
++                        if code != 0:
++                            errors[station] = f"CSV producer exited with code {code}. Check {self.log_path('producer', station).name}."
++                    elif ready_file.is_file() != released:
++                        pending.pop(station)
++            if not pending or time.monotonic() >= deadline:
++                break
++            time.sleep(0.05)
++        phase = "acknowledge the group start" if released else "finish CSV and Kafka startup"
++        errors.update({station: f"CSV producer did not {phase} before the timeout. Check the producer log."
++                       for station in pending})
++        return errors
++
++    def start_all_pipelines(self) -> dict[str, dict]:
++        """Activate registered stations and release their new CSV producers together."""
++        with self.lifecycle_lock, tempfile.TemporaryDirectory(prefix="electricity-start-") as location:
++            results: dict[str, dict] = {}
++            launches: dict[str, list[tuple[str, list[str]]]] = {}
++            started_by_station: dict[str, list[str]] = {}
++            ready_files: dict[str, Path] = {}
++            gate = Path(location)
++            quality_command = self._quality_command()
++            quality_started = False
++            completed = False
++            try:
++                stations = read_station_config().get("stations", {})
++                for slot, station in enumerate(sorted(stations)):
++                    started: list[str] = []
++                    try:
++                        commands, _ = self._prepare_pipeline(station)
++                        if quality_command and not launches:
++                            quality_started |= self.start("quality", quality_command).get("started", False)
++                        ready_file = gate / f"{slot}.ready"
++                        self._launch_services(station, commands, started, ready_file=ready_file)
++                    except Exception as exc:
++                        self._stop_launched_services(station, started)
++                        results[station] = {"status": "failed", "message": str(exc)}
++                        continue
++                    launches[station] = commands
++                    started_by_station[station] = started
++                    if "producer" in started:
++                        ready_files[station] = ready_file
++
++                errors = self._wait_for_replay_group(ready_files)
++                with self.lock:
++                    for station in launches:
++                        for service in ("spark", "predictor"):
++                            worker = self.processes.get(self.process_key(service, station))
++                            if worker is not None and (code := worker.poll()) is not None:
++                                errors.setdefault(station, f"{service.title()} exited with code {code}. "
++                                                  f"Check {self.log_path(service, station).name}.")
++                for station in errors:
++                    self._stop_launched_services(station, started_by_station.pop(station))
++                    launches.pop(station)
++                    ready_files.pop(station, None)
++                if ready_files:
++                    # One release timestamp is read by each waiting producer.
++                    marker = gate / "release.tmp"
++                    marker.write_text(str(time.time() + 0.3), encoding="ascii")
++                    marker.replace(gate / "release")
++                    release_errors = self._wait_for_replay_group(ready_files, released=True)
++                    for station in release_errors:
++                        self._stop_launched_services(station, started_by_station.pop(station))
++                        launches.pop(station)
++                    errors.update(release_errors)
++                results.update({station: {"status": "failed", "message": error} for station, error in errors.items()})
++                self._activate_pipelines(launches, quality_command)
++                results.update({
++                    station: {"status": "started" if started else "already_running", "services": started}
++                    for station, started in started_by_station.items()
++                })
++                completed = True
++                return {"stations": results}
++            finally:
++                if not completed:
++                    for station, started in started_by_station.items():
++                        self._stop_launched_services(station, started)
++                if quality_started and (not completed or not launches):
++                    self.stop("quality")
+ 
+     def stop_pipeline(self, station: str | None = None) -> dict[str, Any]:
+         with self.lifecycle_lock:
+diff --git a/backend/results_api.py b/backend/results_api.py
+index ca7e0ca..3c4fcef 100644
+--- a/backend/results_api.py
++++ b/backend/results_api.py
+@@ -18,11 +18,11 @@ import yaml
+ from fastapi import APIRouter, HTTPException, Query
+ 
+ from backend.pipeline_manager import ROOT, read_station_config
+-from src.ingestion.csv_tail import csv_tail
++from src.ingestion.csv_tail import csv_tail, csv_tail_through
+ from src.ingestion.file_loader import parse_utc_timestamps
+ from src.storage.forecast_store import storage_backend, read_actuals as cassandra_read_actuals, read_forecasts as cassandra_read_forecasts, read_latest_forecast as cassandra_read_latest_forecast, read_quality_events
+ from src.storage.renewable_store import read_renewable_forecasts, read_renewable_actuals
+-from src.storage.hierarchy_rollup import LeafResults, roll_up
++from src.storage.hierarchy_rollup import METRICS, LeafResults, latest_demand_timestamp, roll_up
+ from src.storage.live_actuals import live_actuals_path, read_live_actuals
+ from src.storage.station_hierarchy import group_stations
+ 
+@@ -114,7 +114,8 @@ def _read_csv_cached(path: Path, ttl_seconds: float = 300.0) -> pd.DataFrame:
+     return frame
+ 
+ 
+-def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0) -> pd.DataFrame:
++def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0, *,
++                   time_column: str = "utc_timestamp", end_time: str | None = None) -> pd.DataFrame:
+     """Read only the final max_rows CSV records using reverse block reads.
+ 
+     This is intended for the flat, one-record-per-line CSV files written by the
+@@ -124,12 +125,14 @@ def _read_csv_tail(path: Path, max_rows: int, ttl_seconds: float = 1.0) -> pd.Da
+         return pd.DataFrame()
+ 
+     max_rows = int(max_rows)
+-    key, cached = _cache_get(path, ("tail", max_rows), ttl_seconds)
++    key, cached = _cache_get(path, ("tail", max_rows, time_column, end_time), ttl_seconds)
+     if cached is not None:
+         return cached
+ 
+     try:
+-        frame = pd.read_csv(csv_tail(path, max_rows))
++        rows = (csv_tail_through(path, max_rows, time_column, end_time)
++                if end_time else csv_tail(path, max_rows))
++        frame = pd.read_csv(rows)
+     except (OSError, ValueError, pd.errors.ParserError, UnicodeDecodeError):
+         return pd.DataFrame()
+ 
+@@ -151,6 +154,9 @@ def _read_station_rows(
+     station: str,
+     limit: int,
+     scan_rows: int | None = None,
++    *,
++    time_column: str = "utc_timestamp",
++    end_time: str | None = None,
+ ) -> pd.DataFrame:
+     """Read recent rows for one station without loading a large CSV in full."""
+     if not path.exists() or path.stat().st_size == 0:
+@@ -159,7 +165,7 @@ def _read_station_rows(
+     limit = max(1, min(int(limit), 20000))
+     # Scan extra rows in case several stations share a single append-only file.
+     scan_rows = scan_rows or min(200000, max(50000, limit * 5))
+-    frame = _read_csv_tail(path, scan_rows)
++    frame = _read_csv_tail(path, scan_rows, time_column=time_column, end_time=end_time)
+     if frame.empty or "station_id" not in frame.columns:
+         return pd.DataFrame()
+     frame = frame[frame["station_id"].astype(str) == str(station)]
+@@ -478,47 +484,102 @@ def actuals(
+     return {"records": _json_safe_records(frame)}
+ 
+ 
+-def _operational_leaf(station: str, entry: dict, window: int, *, include_forecasts: bool) -> LeafResults:
+-    """Read processed measurements instead of looking ahead into replay uploads."""
++def _operational_leaf(
++    station: str, entry: dict, window: int, *, include_forecasts: bool,
++    end_time: str | None = None, demand_only: bool = False,
++) -> LeafResults:
++    """Read saved results at the requested time, before limiting the row count."""
+     limit = window * 2
+     use_cassandra = storage_backend() == "cassandra"
+     configured_actuals = entry.get("actuals_file")
+     actual_path = ROOT / configured_actuals if configured_actuals else ACTUAL_FILE
+-    demand = (cassandra_read_actuals(station, limit) if use_cassandra else
++    cutoff = {"end_time": end_time} if end_time else {}
++    demand = (cassandra_read_actuals(station, limit, **cutoff) if use_cassandra else
+               _json_safe_records(_read_station_rows(actual_path, station, limit,
+-                                                   scan_rows=limit if configured_actuals else None)))
++                                                   scan_rows=limit if configured_actuals else None, **cutoff)))
+     live = {}
+     try:
+-        live = read_live_actuals(live_actuals_path(ROOT, station), limit)
++        live = read_live_actuals(live_actuals_path(ROOT, station), limit, **cutoff)
+         demand.extend(live["records"])
+     except sqlite3.Error:
+         _LOG.warning("Live reader storage is temporarily unavailable for %s.", station, exc_info=True)
+-    generation = read_renewable_actuals(station, limit=limit * 2) if (entry.get("renewables") or {}).get("enabled") else []
++    if demand_only:
++        return LeafResults(demand, [], {}, live.get("recovery"))
++
++    renewables = (entry.get("renewables") or {}).get("enabled")
++    if renewables and use_cassandra:
++        generation = read_renewable_actuals(station, limit=limit * 2, **cutoff)
++    elif renewables:
++        generation_path = ROOT / "data" / "processed" / "stations" / station / "renewable_actuals.csv"
++        generation = _json_safe_records(_read_station_rows(generation_path, station, limit * 2,
++                                                            scan_rows=limit * 2, **cutoff))
++    else:
++        generation = []
+     if not include_forecasts:
+         return LeafResults(demand, generation, {}, live.get("recovery"))
+ 
++    forecasts = _operational_forecasts(station, entry, end_time)
++    return LeafResults(demand, generation, forecasts, live.get("recovery"))
++
++
++def _operational_forecasts(station: str, entry: dict, end_time: str | None) -> dict[str, list[dict]]:
++    use_cassandra = storage_backend() == "cassandra"
++    cutoff = {"end_time": end_time} if end_time else {}
++    renewables = (entry.get("renewables") or {}).get("enabled")
+     horizon = int(entry.get("horizon_steps", 96))
+-    # Read the same bounded number of recent runs per component. Include extra
+-    # origins so one faster stream can wait for a slower child's latest run.
+     forecast_rows = min(10000, horizon * 20)
+     configured_forecasts = entry.get("forecasts_file")
+     forecast_path = ROOT / configured_forecasts if configured_forecasts else FORECAST_FILE
+-    demand_forecasts = (cassandra_read_forecasts(station, forecast_rows) if use_cassandra else
++    csv_cutoff = {"time_column": "forecast_origin_utc", **cutoff} if cutoff else {}
++    demand_forecasts = (cassandra_read_forecasts(station, forecast_rows, **cutoff) if use_cassandra else
+                         _json_safe_records(_read_station_rows(forecast_path, station, forecast_rows,
+-                                                             scan_rows=forecast_rows if configured_forecasts else None)))
+-    if not (entry.get("renewables") or {}).get("enabled"):
++                                                             scan_rows=forecast_rows if configured_forecasts else None,
++                                                             **csv_cutoff)))
++    if not renewables:
+         renewable_rows = []
+     elif use_cassandra:
+-        renewable_rows = read_renewable_forecasts(station, limit=forecast_rows * 2)
++        renewable_rows = read_renewable_forecasts(station, limit=forecast_rows * 2, **cutoff)
+     else:
+         frame = _read_station_rows(_renewable_file(station, entry), station, forecast_rows * 2,
+-                                   scan_rows=forecast_rows * 2)
++                                   scan_rows=forecast_rows * 2, **csv_cutoff)
+         renewable_rows = _json_safe_records(frame)
+-    return LeafResults(demand, generation, {
++    return {
+         "demand_mw": demand_forecasts,
+         "solar_mwh": [row for row in renewable_rows if row.get("generation_type") == "solar"],
+         "wind_mwh": [row for row in renewable_rows if row.get("generation_type") == "wind"],
+-    }, live.get("recovery"))
++    }
++
++
++def _older_group_forecasts(members: dict, results: dict[str, LeafResults], origins: dict) -> bool:
++    """If newer batches don't overlap, look back from the lagging predictor."""
++    components = METRICS[:3]
++    heads = {
++        (station, metric): max((row["forecast_origin_utc"] for row in data.forecasts.get(metric, [])
++                                if row.get("forecast_origin_utc")), default=None)
++        for station, data in results.items() for metric in components
++    }
++    tasks = set()
++    for metric in METRICS:
++        if origins[metric]:
++            continue
++        wanted = components if metric == "residual_mwh" else (metric,)
++        series = {(station, kind): heads[station, kind] for station in members for kind in wanted}
++        if all(series.values()):
++            cutoff = min(series.values())
++            tasks.update((station, cutoff) for (station, _), head in series.items() if head > cutoff)
++
++    def read(task):
++        station, cutoff = task
++        try:
++            return _operational_forecasts(station, members[station], cutoff)
++        except (OSError, ValueError, pd.errors.ParserError):
++            _LOG.warning("Older forecast results are temporarily unavailable for %s.", station, exc_info=True)
++            return {}
++
++    for (station, _), found in zip(tasks, _ROLLUP_READERS.map(read, tasks)):
++        for metric, rows in found.items():
++            results[station].forecasts.setdefault(metric, []).extend(rows)
++    return bool(tasks)
+ 
+ 
+ @router.get("/hierarchy")
+@@ -538,16 +599,36 @@ def hierarchy_results(node: str, window: int = Query(288, ge=1, le=2016), includ
+         include_forecasts = False
+     horizon = min(horizons)
+ 
+-    def read(station: str):
++    def read(station: str, *, demand_only: bool = False, end_time: str | None = None):
+         try:
+-            return _operational_leaf(station, members[station], window, include_forecasts=include_forecasts)
++            return _operational_leaf(
++                station, members[station], 2 if demand_only else window,
++                include_forecasts=include_forecasts, demand_only=demand_only, end_time=end_time,
++            )
+         except (OSError, ValueError, pd.errors.ParserError):
+             _LOG.warning("Operational results are temporarily unavailable for %s.", station, exc_info=True)
+             return LeafResults([], [], {})
+ 
+-    results = dict(zip(members, _ROLLUP_READERS.map(read, members)))
+-    totals = roll_up(members, results, window, interval, horizon)
++    def read_aligned(station: str):
++        edge = edges.get(station)
++        cutoff = as_of.isoformat() if as_of is not None and edge is not None and edge > as_of else None
++        return read(station, end_time=cutoff)
++
++    edges = {}
++    as_of = None
++    if len(members) > 1:
++        heads = _ROLLUP_READERS.map(lambda station: read(station, demand_only=True), members)
++        edges = {station: latest_demand_timestamp(data.demand) for station, data in zip(members, heads)}
++        if all(edge is not None for edge in edges.values()):
++            as_of = min(edges.values())
++    results = dict(zip(members, _ROLLUP_READERS.map(read_aligned, members)))
++    totals = roll_up(members, results, window, interval, horizon, as_of=as_of)
++    if (len(members) > 1 and include_forecasts and
++            _older_group_forecasts(members, results, totals["forecast_origins_utc"])):
++        totals = roll_up(members, results, window, interval, horizon, as_of=as_of)
+     latest = totals.pop("latest_demand_utc")
++    latest.update({station: edge.isoformat() for station, edge in edges.items() if edge is not None})
++    totals["aligned_through_utc"] = as_of.isoformat() if as_of is not None else None
+     recovering = [leaf.recovery for leaf in results.values()
+                   if leaf.recovery and leaf.recovery["processed"] < leaf.recovery["total"]]
+     return {
+diff --git a/backend/station_api.py b/backend/station_api.py
+index c5bdd21..469e8ca 100644
+--- a/backend/station_api.py
++++ b/backend/station_api.py
+@@ -26,12 +26,12 @@ from src.ingestion.workbook_loader import (
+     load_station_workbook,
+     parse_selected_models,
+ )
+-from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
++from src.ingestion.station_weather import FORECAST_COLUMNS, station_weather
+ from src.models.forecast_weather import ForecastWeatherUnavailable
+ from src.models.forecast_contract import derive_forecast_contract
+-from src.models.evaluation_splits import chronological_split_bounds
++from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+ from src.storage.station_hierarchy import build_tree, parse_path, validate_path
+-from backend.onboarding_training import initial_training, training_pending
++from backend.onboarding_training import DEFAULT_MODELS, initial_training, training_pending
+ 
+ router = APIRouter(prefix="/stations", tags=["stations"])
+ 
+@@ -91,18 +91,18 @@ def _validate_model_row_counts(
+ 
+     if "demand_forecast" in selected_models:
+         demand_history = historical["demand"]
+-        usable_rows = len(demand_history)
+-        if managed_weather:
+-            usable_rows = len(archive_training_span(demand_history, ["forecast_temperature"]))
+-        train_end, validation_end = chronological_split_bounds(usable_rows, validation_fraction, replay_start is not None)
+-        if (train_end <= history_steps + horizon_steps
+-                or validation_end - train_end < horizon_steps
+-                or (replay_start is not None and usable_rows - validation_end < horizon_steps)):
+-            raise ValueError(
+-                f"Worksheet 'Demand' has {usable_rows:,} usable historical rows. "
+-                f"Add earlier history for the {history_steps}-step lookback and "
+-                f"{horizon_steps}-step forecast horizon in each evaluation split."
++        weather_columns = ["forecast_temperature"] if managed_weather else []
++        fit_frame = demand_history
++        try:
++            fit_frame = (archived_weather_history(demand_history, weather_columns, history_steps)
++                         if managed_weather else demand_history)
++            origins, train_end, validation_end = forecast_split_origins(
++                fit_frame, history_steps, horizon_steps, interval_minutes, validation_fraction,
++                replay_start is not None, weather_columns,
+             )
++        except ValueError as exc:
++            raise ValueError(f"Worksheet 'Demand' has {len(fit_frame):,} usable historical rows. {exc}") from exc
++        usable_rows = len(fit_frame)
+         stream_rows = len(datasets["demand"]) - len(demand_history) if not live_kafka else 0
+         if not live_kafka and stream_rows < horizon_steps:
+             raise ValueError(
+@@ -112,6 +112,7 @@ def _validate_model_row_counts(
+             "total_rows": len(datasets["demand"]),
+             "training_rows": int(usable_rows),
+             "fit_rows": train_end,
++            "eligible_origins_by_split": [len(group) for group in origins],
+             "validation_rows": validation_end - train_end,
+             "test_rows": usable_rows - validation_end,
+             "stream_rows": int(stream_rows),
+@@ -121,23 +122,20 @@ def _validate_model_row_counts(
+         if model_name not in selected_models:
+             continue
+         frame = historical[dataset_name]
+-        if managed_weather:
+-            frame = archive_training_span(frame, list(FORECAST_COLUMNS[dataset_name].values()))
+-        n_rows = len(frame)
+-        train_end, val_end = chronological_split_bounds(n_rows, validation_fraction, True)
+-        if (
+-            train_end <= 672 + 96
+-            or val_end - train_end < 96
+-            or n_rows - val_end < 96
+-        ):
+-            raise ValueError(
+-                f"Worksheet '{dataset_name.title()}' has {n_rows:,} rows. The current Dense NN trainer needs "
+-                "a chronological training, validation and test split, more than 672 history + 96 forecast rows in training, "
+-                "and at least 96 rows each in validation and test. Add more continuous history."
++        weather_columns = list(FORECAST_COLUMNS[dataset_name].values()) if managed_weather else []
++        try:
++            if managed_weather:
++                frame = archived_weather_history(frame, weather_columns, 672)
++            origins, train_end, val_end = forecast_split_origins(
++                frame, 672, 96, 15, validation_fraction, True, weather_columns,
+             )
++        except ValueError as exc:
++            raise ValueError(f"Worksheet '{dataset_name.title()}': {exc}") from exc
++        n_rows = len(frame)
+         counts[model_name] = {
+             "total_rows": int(n_rows),
+             "train_rows": int(train_end),
++            "eligible_origins_by_split": [len(group) for group in origins],
+             "validation_rows": int(val_end - train_end),
+             "test_rows": int(n_rows - val_end),
+         }
+@@ -375,7 +373,7 @@ async def onboard_station(
+                 relative_files.update({f"demand_{name}": value for name, value in demand_forecast_paths.items()})
+                 model_components["demand_forecast"] = {
+                     "enabled": True,
+-                    "algorithm": "dense_nn",
++                    "algorithm": DEFAULT_MODELS["demand_forecast"],
+                     "status": "pending_training",
+                     **demand_forecast_paths,
+                     "checkpoint": f"models/{key}/v1/{key}_encoder_decoder_lstm.pt",
+@@ -385,11 +383,11 @@ async def onboard_station(
+                     raise HTTPException(status_code=422, detail="Worksheet 'Demand' must include temperature when demand_forecast is selected.")
+             else:
+                 model_components["demand_forecast"] = {
+-                    "enabled": False, "algorithm": "lstm", "status": "deselected"
++                    "enabled": False, "algorithm": DEFAULT_MODELS["demand_forecast"], "status": "deselected"
+                 }
+ 
+         else:
+-            model_components["demand_forecast"] = {"enabled": False, "algorithm": "lstm", "status": "deselected"}
++            model_components["demand_forecast"] = {"enabled": False, "algorithm": DEFAULT_MODELS["demand_forecast"], "status": "deselected"}
+ 
+         # Residual-load data is derived from all three historical worksheets,
+         # not a separate demand-only input. Preserve a validated combined training snapshot.
+@@ -428,14 +426,10 @@ async def onboard_station(
+                     if not replay_frame.empty:
+                         replay_rel = _write_csv(replay_frame, staging_dir / f"{key}_{kind}_replay.csv", station_dir)
+                         relative_files[f"{kind}_replay_file"] = replay_rel
+-                if kind == "solar":
+-                    checkpoint = f"models/{key}/solar_dense_nn/solar_pv_mlp_v4.pt"
+-                    metadata = f"models/{key}/solar_dense_nn/solar_mlp_v4_metadata.json"
+-                    version = f"{key}-solar-mlp-v4"
+-                else:
+-                    checkpoint = f"models/{key}/wind_dense_nn/amprion_wind_dense_solar_aligned.pt"
+-                    metadata = f"models/{key}/wind_dense_nn/metadata.json"
+-                    version = f"{key}-wind-dense-v1"
++                algorithm = DEFAULT_MODELS[model_id]
++                checkpoint = f"models/{key}/{kind}_{algorithm}/model.pt"
++                metadata = f"models/{key}/{kind}_{algorithm}/metadata.json"
++                version = f"{key}-{kind}-{algorithm}-v1"
+                 renewable_components[kind] = {
+                     "enabled": True,
+                     # Keep all generation actuals for serving and a pre-replay training source.
+@@ -446,11 +440,12 @@ async def onboard_station(
+                     "checkpoint": checkpoint,
+                     "metadata": metadata,
+                     "model_version": version,
++                    "algorithm": algorithm,
+                     "status": "pending_training",
+                 }
+                 model_components[model_id] = {
+                     "enabled": True,
+-                    "algorithm": "dense_nn",
++                    "algorithm": algorithm,
+                     "status": "pending_training",
+                     "training_file": training_rel,
+                     "checkpoint": checkpoint,
+@@ -459,7 +454,7 @@ async def onboard_station(
+             else:
+                 renewable_components[kind] = {"enabled": False, "status": "deselected"}
+                 model_components[model_id] = {
+-                    "enabled": False, "algorithm": "dense_nn", "status": "deselected"
++                    "enabled": False, "algorithm": DEFAULT_MODELS[model_id], "status": "deselected"
+                 }
+ 
+         # Solar and wind may be trained and deployed independently. Newly
+@@ -527,7 +522,7 @@ async def onboard_station(
+                 "model_checkpoint": checkpoint_rel,
+                 "model_metadata": f"models/{key}/v1/metadata.json",
+                 "model_version": "v1",
+-                "model_algorithm": "dense_nn",
++                "model_algorithm": DEFAULT_MODELS["demand_forecast"],
+                 "training_rows": int(len(train_frame)),
+                 "history_rows": int(min(history_steps, len(train_frame))),
+                 "stream_rows": int(len(stream_frame)) if stream_input == "csv_replay" else 0,
+diff --git a/backend/training_data.py b/backend/training_data.py
+index ce85d34..20bcf7a 100644
+--- a/backend/training_data.py
++++ b/backend/training_data.py
+@@ -21,7 +21,8 @@ import pandas as pd
+ from fastapi import HTTPException, UploadFile
+ from starlette.concurrency import run_in_threadpool
+ 
+-from src.ingestion.station_weather import FORECAST_COLUMNS, archive_training_span, station_weather
++from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
++from src.ingestion.station_weather import FORECAST_COLUMNS, station_weather
+ from src.models.forecast_weather import ForecastWeatherUnavailable
+ 
+ from src.ingestion.workbook_loader import (
+@@ -216,7 +217,17 @@ def prepare_training_upload(upload: Path, component: str, interval: int, timesta
+     if managed and component != "residual_anomaly":
+         weather = station_weather(root, station, entry)
+         weather.enrich({kind: frame})
+-        frame = archive_training_span(frame, list(FORECAST_COLUMNS[kind].values()))
++        history = int(entry.get("history_steps") or 672) if kind == "demand" else 672
++        horizon = int(entry.get("horizon_steps") or 96) if kind == "demand" else 96
++        cutoff = entry.get("replay_start_date")
++        training = frame.loc[frame["utc_timestamp"] < pd.Timestamp(cutoff, tz="UTC")] if cutoff else frame
++        weather_columns = list(FORECAST_COLUMNS[kind].values())
++        eligible = archived_weather_history(training, weather_columns, history)
++        from backend.model_api import training_options_for
++        forecast_split_origins(
++            eligible, history, horizon, interval, training_options_for()["validation_fraction"],
++            bool(cutoff) or kind != "demand", weather_columns,
++        )
+     _validate_values(component, frame, interval=interval, entry=entry)
+     return frame
+ 
+diff --git a/dashboard/app.py b/dashboard/app.py
+index 71646f0..a215045 100644
+--- a/dashboard/app.py
++++ b/dashboard/app.py
+@@ -200,6 +200,29 @@ section_title(
+ if backend_ok and station_ids:
+     if st.button("Refresh station cards"):
+         st.rerun()
++    if st.button("Start all stations", type="primary", help="Start the registered stations together."):
++        try:
++            with st.spinner("Preparing stations for a shared start…"):
++                result = api_post("/pipeline/start-all", timeout=240)
++            st.session_state["station_group_start"] = result["stations"]
++            st.rerun()
++        except requests.RequestException as exc:
++            detail = exc.response.text if exc.response is not None else str(exc)
++            st.error(f"Could not start all stations. {detail}")
++
++    batch = st.session_state.pop("station_group_start", None)
++    if batch is not None:
++        started = sum(item["status"] == "started" for item in batch.values())
++        active = sum(item["status"] == "already_running" for item in batch.values())
++        failed = len(batch) - started - active
++        message = f"Started {started} · Already running {active} · Could not start {failed}"
++        if failed:
++            st.warning(message)
++            for station_id, item in batch.items():
++                if item["status"] == "failed":
++                    st.text(f"{stations.get(station_id, {}).get('display_name') or station_id} · {item['message']}")
++        else:
++            st.success(message)
+     station_ids.sort(key=lambda key: station_label(key, stations[key]).casefold())
+     page_size = 12
+     pages = (len(station_ids) + page_size - 1) // page_size
+diff --git a/dashboard/hierarchy_monitoring.py b/dashboard/hierarchy_monitoring.py
+index a9d5b91..c2cac10 100644
+--- a/dashboard/hierarchy_monitoring.py
++++ b/dashboard/hierarchy_monitoring.py
+@@ -4,34 +4,13 @@ from __future__ import annotations
+ import pandas as pd
+ import plotly.graph_objects as go
+ import streamlit as st
+-from streamlit.components.v1 import html as component_html
+ 
+ METRICS = {
+     "demand_mw": ("Demand", "MW"),
+     "solar_mwh": ("Solar", "MWh"),
+     "wind_mwh": ("Wind Energy", "MWh"),
+-    "residual_mwh": ("Residual load", "MWh"),
++    "residual_mwh": ("Residual Load", "MWh"),
+ }
+-CLOCK_HTML = """
+-<style>
+-body { margin:0; font:14px system-ui,sans-serif; text-align:right; color:#90a8c2; }
+-strong { color:#38bdf8; font-variant-numeric:tabular-nums; }
+-</style>
+-<span>Live clock · UTC </span><strong id="clock"></strong>
+-<script>
+-const clock = document.getElementById("clock");
+-function renderClock() { clock.textContent = new Date().toISOString().slice(11, 19); }
+-renderClock();
+-setInterval(renderClock, 1000);
+-</script>
+-"""
+-
+-
+-def show_clock() -> None:
+-    if hasattr(st, "iframe"):
+-        st.iframe(CLOCK_HTML, height=34)
+-    else:
+-        component_html(CLOCK_HTML, height=34)
+ 
+ 
+ def _trace(rows: list[dict], metric: str, forecast: bool) -> go.Scatter:
+@@ -53,44 +32,94 @@ def _trace(rows: list[dict], metric: str, forecast: bool) -> go.Scatter:
+     )
+ 
+ 
+-def render_group(payload: dict, node: dict, metric: str) -> None:
+-    label, unit = METRICS[metric]
++def render_group(
++    payload: dict, node: dict, metric: str | None = None, *,
++    include_forecasts: bool = True, show_forecast_table: bool = False,
++) -> None:
++    st.subheader(node["name"])
+     actuals = payload.get("actuals", [])
+     forecasts = payload.get("forecasts", [])
++    origins = payload.get("forecast_origins_utc") or {}
+     leaf_count = payload["leaf_count"]
+-    origin = payload.get("forecast_origin_utc")
+     latest = actuals[-1] if actuals else None
+-    point = latest[metric] if latest else {"value": None, "reporting": 0}
+-    st.subheader(f"{node['name']} · {label}")
+-    col1, col2, col3 = st.columns(3)
+-    suffix = f"{unit} / {payload['interval_minutes']} min" if unit == "MWh" else unit
+-    value = "—" if point["value"] is None else f"{point['value']:,.2f} {suffix}"
+-    col1.metric("Latest observed total", value)
+-    coverage = "Complete" if point["reporting"] == leaf_count else "Partial" if point["reporting"] else "Waiting"
+-    col2.metric("Registered substations reporting", f"{point['reporting']} / {leaf_count}", coverage, delta_color="off")
+-    col3.metric("Latest interval (UTC)", pd.Timestamp(latest["utc_timestamp"]).strftime("%d %b %H:%M") if latest else "—")
+-    if origin and any(row[metric]["value"] is not None for row in forecasts):
+-        st.caption(f"Forecast origin · {pd.Timestamp(origin):%d %b %H:%M UTC}")
+-    if not payload.get("forecast_compatible", True):
++    if latest:
++        timestamp = pd.Timestamp(latest["utc_timestamp"])
++        reporting = latest["demand_mw"]["reporting"]
++        st.caption(f"Latest shared interval · {timestamp:%d %b %H:%M UTC} · "
++                   f"Demand coverage {reporting}/{leaf_count}"
++                   if reporting == leaf_count else
++                   f"Latest available interval · {timestamp:%d %b %H:%M UTC} · "
++                   f"Partial demand coverage {reporting}/{leaf_count}")
++
++    edges = [pd.Timestamp(row["latest_demand_utc"]) for row in payload["substations"] if row["latest_demand_utc"]]
++    if len(edges) == leaf_count and len(edges) > 1:
++        lag = max(edges) - min(edges)
++        if lag >= pd.Timedelta(minutes=payload["interval_minutes"]):
++            st.caption(f"Substation replay times differ by {lag}. The charts align to the slowest station.")
++    if include_forecasts and not payload.get("forecast_compatible", True):
+         st.caption("A common forecast horizon is needed to sum forecasts for this group.")
+-    traces = [_trace(rows, metric, is_forecast) for rows, is_forecast in ((actuals, False), (forecasts, True))
+-              if any(row[metric]["value"] is not None for row in rows)]
+-    if traces:
+-        chart = go.Figure(traces)
+-        chart.update_layout(
+-            template="plotly_dark", height=430, hovermode="x unified",
+-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,27,48,.50)",
+-            xaxis_title="Time (UTC)", yaxis_title=f"{label} ({suffix})",
+-            legend={"orientation": "h"}, uirevision=f"{node['id']}:{metric}",
+-        )
+-        st.plotly_chart(chart, use_container_width=True)
+-    else:
+-        st.info(f"Waiting for {label.lower()} readings from the registered substations.")
+-    if metric == "residual_mwh":
+-        st.caption("Residual load uses demand, solar and Wind Energy from the same substation and interval.")
+     if payload.get("recovery"):
+         progress = payload["recovery"]
+         st.caption(f"Demand recovery · {progress['processed']}/{progress['total']} Kafka records processed")
++
++    for name in (metric,) if metric else METRICS:
++        _render_metric(actuals, forecasts, origins.get(name), leaf_count, node["id"], name,
++                       payload["interval_minutes"], include_forecasts, show_forecast_table)
++
+     with st.expander("Substation reporting details"):
+         if st.checkbox("Show latest demand by substation", key=f"reporting_{node['id']}"):
+             st.dataframe(payload["substations"], use_container_width=True, hide_index=True)
++
++
++def _render_metric(
++    actuals: list[dict], forecasts: list[dict], origin: str | None, leaf_count: int,
++    node_id: str, metric: str, interval: int, include_forecasts: bool, show_forecast_table: bool,
++) -> None:
++    label, unit = METRICS[metric]
++    suffix = f"{unit} / {interval} min" if unit == "MWh" else unit
++    st.subheader(f"{label} · actual vs forecast")
++
++    latest = actuals[-1][metric] if actuals else {"value": None, "reporting": 0}
++    forecast_rows = [row for row in forecasts if row[metric]["value"] is not None]
++    values = [row[metric]["value"] for row in forecast_rows]
++    actual_time = pd.Timestamp(actuals[-1]["utc_timestamp"]) if actuals else None
++    next_value = next((row[metric]["value"] for row in forecast_rows
++                       if actual_time is None or pd.Timestamp(row["utc_timestamp"]) > actual_time), None)
++    summary = (
++        ("Latest actual", latest["value"]),
++        ("Next forecast", next_value),
++        ("Forecast peak", max(values) if values else None),
++        ("Forecast average", sum(values) / len(values) if values else None),
++    )
++    for (caption, value), column in zip(summary, st.columns(4, gap="small")):
++        if caption == "Latest actual" and 0 < latest["reporting"] < leaf_count:
++            caption = f"Latest actual · partial ({latest['reporting']}/{leaf_count})"
++        column.metric(caption, "—" if value is None else f"{value:,.2f} {suffix}")
++
++    if origin:
++        st.caption(f"Forecast origin · {pd.Timestamp(origin):%d %b %H:%M UTC}")
++    if values and next_value is None:
++        st.caption("The latest shared forecast ends at or before the last observation.")
++    chart = go.Figure()
++    if any(row[metric]["value"] is not None for row in actuals):
++        chart.add_trace(_trace(actuals, metric, False))
++    if forecast_rows:
++        chart.add_trace(_trace(forecast_rows, metric, True))
++    elif include_forecasts:
++        st.caption(f"Waiting for a complete {label.lower()} forecast at a shared origin.")
++    if chart.data:
++        chart.update_layout(
++            template="plotly_dark", height=410, hovermode="x unified",
++            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,27,48,.50)",
++            margin={"t": 58, "b": 72, "l": 64, "r": 16},
++            xaxis={"title": "Time (UTC)", "automargin": True},
++            yaxis={"title": f"{label} ({suffix})", "automargin": True},
++            legend={"orientation": "h", "x": 0, "xanchor": "left", "y": 1.02, "yanchor": "bottom"},
++            uirevision=f"{node_id}:{metric}",
++        )
++        st.plotly_chart(chart, use_container_width=True, key=f"hierarchy:{node_id}:{metric}")
++    else:
++        st.info(f"Waiting for {label.lower()} readings from the registered substations.")
++    if show_forecast_table and forecast_rows:
++        st.dataframe([{"Forecast time (UTC)": row["utc_timestamp"], f"{label} ({suffix})": row[metric]["value"]}
++                      for row in forecast_rows], use_container_width=True, hide_index=True)
+diff --git a/dashboard/pages/model_management.py b/dashboard/pages/model_management.py
+index e254aa4..33eeaf0 100644
+--- a/dashboard/pages/model_management.py
++++ b/dashboard/pages/model_management.py
+@@ -113,7 +113,7 @@ def _parameter_widget(label: str, value, key: str, parameter_name: str):
+ COMPONENT_LABELS = {
+     "demand_forecast": "Demand forecasting",
+     "solar_forecast": "Solar forecasting",
+-    "wind_forecast": "Wind forecasting",
++    "wind_forecast": "Wind Energy forecasting",
+     "residual_anomaly": "Residual Load anomaly autoencoder",
+ }
+ 
+@@ -142,8 +142,10 @@ def render_model_lab(station: str, station_label: str, selected_component: str,
+         return
+     st.markdown(f"**Station:** {station_label} (`{station}`) · **Component:** {COMPONENT_LABELS[selected_component]}")
+     algorithm_labels = component_payload.get("labels", {})
++    preferred = (component_payload.get("component_default_algorithms") or {}).get(selected_component)
+     algo = st.selectbox(
+         "Training algorithm", algorithms,
++        index=algorithms.index(preferred) if preferred in algorithms else 0,
+         format_func=lambda key: algorithm_labels.get(key, {}).get("label", key.upper()),
+         key=f"training_algorithm_{station}_{selected_component}",
+     )
+diff --git a/dashboard/pages/monitoring.py b/dashboard/pages/monitoring.py
+index 72e7b8a..1e1d555 100644
+--- a/dashboard/pages/monitoring.py
++++ b/dashboard/pages/monitoring.py
+@@ -10,7 +10,8 @@ import streamlit as st
+ 
+ try:
+     from dashboard.ui import setup_page, render_status_strip
+-    from dashboard.hierarchy_monitoring import METRICS, render_group, show_clock
++    from dashboard.hierarchy_monitoring import METRICS, render_group
++    from src.storage.hierarchy_rollup import demand_to_mw_factor
+     from dashboard.station_tree import select_monitoring_node
+     from dashboard.renewable_plot import build_renewable_figure
+     from dashboard.renewable_summary import build_renewable_summaries
+@@ -22,7 +23,8 @@ except ModuleNotFoundError:
+     from pathlib import Path
+     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+     from dashboard.ui import setup_page, render_status_strip
+-    from dashboard.hierarchy_monitoring import METRICS, render_group, show_clock
++    from dashboard.hierarchy_monitoring import METRICS, render_group
++    from src.storage.hierarchy_rollup import demand_to_mw_factor
+     from dashboard.station_tree import select_monitoring_node
+     from dashboard.renewable_plot import build_renewable_figure
+     from dashboard.renewable_summary import build_renewable_summaries
+@@ -77,11 +79,11 @@ def as_utc(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+     )
+ 
+ 
+-def number_column(frame: pd.DataFrame, column: str) -> pd.DataFrame:
++def number_column(frame: pd.DataFrame, column: str, factor: float = 1.0) -> pd.DataFrame:
+     if frame.empty or column not in frame.columns:
+         return pd.DataFrame()
+     result = frame.copy()
+-    result[column] = pd.to_numeric(result[column], errors="coerce")
++    result[column] = pd.to_numeric(result[column], errors="coerce") * factor
+     return result.dropna(subset=[column])
+ 
+ 
+@@ -102,11 +104,7 @@ def fmt_utc(value) -> str:
+ # ---------------------------------------------------------------------
+ api = setup_page("Live Monitoring", "monitoring")
+ 
+-heading, clock = st.columns([3, 1], vertical_alignment="center")
+-with heading:
+-    st.title("⚡ Live Monitoring")
+-with clock:
+-    show_clock()
++st.title("⚡ Live Monitoring")
+ 
+ # ---------------------------------------------------------------------
+ # Sidebar
+@@ -181,13 +179,17 @@ else:
+     selected_node = {"id": station, "children": []}
+ station = selected_node["id"]
+ 
+-use_hierarchy_view = bool(selected_node["children"] or stations.get(station, {}).get("hierarchy_path"))
+-if use_hierarchy_view:
+-    with st.sidebar:
+-        group_metric = st.selectbox("Show", list(METRICS), format_func=lambda metric: METRICS[metric][0])
++use_hierarchy_view = bool(selected_node["children"])
++group_metric = None
++with st.sidebar:
++    if not selected_node["children"] and stations.get(station, {}).get("hierarchy_path"):
++        use_hierarchy_view = not st.checkbox(
++            "Show individual model and anomaly panels", value=True, key=f"individual_panels_{station}",
++        )
++    if use_hierarchy_view:
+         include_forecasts = st.checkbox("Show forecasts", value=True)
+         if not selected_node["children"]:
+-            use_hierarchy_view = not st.checkbox("Show individual model and anomaly panels")
++            group_metric = st.selectbox("Show", list(METRICS), format_func=lambda metric: METRICS[metric][0])
+ 
+ 
+ def render_live_monitoring_panel(
+@@ -228,6 +230,7 @@ def render_live_monitoring_panel(
+     station_interval_minutes = int(stations[station].get("interval_minutes", 15))
+     station_horizon_steps = int(stations[station].get("horizon_steps", 96))
+     station_forecast_horizon_hours = float(stations[station].get("forecast_horizon_hours", 24))
++    demand_factor = demand_to_mw_factor(stations[station], station_interval_minutes)
+ 
+     # ---------------------------------------------------------------------
+     # Load saved actuals and forecasts through FastAPI
+@@ -248,7 +251,7 @@ def render_live_monitoring_panel(
+ 
+     if not forecasts.empty:
+         forecasts = as_utc(forecasts, "forecast_timestamp_utc")
+-        forecasts = number_column(forecasts, "predicted_demand")
++        forecasts = number_column(forecasts, "predicted_demand", demand_factor)
+ 
+         for col in ["forecast_issued_at_utc", "forecast_origin_utc"]:
+             if col in forecasts.columns:
+@@ -353,7 +356,7 @@ def render_live_monitoring_panel(
+     actuals = pd.DataFrame(actual_payload.get("records", []))
+     if not actuals.empty:
+         actuals = as_utc(actuals, "utc_timestamp")
+-        actuals = number_column(actuals, "actual_demand")
++        actuals = number_column(actuals, "actual_demand", demand_factor)
+         actuals = (
+             actuals.drop_duplicates("utc_timestamp", keep="last")
+             .sort_values("utc_timestamp")
+@@ -879,7 +882,8 @@ if use_hierarchy_view:
+         except requests.RequestException as exc:
+             st.warning(f"Hierarchy readings are temporarily unavailable: {exc}")
+             return
+-        render_group(payload, selected_node, group_metric)
++        render_group(payload, selected_node, group_metric, include_forecasts=include_forecasts,
++                     show_forecast_table=show_forecast_table)
+ 
+     render_hierarchy_monitoring()
+ else:
+diff --git a/dashboard/pages/station_management.py b/dashboard/pages/station_management.py
+index f0c82b9..a9c30c7 100644
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -137,7 +137,7 @@ with st.form("station_onboarding_form", clear_on_submit=False):
+         else:
+             st.caption(f"7-day history: {10080 // interval_minutes} rows · 24-hour horizon: {1440 // interval_minutes} rows")
+     st.markdown("**Select models to train automatically**")
+-    st.caption("Dense NN for Demand, Solar and Wind Energy. Dense Autoencoder for residual-load anomalies.")
++    st.caption("Dense NN for Demand, LSTM for Solar and Wind Energy, and Dense Autoencoder for residual-load anomalies.")
+     selected_models = []
+     mcols = st.columns(4)
+     for idx, (model_id, label) in enumerate(model_labels.items()):
+diff --git a/src/ingestion/csv_tail.py b/src/ingestion/csv_tail.py
+index cedb12d..01222ba 100644
+--- a/src/ingestion/csv_tail.py
++++ b/src/ingestion/csv_tail.py
+@@ -1,4 +1,5 @@
+ """Read the end of the platform's flat, chronological CSV files."""
++from datetime import datetime, timezone
+ from io import BytesIO
+ from pathlib import Path
+ 
+@@ -29,3 +30,43 @@ def csv_tail(path: Path, max_rows: int) -> BytesIO:
+         lines = lines[1:]
+     lines = lines[-max_rows:]
+     return BytesIO(header + b"\n" + b"\n".join(lines))
++
++
++def csv_tail_through(path: Path, max_rows: int, time_column: str, end_time: str) -> BytesIO:
++    """Find the last matching rows through a UTC cutoff in an operational CSV."""
++    cutoff = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
++    if cutoff.tzinfo is None:
++        cutoff = cutoff.replace(tzinfo=timezone.utc)
++    lines = []
++    with path.open("rb") as file:
++        header = file.readline().rstrip(b"\r\n")
++        start = file.tell()
++        columns = header.decode("utf-8-sig").split(",")
++        if time_column not in columns:
++            return BytesIO(header + b"\n")
++        column = columns.index(time_column)
++        file.seek(0, 2)
++        position = file.tell()
++        carry = b""
++        while position > start and len(lines) < max_rows:
++            left = max(start, position - 64 * 1024)
++            file.seek(left)
++            block = file.read(position - left) + carry
++            position = left
++            parts = block.split(b"\n")
++            carry = parts.pop(0) if left > start else b""
++            for line in reversed(parts):
++                fields = line.split(b",", column + 1)
++                if len(fields) <= column or not fields[column]:
++                    continue
++                try:
++                    timestamp = datetime.fromisoformat(fields[column].decode().strip('"').replace("Z", "+00:00"))
++                except ValueError:
++                    continue
++                if timestamp.tzinfo is None:
++                    timestamp = timestamp.replace(tzinfo=timezone.utc)
++                if timestamp <= cutoff:
++                    lines.append(line.rstrip(b"\r"))
++                    if len(lines) == max_rows:
++                        break
++    return BytesIO(header + b"\n" + b"\n".join(reversed(lines)))
+diff --git a/src/models/evaluation_splits.py b/src/models/evaluation_splits.py
+index 6e08645..51cb8de 100644
+--- a/src/models/evaluation_splits.py
++++ b/src/models/evaluation_splits.py
+@@ -1,5 +1,9 @@
+ """Chronological target boundaries for model evaluation."""
+ 
++import numpy as np
++import pandas as pd
++
++
+ TEST_FRACTION = 0.15
+ 
+ 
+@@ -9,3 +13,43 @@ def chronological_split_bounds(rows: int, validation_fraction: float, with_test:
+     train_end = int(rows * (1 - validation_fraction - test_fraction))
+     validation_end = int(rows * (1 - test_fraction)) if with_test else rows
+     return train_end, validation_end
++
++
++def archived_weather_history(frame: pd.DataFrame, columns: list[str], history: int) -> pd.DataFrame:
++    """Keep every archive period and enough prior actuals to seed its first origin."""
++    if not set(columns).issubset(frame.columns):
++        raise ValueError("This dataset is missing archived day-ahead weather columns.")
++    valid = np.flatnonzero(np.isfinite(frame[columns].to_numpy(dtype=float)).all(axis=1))
++    if not len(valid):
++        raise ValueError("No archived day-ahead weather overlaps this dataset.")
++    return frame.iloc[max(0, valid[0] - history):valid[-1] + 1].reset_index(drop=True)
++
++
++def forecast_split_origins(
++    frame: pd.DataFrame, history: int, horizon: int, interval: int,
++    validation_fraction: float, with_test: bool, weather_columns: list[str],
++) -> tuple[list[np.ndarray], int, int]:
++    """Return chronological target windows with continuous history and real forecast weather."""
++    size = len(frame)
++    train_end, val_end = chronological_split_bounds(size, validation_fraction, with_test)
++    bounds = [(history, train_end), (max(history, train_end), val_end)]
++    if with_test:
++        bounds.append((max(history, val_end), size))
++    timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True)).as_unit("ns")
++    breaks = np.r_[0, np.cumsum(np.diff(timestamps.asi8) != pd.Timedelta(minutes=interval).value)]
++    missing_weather = np.zeros(size + 1, dtype=np.int64)
++    if weather_columns:
++        valid = np.isfinite(frame[weather_columns].to_numpy(dtype=float)).all(axis=1)
++        missing_weather[1:] = np.cumsum(~valid)
++    groups = []
++    for first, end in bounds:
++        starts = np.arange(first, end - horizon + 1, dtype=np.int64)
++        continuous = breaks[starts + horizon - 1] == breaks[starts - history]
++        covered = missing_weather[starts + horizon] == missing_weather[starts]
++        groups.append(starts[continuous & covered])
++    for label, starts, minimum in zip(("training", "validation", "test"), groups, (2, 1, 1)):
++        if len(starts) < minimum:
++            weather = " with archived day-ahead weather for every forecast step" if weather_columns else ""
++            raise ValueError(f"The {label} split has {len(starts)} usable forecast windows{weather}. "
++                             f"Provide more continuous data for the {history}-step history and {horizon}-step horizon.")
++    return groups, train_end, val_end
+diff --git a/src/models/renewable_forecaster.py b/src/models/renewable_forecaster.py
+index 5c0dac4..b30ae15 100644
+--- a/src/models/renewable_forecaster.py
++++ b/src/models/renewable_forecaster.py
+@@ -381,6 +381,10 @@ class AmprionRenewableForecaster:
+         with torch.inference_mode():
+             scaled = self.wind_model(torch.from_numpy(x_scaled).to(self.device)).cpu().numpy().reshape(-1)
+         values = np.maximum(scaled * float(cp["target_std"]) + float(cp["target_mean"]), 0.0)
++        if cp.get("wind_persistence_blend"):
++            from src.models.train_renewable import wind_persistence_blend
++            last_actual = float(frame.iloc[self.history_steps - 1][wind_features.TARGET_COLUMN])
++            values = wind_persistence_blend(values, last_actual, cp["wind_persistence_blend"])
+         if len(values) != self.horizon_steps or not np.isfinite(values).all():
+             raise RuntimeError("Wind model returned invalid forecast values")
+         return self._records("wind", origin, future_ts, values, issued_at, self.wind_name, mode)
+diff --git a/src/models/streaming_predictor.py b/src/models/streaming_predictor.py
+index e77cc54..32d7313 100644
+--- a/src/models/streaming_predictor.py
++++ b/src/models/streaming_predictor.py
+@@ -58,7 +58,7 @@ from src.storage.forecast_store import append_actuals, append_forecasts, storage
+ from src.quality.validator import validate_event, quality_event
+ from src.quality.event_store import record_quality_event
+ from src.observability import metrics
+-from src.models.tabular_forecasting import build_origin_features
++from src.models.tabular_forecasting import apply_demand_blend, build_origin_features, weekly_demand_baseline
+ from src.ingestion.station_weather import FORECAST_WEATHER_MODE, StationWeather, live_origin, station_weather, utc_index
+ from src.models.forecast_weather import ForecastWeatherUnavailable, select_forecast_horizon
+ 
+@@ -442,6 +442,14 @@ def generate_forecast(
+         if missing:
+             raise ValueError(f"Serving feature builder is missing model features: {sorted(missing)}")
+         predictions = np.asarray(model.predict(features.reindex(columns=feature_names)), dtype=float).reshape(-1)
++        weight = float(checkpoint.get("weekly_blend_model_weight", 1.0))
++        if weight < 1.0:
++            weekly = weekly_demand_baseline(history_frame, len(future_ts), interval_minutes)
++            if weekly is None:
++                raise ValueError("The seasonal demand blend requires seven days of observations.")
++            predictions = apply_demand_blend(predictions, weekly, weight)
++        elif "weekly_blend_model_weight" in checkpoint:
++            predictions = np.maximum(0.0, predictions)
+     elif algorithm in {"dense_nn", "dense", "dense_multioutput"}:
+         if weather_lookup is None:
+             raise ForecastWeatherUnavailable("No forecast_weather_file is configured for the Dense demand model")
+diff --git a/src/models/tabular_forecasting.py b/src/models/tabular_forecasting.py
+index c33a695..458a15b 100644
+--- a/src/models/tabular_forecasting.py
++++ b/src/models/tabular_forecasting.py
+@@ -205,3 +205,15 @@ def json_safe_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+             value = float(value)
+         clean[str(key)] = value
+     return clean
++
++
++def weekly_demand_baseline(history: pd.DataFrame, horizon: int, interval: int) -> np.ndarray | None:
++    """Use the observation at the same UTC interval seven days earlier."""
++    lookback = _steps_for_duration(10080, interval)
++    if len(history) < lookback or horizon > lookback:
++        return None
++    return history["demand"].to_numpy(dtype=float)[-lookback:][:horizon]
++
++
++def apply_demand_blend(predicted: np.ndarray, baseline: np.ndarray, weight: float) -> np.ndarray:
++    return np.maximum(0.0, weight * predicted + (1.0 - weight) * baseline)
+diff --git a/src/models/train.py b/src/models/train.py
+index 0545fae..2e36d57 100644
+--- a/src/models/train.py
++++ b/src/models/train.py
+@@ -21,10 +21,10 @@ from torch import nn
+ from torch.utils.data import DataLoader, Dataset
+ import yaml
+ 
+-from src.ingestion.station_weather import FORECAST_WEATHER_MODE, archive_training_span
++from src.ingestion.station_weather import FORECAST_WEATHER_MODE
+ from src.ingestion.file_loader import load_station_csv
+ from src.features.feature_schema import HISTORY_FEATURES, FUTURE_FEATURES
+-from src.models.evaluation_splits import chronological_split_bounds
++from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+ from src.models.forecast_contract import station_forecast_contract
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+@@ -252,22 +252,19 @@ def main() -> None:
+     if with_test:
+         cutoff = pd.Timestamp(station["replay_start_date"], tz="UTC")
+         frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
++    weather_columns = ["forecast_temperature"] if managed else []
+     forecast_temperatures = None
+     if managed:
+-        frame = archive_training_span(frame, ["forecast_temperature"])
++        frame = archived_weather_history(frame, weather_columns, history_steps)
+         forecast_temperatures = frame["forecast_temperature"].to_numpy(dtype=np.float32)
+     timestamps = pd.DatetimeIndex(pd.to_datetime(frame["utc_timestamp"], utc=True))
+     demand = frame["demand"].to_numpy(dtype=np.float32)
+     temperature = frame["temperature"].to_numpy(dtype=np.float32)
+     n_rows = len(frame)
+ 
+-    split_row, validation_end_row = chronological_split_bounds(n_rows, args.validation_fraction, with_test)
+-    if (split_row <= history_steps + horizon_steps or validation_end_row - split_row < horizon_steps
+-            or (with_test and n_rows - validation_end_row < horizon_steps)):
+-        raise ValueError(
+-            f"Not enough rows ({n_rows}) for history={history_steps}, horizon={horizon_steps} "
+-            "and the selected chronological evaluation splits."
+-        )
++    origin_groups, split_row, validation_end_row = forecast_split_origins(
++        frame, history_steps, horizon_steps, interval_minutes, args.validation_fraction, with_test, weather_columns,
++    )
+ 
+     demand_mean = float(np.mean(demand[:split_row]))
+     demand_std = float(np.std(demand[:split_row]))
+@@ -287,10 +284,8 @@ def main() -> None:
+     history_matrix = np.column_stack([hist_map[name] for name in HISTORY_FEATURES]).astype(np.float32)
+ 
+     # Each index is the first target row; its history ends immediately before it.
+-    train_indices = np.arange(history_steps, split_row - horizon_steps + 1, dtype=np.int64)
+-    val_indices = np.arange(split_row, validation_end_row - horizon_steps + 1, dtype=np.int64)
+-    train_indices = sample_indices(train_indices, args.max_train_windows)
+-    val_indices = sample_indices(val_indices, args.max_validation_windows)
++    train_indices = sample_indices(origin_groups[0], args.max_train_windows)
++    val_indices = sample_indices(origin_groups[1], args.max_validation_windows)
+     if len(train_indices) < 1 or len(val_indices) < 1:
+         raise ValueError("The selected data split produced no training or validation windows.")
+ 
+@@ -374,10 +369,7 @@ def main() -> None:
+ 
+     test_metadata = {}
+     if with_test:
+-        test_indices = sample_indices(
+-            np.arange(validation_end_row, n_rows - horizon_steps + 1, dtype=np.int64),
+-            args.max_validation_windows,
+-        )
++        test_indices = sample_indices(origin_groups[2], args.max_validation_windows)
+         test_ds = WindowDataset(test_indices, demand_scaled, history_matrix, temperature,
+                                 timestamps, temp_mean, temp_std, history_steps,
+                                 horizon_steps, interval_minutes, forecast_temperatures)
+diff --git a/src/models/train_renewable.py b/src/models/train_renewable.py
+index 6d16df3..4d953a3 100644
+--- a/src/models/train_renewable.py
++++ b/src/models/train_renewable.py
+@@ -10,6 +10,7 @@ import copy
+ import json
+ import math
+ import time
++from itertools import product
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -20,8 +21,7 @@ import torch
+ from torch import nn
+ from torch.utils.data import DataLoader, TensorDataset
+ 
+-from src.ingestion.station_weather import archive_training_span
+-from src.models.evaluation_splits import chronological_split_bounds
++from src.models.evaluation_splits import archived_weather_history, chronological_split_bounds, forecast_split_origins
+ from src.models.model_registry import next_version, utc_now
+ from src.models.training.amprion import solar_mlp_features as solar
+ from src.models.training.amprion import solar_mlp_model
+@@ -137,7 +137,6 @@ def normalize_sequences(hist: np.ndarray, future: np.ndarray, stats: dict[str, A
+ def _fit_torch(model, x_train, y_train, x_val, y_val, params: dict, *, sequence: bool):
+     threads = max(1, min(4, int(params.get("num_threads", 2))))
+     torch.set_num_threads(threads)
+-    torch.manual_seed(int(params.get("random_state", 42)))
+     bs = int(params.get("batch_size", 8 if sequence else 128))
+     if sequence:
+         train_loader = DataLoader(TensorDataset(*(torch.from_numpy(a) for a in (*x_train, y_train))),
+@@ -228,6 +227,22 @@ def metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, float | int]
+     }
+ 
+ 
++def wind_persistence_blend(predicted: np.ndarray, last_actual, settings: dict) -> np.ndarray:
++    """Weight the latest measured generation most heavily at short lead times."""
++    steps = np.arange(predicted.shape[-1], dtype=float)
++    decay = settings["decay_hours"] * 60 / INTERVAL
++    weight = settings["persistence_weight"] * np.exp(-steps / decay)
++    return np.maximum(0.0, (1 - weight) * settings["model_gain"] * predicted + weight * last_actual)
++
++
++def _calibrate_wind(y_valid: np.ndarray, predicted: np.ndarray, last_actual: np.ndarray) -> dict:
++    """Select an adjustment on the validation period, including the model alone."""
++    options = product((1.0, 0.9, 1.1, 0.8, 1.2, 1.3), (0.0, 0.25, 0.5, 0.75, 1.0), (1, 3, 6, 12, 24))
++    settings = (dict(model_gain=gain, persistence_weight=weight, decay_hours=hours)
++                for gain, weight, hours in options)
++    return min(settings, key=lambda cfg: np.abs(y_valid - wind_persistence_blend(predicted, last_actual, cfg)).mean())
++
++
+ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+     import yaml
+     started_at = time.perf_counter()
+@@ -254,18 +269,20 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+     if entry.get("replay_start_date"):
+         cutoff = pd.Timestamp(entry["replay_start_date"], tz="UTC")
+         frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
++    weather_columns = []
+     if entry.get("weather"):
+         weather_columns = ([solar.FORECAST_CLOUD_COLUMN, solar.FORECAST_RADIATION_COLUMN] if kind == "solar"
+                            else ["_future_wind_speed", "_future_wind_direction"])
+-        frame = archive_training_span(frame, weather_columns)
++        frame = archived_weather_history(frame, weather_columns, HISTORY)
+     target_col = solar.TARGET_COLUMN if kind == "solar" else wind.TARGET_COLUMN
+     all_targets = frame[target_col].to_numpy(dtype=np.float64)
+     count = len(frame)
+-    train_starts, valid_starts, test_starts, train_end, val_end = split_origins(
+-        count, float(options.get("validation_fraction", 0.15)),
+-        max_train=int(params.get("max_train_origins", 256)),
+-        max_validation=int(params.get("max_validation_origins", 64)),
++    groups, train_end, val_end = forecast_split_origins(
++        frame, HISTORY, HORIZON, INTERVAL, float(options.get("validation_fraction", 0.15)), True, weather_columns,
+     )
++    train_starts = sample_origins(groups[0], int(params.get("max_train_origins", 256)))
++    max_eval = int(params.get("max_validation_origins", 64))
++    valid_starts, test_starts = (sample_origins(starts, max_eval) for starts in groups[1:])
+     target_mean = float(np.mean(all_targets[:train_end]))
+     target_std = float(np.std(all_targets[:train_end]))
+     if target_std < 1e-6:
+@@ -274,6 +291,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+     artifact_dir = ROOT / "models" / station / "experiments" / exp
+     artifact_dir.mkdir(parents=True, exist_ok=True)
+     extra: dict[str, Any] = {}
++    if algorithm in {"lstm", "dense_nn"}:
++        torch.manual_seed(int(params.get("random_state", 42)))
+ 
+     if algorithm == "lstm":
+         htrain, ftrain, y_train = sequence_arrays(kind, frame, train_starts)
+@@ -344,8 +363,17 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+                                    "architecture": {"input_size": len(names), "hidden_1": int(params["hidden_1"]),
+                                                     "hidden_2": int(params["hidden_2"]), "hidden_3": int(params["hidden_3"]),
+                                                     "dropout": float(params["dropout"])}})
+-            torch.save(checkpoint, artifact_path)
+             extra = {"best_epoch": best_epoch, "feature_schema": f"renewable_{kind}_engineered_dense_v1"}
++            if kind == "wind" and weather_columns:
++                with torch.inference_mode():
++                    val_pred = model(torch.from_numpy(Xv)).numpy() * target_std + target_mean
++                blend = _calibrate_wind(y_valid, np.maximum(val_pred, 0.0), all_targets[val_origins - 1, None])
++                if blend["model_gain"] != 1.0 or blend["persistence_weight"] != 0.0:
++                    checkpoint["wind_persistence_blend"] = blend
++                    extra["wind_persistence_blend"] = blend
++                    extra["unblended_test_metrics"] = metrics(y_test, np.maximum(pred, 0.0))
++                    pred = wind_persistence_blend(np.maximum(pred, 0.0), all_targets[test_origins - 1, None], blend)
++            torch.save(checkpoint, artifact_path)
+         else:
+             model = _make_tree_model(algorithm, params)
+             model.fit(expand_origin_features(Xtrain), y_train.reshape(-1))
+@@ -373,6 +401,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+         "history_steps": HISTORY, "horizon_steps": HORIZON, "interval_minutes": INTERVAL,
+         "training_rows": int(train_end), "validation_rows": int(val_end-train_end),
+         "test_rows": int(count-val_end), "training_origins": int(len(train_starts)),
++        "eligible_origins_by_split": [len(origins) for origins in groups],
+         "validation_origin_count": int(len(valid_starts)), "test_origin_count": int(len(test_starts)),
+         "training_start_utc": pd.Timestamp(frame.utc_timestamp.iloc[0]).isoformat(),
+         "training_end_utc": pd.Timestamp(frame.utc_timestamp.iloc[train_end-1]).isoformat(),
+diff --git a/src/models/train_tabular.py b/src/models/train_tabular.py
+index bcf303f..d9bc981 100644
+--- a/src/models/train_tabular.py
++++ b/src/models/train_tabular.py
+@@ -17,13 +17,15 @@ import yaml
+ from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+ from sklearn.metrics import mean_absolute_error, mean_squared_error
+ 
+-from src.ingestion.station_weather import FORECAST_WEATHER_MODE, archive_training_span
++from src.ingestion.station_weather import FORECAST_WEATHER_MODE
+ from src.ingestion.file_loader import load_station_csv
+-from src.models.evaluation_splits import chronological_split_bounds
++from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+ from src.models.model_registry import next_version, upsert_experiment, utc_now
+ from src.models.forecast_contract import station_forecast_contract
+ from src.models.tabular_forecasting import (
+     FEATURE_SCHEMA,
++    apply_demand_blend,
++    weekly_demand_baseline,
+     build_training_examples,
+     json_safe_parameters,
+ )
+@@ -142,25 +144,24 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+     if with_test:
+         cutoff = pd.Timestamp(station_entry["replay_start_date"], tz="UTC")
+         frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
++    weather_columns = ["forecast_temperature"] if managed else []
+     if managed:
+-        frame = archive_training_span(frame, ["forecast_temperature"])
++        frame = archived_weather_history(frame, weather_columns, history_steps)
+     n_rows = len(frame)
+-    split_row, validation_end_row = chronological_split_bounds(n_rows, validation_fraction, with_test)
+-    if (split_row <= history_steps + horizon_steps or validation_end_row - split_row < horizon_steps
+-            or (with_test and n_rows - validation_end_row < horizon_steps)):
+-        raise ValueError(
+-            f"Not enough rows ({n_rows}) for history={history_steps}, horizon={horizon_steps} "
+-            "and the chronological evaluation splits."
+-        )
+-
+-    train_origins = np.arange(history_steps, split_row - horizon_steps + 1, dtype=np.int64)
+-    validation_origins = np.arange(split_row, validation_end_row - horizon_steps + 1, dtype=np.int64)
+-    train_origins = sample_origins(train_origins, int(parameters.get("max_train_origins", 300)))
+-    validation_origins = sample_origins(
+-        validation_origins, int(parameters.get("max_validation_origins", 80))
++    origin_groups, split_row, validation_end_row = forecast_split_origins(
++        frame, history_steps, horizon_steps, interval_minutes, validation_fraction, with_test, weather_columns,
+     )
+-    if len(train_origins) < 2 or len(validation_origins) < 1:
+-        raise ValueError("Not enough train/validation forecast origins after sampling.")
++    train_origins = sample_origins(origin_groups[0], int(parameters.get("max_train_origins", 300)))
++    max_eval = int(parameters.get("max_validation_origins", 80))
++    validation_origins = sample_origins(origin_groups[1], max_eval)
++    if len(train_origins) < 2:
++        raise ValueError("Not enough training forecast origins after sampling.")
++
++    def weekly_predictions(origins: np.ndarray) -> np.ndarray:
++        return np.concatenate([
++            weekly_demand_baseline(frame.iloc[start - history_steps:start], horizon_steps, interval_minutes)
++            for start in origins
++        ])
+ 
+     x_train, y_train, train_origin_ids = build_training_examples(
+         frame, train_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
+@@ -184,6 +185,19 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+     predicted = np.asarray(predicted, dtype=float).reshape(-1)
+     if len(predicted) != len(y_valid):
+         raise RuntimeError(f"Estimator returned {len(predicted)} predictions for {len(y_valid)} validation rows.")
++    blend = {}
++    if managed and algorithm == "dense_nn" and weekly_demand_baseline(
++        frame.iloc[train_origins[0] - history_steps:train_origins[0]], horizon_steps, interval_minutes
++    ) is not None:
++        weekly = weekly_predictions(validation_origins)
++        weight = min((0.0, 0.25, 0.5, 0.75, 1.0),
++                     key=lambda value: mean_absolute_error(y_valid, apply_demand_blend(predicted, weekly, value)))
++        blend = {
++            "weekly_blend_model_weight": weight,
++            "unblended_validation_metrics": calculate_metrics(y_valid, np.maximum(0.0, predicted)),
++            "weekly_validation_metrics": calculate_metrics(y_valid, weekly),
++        }
++        predicted = apply_demand_blend(predicted, weekly, weight)
+     metrics = calculate_metrics(y_valid, predicted)
+ 
+     # Error profile by lead step is part of the experiment and comparison output.
+@@ -198,16 +212,22 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+     validation_end = str(pd.Timestamp(frame.iloc[validation_end_row - 1]["utc_timestamp"]).isoformat())
+     test_metadata = {}
+     if with_test:
+-        test_origins = sample_origins(
+-            np.arange(validation_end_row, n_rows - horizon_steps + 1, dtype=np.int64),
+-            int(parameters.get("max_validation_origins", 80)),
+-        )
++        test_origins = sample_origins(origin_groups[2], max_eval)
+         x_test, y_test, _ = build_training_examples(
+             frame, test_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed,
+         )
+         x_test = x_test.reindex(columns=feature_names)
+         test_predicted = estimator.predict(x_test.to_numpy(dtype=np.float32))
++        test_baselines = {}
++        if blend:
++            weekly = weekly_predictions(test_origins)
++            test_baselines = {
++                "unblended_test_metrics": calculate_metrics(y_test, np.maximum(0.0, test_predicted)),
++                "weekly_test_metrics": calculate_metrics(y_test, weekly),
++            }
++            test_predicted = apply_demand_blend(test_predicted, weekly, blend["weekly_blend_model_weight"])
+         test_metadata = {
++            **test_baselines,
+             "test_metrics": calculate_metrics(y_test, test_predicted),
+             "test_origin_count": len(test_origins),
+             "test_start_utc": frame["utc_timestamp"].iloc[validation_end_row].isoformat(),
+@@ -239,6 +259,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+         "history_window_hours": contract["history_window_hours"],
+         "forecast_horizon_hours": contract["forecast_horizon_hours"],
+         "training_rows": int(n_rows),
++        "eligible_origins_by_split": [len(origins) for origins in origin_groups],
+         "training_origins": int(len(train_origins)),
+         "training_samples": int(len(y_train)),
+         "validation_origins": int(len(validation_origins)),
+@@ -251,6 +272,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+         "validation_fraction": validation_fraction,
+         "evaluation_protocol": "chronological_train_validation_test_sampled_origins_v1"
+         if with_test else "chronological_holdout_sampled_origins_v1",
++        **blend,
+         **test_metadata,
+         "parameters": parameters,
+         "metrics": metrics,
+@@ -282,6 +304,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
+         "validation_end_utc": validation_end,
+         "validation_origin_count": int(len(validation_origins)),
+         "evaluation_protocol": metadata["evaluation_protocol"],
++        **blend,
+         **test_metadata,
+         "parameters": parameters,
+         "metrics": metrics,
+diff --git a/src/producers/csv_producer.py b/src/producers/csv_producer.py
+index 20947f7..04f522f 100644
+--- a/src/producers/csv_producer.py
++++ b/src/producers/csv_producer.py
+@@ -272,6 +272,22 @@ def iter_rows_after_progress(
+         )
+ 
+ 
++def wait_for_group_replay(ready_file: Path) -> float:
++    """Signal readiness and return the common first-publication deadline."""
++    release = ready_file.with_name("release")
++    ready_file.touch()
++    try:
++        deadline = time.monotonic() + 240
++        while not release.is_file():
++            if not ready_file.parent.is_dir() or time.monotonic() >= deadline:
++                raise TimeoutError("Timed out waiting for the station group start.")
++            time.sleep(0.025)
++        start_at = float(release.read_text(encoding="ascii"))
++        return time.monotonic() + max(0.0, start_at - time.time())
++    finally:
++        ready_file.unlink(missing_ok=True)
++
++
+ def run_producer(args: argparse.Namespace) -> None:
+     if args.delay < 0 or args.limit < 0 or args.chunksize <= 0 or args.checkpoint_every <= 0:
+         raise ValueError(
+@@ -461,7 +477,16 @@ def run_producer(args: argparse.Namespace) -> None:
+             flush=True,
+         )
+ 
++        group_ready_file = getattr(args, "group_ready_file", None)
++        group_start = None
++        if group_ready_file is not None:
++            # Resolve the topic before signalling readiness so the first send
++            # does not wait separately for metadata on each station.
++            producer.partitions_for(topic)
++            group_start = wait_for_group_replay(group_ready_file)
+         for row, timestamp in rows_with_first():
++            if group_start is not None:
++                time.sleep(max(0.0, group_start + sent * args.delay - time.monotonic()))
+             if previous_timestamp is not None and timestamp <= previous_timestamp:
+                 raise ValueError(
+                     f"Non-increasing timestamp in {csv_path}: {timestamp} follows "
+@@ -495,7 +520,7 @@ def run_producer(args: argparse.Namespace) -> None:
+ 
+             if args.limit and sent >= args.limit:
+                 break
+-            if args.delay > 0:
++            if group_start is None and args.delay > 0:
+                 time.sleep(args.delay)
+ 
+         flush_acknowledged_batch()
+@@ -517,6 +542,7 @@ def main() -> None:
+         description="Publish a station's source CSV to its configured raw Kafka topic."
+     )
+     parser.add_argument("--station", required=True, help="Station key in config/stations.yaml")
++    parser.add_argument("--group-ready-file", type=Path, help="Coordinate the first publication with a batch of stations.")
+     parser.add_argument("--csv", default=None, help="Streaming CSV path override")
+     parser.add_argument("--history-file", default=None, help="History CSV path override")
+     parser.add_argument("--topic", default=None, help="Optional Kafka topic override")
+diff --git a/src/storage/cassandra_store.py b/src/storage/cassandra_store.py
+index c6be66c..77b1755 100644
+--- a/src/storage/cassandra_store.py
++++ b/src/storage/cassandra_store.py
+@@ -489,12 +489,15 @@ def write_quality_event(event: dict[str, Any]) -> None:
+     _register_bucket(session, str(event["station_id"]), "quality_day", timestamp.date().isoformat())
+ 
+ 
+-def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
++def read_actuals(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
+     session = get_session()
+     cfg = _config().get("cassandra", {})
+     months = max(1, int(cfg.get("actual_history_months", 12)))
+     latest = session.execute(_PREPARED["latest_actual_read"], (station,)).one()
+-    if latest is not None and latest.month_bucket:
++    cutoff = _utc_naive(end_time) if end_time else None
++    if cutoff is not None:
++        year, month = cutoff.year, cutoff.month
++    elif latest is not None and latest.month_bucket:
+         year, month = (int(part) for part in latest.month_bucket.split("-", 1))
+     else:
+         now = datetime.now(timezone.utc)
+@@ -507,7 +510,8 @@ def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
+             month, year = 12, year - 1
+     rows: list[dict[str, Any]] = []
+     for bucket in buckets:
+-        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["actual_read"], (station, bucket)))
++        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["actual_read"], (station, bucket))
++                    if cutoff is None or _utc_naive(row.utc_timestamp) <= cutoff)
+         if len(rows) >= limit:
+             break
+     rows.sort(key=lambda row: row["utc_timestamp"])
+@@ -517,18 +521,20 @@ def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
+     return rows
+ 
+ 
+-def read_forecasts(station: str, limit: int = 5000) -> list[dict[str, Any]]:
++def read_forecasts(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
+     session = get_session()
+     days = max(1, int(_config().get("cassandra", {}).get("forecast_history_days", 14)))
+     latest_run = session.execute(_PREPARED["latest_pointer_read"], (station,)).one()
+-    anchor_day = (latest_run.forecast_origin_utc.date()
++    cutoff = _utc_naive(end_time) if end_time else None
++    anchor_day = (cutoff.date() if cutoff is not None else latest_run.forecast_origin_utc.date()
+                   if latest_run is not None and latest_run.forecast_origin_utc is not None
+                   else datetime.now(timezone.utc).date())
+     rows: list[dict[str, Any]] = []
+     from datetime import timedelta
+     for offset in range(days):
+         day = anchor_day - timedelta(days=offset)
+-        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["forecast_read"], (station, day)))
++        rows.extend(dict(row._asdict()) for row in session.execute(_PREPARED["forecast_read"], (station, day))
++                    if cutoff is None or _utc_naive(row.forecast_origin_utc) <= cutoff)
+         if len(rows) >= limit:
+             break
+     rows.sort(key=lambda row: (row["forecast_origin_utc"], row["horizon_step"]))
+@@ -782,14 +788,17 @@ def read_renewable_actuals(station: str, limit: int = 20000,
+         anchor = cutoff or (pointer.latest_timestamp if pointer else None)
+         if anchor is None:
+             continue
++        kind_rows = []
+         for month in _recent_months(_utc_naive(anchor), months):
+             for item in session.execute(_PREPARED["renewable_actual_read"], (station, kind, month)):
+                 obj = dict(item._asdict())
+                 if cutoff and _utc_naive(obj["utc_timestamp"]) > cutoff:
+                     continue
+-                rows.append(obj)
+-            if len(rows) >= 2 * max(1, limit):
++                kind_rows.append(obj)
++            if len(kind_rows) >= max(1, limit // 2):
+                 break
++        kind_rows.sort(key=lambda row: _utc_naive(row["utc_timestamp"]))
++        rows.extend(kind_rows[-max(1, limit // 2):])
+     rows.sort(key=lambda r: _utc_naive(r["utc_timestamp"]))
+     return _iso_rows(rows[-max(1, int(limit)):], ("utc_timestamp",))
+ 
+diff --git a/src/storage/forecast_store.py b/src/storage/forecast_store.py
+index 136e53f..8a49c51 100644
+--- a/src/storage/forecast_store.py
++++ b/src/storage/forecast_store.py
+@@ -234,16 +234,16 @@ def append_actuals(
+         return saved
+ 
+ 
+-def read_actuals(station: str, limit: int = 5000) -> list[dict[str, Any]]:
++def read_actuals(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
+     if storage_backend() == "cassandra":
+         from src.storage.cassandra_store import read_actuals as read
+-        return read(station, limit)
++        return read(station, limit, end_time=end_time) if end_time else read(station, limit)
+     return []
+ 
+-def read_forecasts(station: str, limit: int = 5000) -> list[dict[str, Any]]:
++def read_forecasts(station: str, limit: int = 5000, end_time: str | None = None) -> list[dict[str, Any]]:
+     if storage_backend() == "cassandra":
+         from src.storage.cassandra_store import read_forecasts as read
+-        return read(station, limit)
++        return read(station, limit, end_time=end_time) if end_time else read(station, limit)
+     return []
+ 
+ def read_latest_forecast(station: str) -> list[dict[str, Any]]:
+diff --git a/src/storage/hierarchy_rollup.py b/src/storage/hierarchy_rollup.py
+index 543a899..c470b20 100644
+--- a/src/storage/hierarchy_rollup.py
++++ b/src/storage/hierarchy_rollup.py
+@@ -37,7 +37,14 @@ def _number(value) -> float | None:
+         return None
+ 
+ 
+-def _multiplier(entry: dict, interval: int) -> float:
++def latest_demand_timestamp(rows: list[dict]) -> pd.Timestamp | None:
++    return max((timestamp for row in rows
++                if _number(row.get("actual_demand")) is not None
++                and (timestamp := _timestamp(row.get("utc_timestamp"))) is not None), default=None)
++
++
++def demand_to_mw_factor(entry: dict, interval: int) -> float:
++    """Convert per-interval energy to average power for monitoring."""
+     return 60 / interval if entry.get("residual_demand_unit") == "mwh_per_interval" else 1.0
+ 
+ 
+@@ -83,7 +90,8 @@ def _latest_runs(rows: list[dict], metric: str, horizon: int,
+     return selected
+ 
+ 
+-def roll_up(members: dict, inputs: dict[str, LeafResults], window: int, interval: int, horizon: int) -> dict:
++def roll_up(members: dict, inputs: dict[str, LeafResults], window: int, interval: int, horizon: int,
++            *, as_of: pd.Timestamp | None = None) -> dict:
+     """Use only saved observations and add each leaf once per timestamp and metric."""
+     step = pd.Timedelta(minutes=interval)
+     offset_ns = next((int(entry["hierarchy_grid_offset_seconds"]) * 10**9
+@@ -95,7 +103,7 @@ def roll_up(members: dict, inputs: dict[str, LeafResults], window: int, interval
+     for station, entry in members.items():
+         data = inputs.get(station, LeafResults([], [], {}))
+         points: dict = defaultdict(dict)
+-        factor = _multiplier(entry, interval)
++        factor = demand_to_mw_factor(entry, interval)
+         for row in data.demand:
+             timestamp = _timestamp(row.get("utc_timestamp"))
+             value = _number(row.get("actual_demand"))
+@@ -114,38 +122,47 @@ def roll_up(members: dict, inputs: dict[str, LeafResults], window: int, interval
+                 points[timestamp][f"{kind}_mwh"] = value
+         leaf_actuals[station] = points
+         component_origins[station] = {
+-            metric: _latest_runs(data.forecasts.get(metric, []), metric, horizon, step, demand_edges[station])
++            metric: _latest_runs(data.forecasts.get(metric, []), metric, horizon, step,
++                                 min(as_of, demand_edges[station])
++                                 if as_of is not None and demand_edges[station] is not None
++                                 else demand_edges[station])
+             for metric in METRICS[:3]
+         }
+ 
+-    counts: dict = defaultdict(int)
+-    for runs in component_origins.values():
+-        for origin in runs["demand_mw"]:
+-            counts[origin] += 1
+-    # Prefer full demand coverage, and still provide a flagged partial run
+-    # when the bounded window has no common origin.
+-    shared = [origin for origin, count in counts.items() if count == len(members)]
+-    origin = max(shared or counts, default=None)
++    # Each metric gets its latest origin shared by every contributing station.
++    # Residual load needs a single origin shared across all three inputs.
++    shared_origins = {
++        metric: set.intersection(*(set(runs[metric]) for runs in component_origins.values()))
++        if component_origins else set()
++        for metric in METRICS[:3]
++    }
++    shared_origins["residual_mwh"] = set.intersection(*shared_origins.values())
++    common_origin = max(shared_origins["residual_mwh"], default=None)
++    origins = {metric: common_origin or max(options, default=None) for metric, options in shared_origins.items()}
+     forecast_totals: dict = defaultdict(dict)
+-    if origin is not None:
+-        for station, runs in component_origins.items():
+-            factor = _multiplier(members[station], interval)
+-            leaf_points: dict = defaultdict(dict)
+-            for metric, forecasts in runs.items():
+-                for target, value in forecasts.get(origin, {}).items():
+-                    leaf_points[target][metric] = value * factor if metric == "demand_mw" else value
+-            for target, values in leaf_points.items():
++    for station, runs in component_origins.items():
++        factor = demand_to_mw_factor(members[station], interval)
++        for metric in METRICS[:3]:
++            for target, value in runs[metric].get(origins[metric], {}).items():
++                _accumulate(forecast_totals[target], {metric: value * factor if metric == "demand_mw" else value})
++        residual_origin = origins["residual_mwh"]
++        if residual_origin is not None:
++            for target, value in runs["demand_mw"][residual_origin].items():
++                values = {"demand_mw": value * factor, "solar_mwh": runs["solar_mwh"][residual_origin][target],
++                          "wind_mwh": runs["wind_mwh"][residual_origin][target]}
+                 _add_residual(values, interval)
+-                _accumulate(forecast_totals[target], values)
++                _accumulate(forecast_totals[target], {"residual_mwh": values["residual_mwh"]})
+ 
+-    observed = max((timestamp for points in leaf_actuals.values() for timestamp in points), default=None)
++    observed = as_of if as_of is not None else max(
++        (timestamp for points in leaf_actuals.values() for timestamp in points), default=None
++    )
+     actual_records = []
+     if observed is not None:
+         start = observed - step * (window - 1)
+         actual_totals: dict = defaultdict(dict)
+         for points in leaf_actuals.values():
+             for timestamp, values in points.items():
+-                if timestamp >= start and (observed - timestamp) % step == pd.Timedelta(0):
++                if start <= timestamp <= observed and (observed - timestamp) % step == pd.Timedelta(0):
+                     _add_residual(values, interval)
+                     _accumulate(actual_totals[timestamp], values)
+         earliest = min(actual_totals, default=observed)
+@@ -156,5 +173,7 @@ def roll_up(members: dict, inputs: dict[str, LeafResults], window: int, interval
+         "latest_demand_utc": {station: edge.isoformat() if edge is not None else None
+                               for station, edge in demand_edges.items()},
+         "forecasts": [_point(timestamp, totals, len(members)) for timestamp, totals in sorted(forecast_totals.items())],
+-        "forecast_origin_utc": origin.isoformat() if origin is not None else None,
++        "forecast_origin_utc": origins["demand_mw"].isoformat() if origins["demand_mw"] is not None else None,
++        "forecast_origins_utc": {metric: origin.isoformat() if origin is not None else None
++                                 for metric, origin in origins.items()},
+     }
+diff --git a/src/storage/live_actuals.py b/src/storage/live_actuals.py
+index c43543b..fba6454 100644
+--- a/src/storage/live_actuals.py
++++ b/src/storage/live_actuals.py
+@@ -2,7 +2,7 @@
+ from __future__ import annotations
+ 
+ from contextlib import closing
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from pathlib import Path
+ import sqlite3
+ 
+@@ -49,7 +49,7 @@ def save_readings(path: Path, records: list[tuple[str, float]], position: int |
+             db.execute("UPDATE cursor SET next_offset = ? WHERE singleton = 1", (position,))
+ 
+ 
+-def read_live_actuals(path: Path, limit: int) -> dict:
++def read_live_actuals(path: Path, limit: int, end_time: str | None = None) -> dict:
+     if not path.is_file():
+         return {"records": [], "cursor": None, "recovery": None, "first_timestamp": None}
+     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.3)) as db:
+@@ -59,9 +59,17 @@ def read_live_actuals(path: Path, limit: int) -> dict:
+         if cursor is None:
+             return {"records": [], "cursor": None, "recovery": None, "first_timestamp": None}
+         first_timestamp = db.execute("SELECT MIN(timestamp) FROM readings").fetchone()[0]
++        where = ""
++        params = (limit,)
++        if end_time:
++            cutoff = datetime.fromisoformat(end_time.replace("Z", "+00:00")).astimezone(timezone.utc)
++            # Both seconds-only and fractional UTC timestamps are stored.
++            after = cutoff + timedelta(microseconds=1)
++            where = "WHERE timestamp < ? "
++            params = (after.isoformat(timespec="microseconds").replace(".000000+00:00", "+00:00"), limit)
+         rows = db.execute(
+             "SELECT timestamp AS utc_timestamp, demand AS actual_demand, received_at "
+-            "FROM readings ORDER BY timestamp DESC LIMIT ?", (limit,),
++            f"FROM readings {where}ORDER BY timestamp DESC LIMIT ?", params,
+         ).fetchall()
+     current, start, end = cursor
+     recovery = None
+diff --git a/tests/test_batch_activation.py b/tests/test_batch_activation.py
+new file mode 100644
+index 0000000..8e5865f
+--- /dev/null
++++ b/tests/test_batch_activation.py
+@@ -0,0 +1,79 @@
++import os
++from pathlib import Path
++import sys
++import time
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from backend import pipeline_api, pipeline_manager as pm
++
++
++def test_start_all_releases_csv_producers_together_and_keeps_other_stations_isolated(tmp_path, monkeypatch):
++    monkeypatch.setattr(pm, "ROOT", Path(__file__).resolve().parents[1])
++    monkeypatch.setattr(pm, "STATION_CONFIG", tmp_path / "stations.yaml")
++    monkeypatch.setattr(pm, "LOG_DIR", tmp_path)
++    monkeypatch.setenv("QUALITY_CONSUMER_EXTERNAL", "true")
++    stations = {"one": {}, "two": {}, "broken": {}, "training": {}, "external": {}}
++    pm.write_station_config({"stations": stations})
++    manager = pm.PipelineManager()
++    monkeypatch.setattr(pipeline_api, "manager", manager)
++    monkeypatch.setattr(manager, "get_runtime_environment", lambda: {"env": os.environ.copy()})
++    monkeypatch.setattr(manager, "start_supervisor", lambda: None)
++
++    sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
++    worker = """
++from pathlib import Path
++import sys
++import time
++from src.producers.csv_producer import wait_for_group_replay
++
++# Simulate noticeably different import, CSV and broker startup times.
++time.sleep(float(sys.argv[2]))
++start = wait_for_group_replay(Path(sys.argv[-1]))
++time.sleep(max(0.0, start - time.monotonic()))
++Path(sys.argv[1]).write_text(str(time.monotonic()))
++time.sleep(30)
++"""
++
++    def prepare(station):
++        if station == "training":
++            raise RuntimeError("Initial model training is still queued.")
++        commands = [("spark", sleeper), ("predictor", sleeper)]
++        if station == "broken":
++            commands.append(("producer", [sys.executable, "-c", "raise SystemExit(2)"]))
++        elif station != "external":
++            delay = "0.0" if station == "one" else "0.6"
++            commands.append(("producer", [sys.executable, "-c", worker, str(tmp_path / station), delay]))
++        return commands, {}
++
++    monkeypatch.setattr(manager, "_prepare_pipeline", prepare)
++    app = FastAPI()
++    app.include_router(pipeline_api.router)
++    try:
++        with TestClient(app) as client:
++            response = client.post("/pipeline/start-all")
++            assert response.status_code == 200, response.text
++            result = response.json()["stations"]
++            assert result["one"]["status"] == result["two"]["status"] == "started", result
++            assert result["external"]["status"] == "started"
++            assert "producer" not in result["external"]["services"]
++            assert "exited with code 2" in result["broken"]["message"]
++            assert result["training"] == {"status": "failed", "message": "Initial model training is still queued."}
++            assert pm.read_station_config()["active_stations"] == ["external", "one", "two"]
++            first_pids = {name: manager.processes[f"{name}:producer"].pid for name in ("one", "two")}
++
++            deadline = time.monotonic() + 4
++            while not all((tmp_path / name).is_file() for name in first_pids):
++                assert time.monotonic() < deadline
++                time.sleep(0.03)
++            times = [float((tmp_path / name).read_text()) for name in first_pids]
++            assert abs(times[0] - times[1]) < 0.2
++            assert "--group-ready-file" not in manager._supervised["one:producer"].command
++            assert manager.processes["broken:spark"].poll() is not None
++
++            repeated = client.post("/pipeline/start-all").json()["stations"]
++            assert repeated["one"]["status"] == repeated["two"]["status"] == "already_running"
++            assert first_pids == {name: manager.processes[f"{name}:producer"].pid for name in first_pids}
++    finally:
++        manager.stop_pipeline()
+diff --git a/tests/test_onboarding_training.py b/tests/test_onboarding_training.py
+index 566cb6c..413a47c 100644
+--- a/tests/test_onboarding_training.py
++++ b/tests/test_onboarding_training.py
+@@ -9,9 +9,9 @@ def test_initial_queue_deploys_and_retries_components(monkeypatch, tmp_path):
+     registry_file = tmp_path / "experiments.json"
+     monkeypatch.setattr(pipeline_manager, "STATION_CONFIG", station_file)
+     monkeypatch.setattr(model_registry, "REGISTRY_PATH", registry_file)
+-    plan = onboarding_training.initial_training(["demand_forecast", "solar_forecast", "residual_anomaly"])
++    plan = onboarding_training.initial_training(["demand_forecast", "solar_forecast", "wind_forecast", "residual_anomaly"])
+     assert [(key, task["algorithm"]) for key, task in plan.items()] == [
+-        ("demand_forecast", "dense_nn"), ("solar_forecast", "dense_nn"),
++        ("demand_forecast", "dense_nn"), ("solar_forecast", "lstm"), ("wind_forecast", "lstm"),
+         ("residual_anomaly", "dense_autoencoder"),
+     ]
+     pipeline_manager.write_station_config({"stations": {study: {
+@@ -67,5 +67,5 @@ def test_initial_queue_deploys_and_retries_components(monkeypatch, tmp_path):
+     advance()
+     assert station()["initial_training"]["solar_forecast"]["error"] == "Training failed"
+     assert station_api.retry_initial_training(study)["queued"] == 1
+-    assert station()["initial_training"]["solar_forecast"] == {"algorithm": "dense_nn", "status": "queued"}
++    assert station()["initial_training"]["solar_forecast"] == {"algorithm": "lstm", "status": "queued"}
+     assert station()["initial_training"]["demand_forecast"]["status"] == "ready"
+diff --git a/tests/test_station_hierarchy.py b/tests/test_station_hierarchy.py
+index 20f69dd..272f621 100644
+--- a/tests/test_station_hierarchy.py
++++ b/tests/test_station_hierarchy.py
+@@ -101,8 +101,9 @@ def test_group_api_reads_operational_storage_without_opening_uploads(tmp_path, m
+         snapshot = client.get("/results/hierarchy", params=params).json()
+         assert snapshot["leaf_count"] == 4
+         assert snapshot["actuals"][0]["demand_mw"] == {"value": 100, "reporting": 4, "expected": 4}
+-        assert snapshot["actuals"][-1]["utc_timestamp"] == "2026-10-01T00:15:00+00:00"
+-        assert snapshot["actuals"][-1]["demand_mw"] == {"value": 60, "reporting": 3, "expected": 4}
++        assert snapshot["aligned_through_utc"] == "2026-10-01T00:00:00+00:00"
++        assert snapshot["actuals"][-1]["demand_mw"] == {"value": 100, "reporting": 4, "expected": 4}
++        assert snapshot["substations"][0]["latest_demand_utc"] == "2026-10-01T00:15:00+00:00"
+ 
+         path = live_actuals_path(tmp_path, "demo-4")
+         initialize(path, "demo-4-featured")
+@@ -144,3 +145,53 @@ def test_onboarding_contract_creates_only_leaves_and_reuses_the_parent(monkeypat
+         assert tree[0]["name"] == "Germany"
+         assert tree[0]["leaf_count"] == 2
+         assert set(state["stations"]) == {"sub-1", "sub-2"}
++
++
++def test_group_finds_shared_runs_after_fast_station_tail_has_moved_past_them(tmp_path, monkeypatch):
++    from src.storage.station_hierarchy import group_key
++
++    start = pd.Timestamp("2026-10-01T00:00:00Z")
++    step = pd.Timedelta(minutes=15)
++    stations = {}
++    for station, last, demand, unit in [("fast", 300, 40, "mw"), ("slow", 4, 8, "mwh_per_interval")]:
++        folder = tmp_path / "data" / "processed" / "stations" / station
++        folder.mkdir(parents=True)
++        entry = leaf("Country: Germany", unit)
++        entry.update(actuals_file=str(folder / "actuals.csv"), forecasts_file=str(folder / "forecasts.csv"),
++                     renewable_forecasts_file=str(folder / "renewable_forecasts.csv"), renewables={"enabled": True})
++        stations[station] = entry
++        # Each demand offset is an interval when a real observation was saved.
++        actuals = [{"station_id": station, "utc_timestamp": (start + step * i).isoformat(), "actual_demand": demand}
++                   for i in range(last + 1)]
++        pd.DataFrame(actuals).to_csv(entry["actuals_file"], index=False)
++        generation = [
++            {"station_id": station, "utc_timestamp": row["utc_timestamp"], "generation_type": metric,
++             "actual_generation_mwh": value}
++            for row in actuals for metric, value in [("solar", 2), ("wind", 3)]
++        ]
++        pd.DataFrame(generation).to_csv(folder / "renewable_actuals.csv", index=False)
++        forecasts = []
++        renewable = []
++        for i in range(last + 1):
++            origin = start + step * i
++            for lead in range(1, 3):
++                base = {"station_id": station, "forecast_origin_utc": origin.isoformat(),
++                        "forecast_timestamp_utc": (origin + step * lead).isoformat(),
++                        "forecast_run_id": str(i)}
++                forecasts.append({**base, "predicted_demand": demand})
++                if station == "fast" or i < last:
++                    renewable.extend({**base, "generation_type": k, "predicted_generation_mwh": v}
++                                     for k, v in [("solar", 2), ("wind", 3)])
++        pd.DataFrame(forecasts).to_csv(entry["forecasts_file"], index=False)
++        pd.DataFrame(renewable).to_csv(entry["renewable_forecasts_file"], index=False)
++
++    monkeypatch.setattr(results_api, "ROOT", tmp_path)
++    monkeypatch.setattr(results_api, "storage_backend", lambda: "csv")
++    monkeypatch.setattr(results_api, "read_station_config", lambda: {"stations": stations})
++    group = results_api.hierarchy_results(group_key(["Germany"]), window=2, include_forecasts=True)
++    assert group["actuals"][-1]["demand_mw"] == {"value": 72, "reporting": 2, "expected": 2}
++    assert group["substations"][0]["latest_demand_utc"] == (start + step * 300).isoformat()
++    assert set(group["forecast_origins_utc"].values()) == {(start + step * 3).isoformat()}
++    assert len(group["forecasts"]) == 2
++    for point in group["forecasts"]:
++        assert [point[metric]["value"] for metric in ("demand_mw", "solar_mwh", "wind_mwh", "residual_mwh")] == [72, 4, 6, 8]
+diff --git a/tests/test_train_origin_sampling.py b/tests/test_train_origin_sampling.py
+index 653520a..5098027 100644
+--- a/tests/test_train_origin_sampling.py
++++ b/tests/test_train_origin_sampling.py
+@@ -23,3 +23,24 @@ def test_negative_maximum_is_rejected():
+         assert "cannot be negative" in str(exc)
+     else:
+         raise AssertionError("Expected a negative sample limit to fail")
++
++
++def test_weather_training_retains_later_periods_without_crossing_missing_weather_or_actuals():
++    import numpy as np
++    import pandas as pd
++    from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
++
++    days = pd.date_range("2026-01-01", periods=100, freq="15min", tz="UTC").delete(32)
++    frame = pd.DataFrame({"utc_timestamp": days, "forecast_temperature": 12.})
++    frame.loc[:8, "forecast_temperature"] = np.nan
++    frame.loc[38:45, "forecast_temperature"] = np.nan
++    eligible = archived_weather_history(frame, ["forecast_temperature"], history=4)
++    groups, train_end, val_end = forecast_split_origins(eligible, 4, 3, 15, 0.15, True, ["forecast_temperature"])
++    assert len(groups) == 3 and all(len(group) for group in groups)
++    assert eligible.utc_timestamp.iloc[0] == frame.utc_timestamp.iloc[5]
++    assert groups[0][0] == 4
++    assert eligible.utc_timestamp.iloc[groups[0][-1]] > frame.utc_timestamp.iloc[45]
++    assert groups[0][-1] + 3 <= train_end and groups[1][-1] + 3 <= val_end
++    for start in np.concatenate(groups):
++        assert eligible.forecast_temperature.iloc[start:start+3].notna().all()
++        assert eligible.utc_timestamp.iloc[start-4:start+3].diff().dropna().eq(pd.Timedelta(minutes=15)).all()

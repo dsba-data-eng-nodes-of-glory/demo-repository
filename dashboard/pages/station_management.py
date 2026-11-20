@@ -81,6 +81,10 @@ model_labels = {
     "wind_forecast": "Wind Energy forecasting",
     "residual_anomaly": "Residual Load anomaly autoencoder",
 }
+stream_input = st.selectbox(
+    "Stream input", ["csv_replay", "kafka"],
+    format_func=lambda value: "Historical CSV replay" if value == "csv_replay" else "Live Kafka feed",
+)
 with st.form("station_onboarding_form", clear_on_submit=False):
     c1, c2 = st.columns(2)
     with c1:
@@ -91,11 +95,12 @@ with st.form("station_onboarding_form", clear_on_submit=False):
             placeholder="Country: Germany\nState: North Rhine-Westphalia\nStation: Station A",
             help="Enter one parent per line as Level: Name. Add extra levels as needed. Leave blank for a standalone source station.",
         ).strip()
-        stream_input = st.selectbox(
-            "Stream input", ["csv_replay", "kafka"],
-            format_func=lambda value: "Historical CSV replay" if value == "csv_replay" else "Live Kafka feed",
-        )
-        stream_fraction = st.slider("Hold out from model fitting (%)", min_value=10, max_value=50, value=20, step=5)
+        replay_start_date = None
+        if stream_input == "csv_replay":
+            replay_start_date = st.date_input(
+                "Replay start date (UTC)", value=None,
+                help="Replay starts at 00:00 UTC. Earlier rows are used for model development. Choose the same date for stations you want to compare.",
+            )
         uploaded = st.file_uploader("Historical station workbook", type=["xlsx", "xlsm"], key="station_workbook_upload")
     with c2:
         st.markdown("**Timestamp configuration**")
@@ -132,7 +137,7 @@ with st.form("station_onboarding_form", clear_on_submit=False):
         else:
             st.caption(f"7-day history: {10080 // interval_minutes} rows · 24-hour horizon: {1440 // interval_minutes} rows")
     st.markdown("**Select models to train automatically**")
-    st.caption("Dense NN for Demand, Solar and Wind Energy. Dense Autoencoder for residual-load anomalies.")
+    st.caption("Dense NN for Demand, LSTM for Solar and Wind Energy, and Dense Autoencoder for residual-load anomalies.")
     selected_models = []
     mcols = st.columns(4)
     for idx, (model_id, label) in enumerate(model_labels.items()):
@@ -151,6 +156,8 @@ with st.form("station_onboarding_form", clear_on_submit=False):
 if submitted:
     if not station_id or uploaded is None:
         st.error("Enter a station ID and upload the Excel workbook.")
+    elif stream_input == "csv_replay" and replay_start_date is None:
+        st.error("Select a replay start date.")
     elif not selected_models:
         st.error("Select at least one model component.")
     elif "residual_anomaly" in selected_models and not {"demand_forecast", "solar_forecast", "wind_forecast"}.issubset(selected_models):
@@ -165,7 +172,7 @@ if submitted:
                     "station_id": station_id,
                     "display_name": display_name or station_id.upper(),
                     "hierarchy_path": hierarchy_path,
-                    "stream_fraction": stream_fraction / 100.0,
+                    **({"replay_start_date": replay_start_date.isoformat()} if replay_start_date else {}),
                     "stream_input": stream_input,
                     "timestamp_format": timestamp_format,
                     "source_timezone": source_timezone or "UTC",
@@ -193,6 +200,8 @@ if submitted:
 notice = st.session_state.pop("registered_station_notice", None)
 if notice:
     st.success(f"{notice['station']} registered. Initial training is queued.")
+    if notice.get("replay_start_date"):
+        st.caption(f"Replay starts {notice['replay_start_date']} at 00:00 UTC.")
     if notice.get("topic_warning"):
         st.warning(f"Kafka setup pending: {notice['topic_warning']}")
     elif notice.get("topics_ready"):
@@ -225,6 +234,8 @@ selected = st.selectbox(
     format_func=lambda key: station_label(key, stations[key]),
 )
 entry = stations[selected]
+if entry.get("replay_start_date"):
+    st.caption(f"Configured replay start · {entry['replay_start_date']} at 00:00 UTC")
 if entry.get("weather"):
     locations = ", ".join(point["location"] for point in entry["weather"].get("sites", []))
     st.caption(f"Open-Meteo weather · {locations}")

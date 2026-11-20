@@ -7,6 +7,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from dashboard.monitoring_units import interval_unit_label, unit_factor
+
 
 def _utc(frame: pd.DataFrame, column: str) -> pd.DataFrame:
     if frame.empty or column not in frame.columns:
@@ -22,6 +24,9 @@ def build_renewable_figure(
     *,
     chart_start: Any = None,
     chart_end: Any = None,
+    display_unit: str = "MWh",
+    interval_minutes: int = 15,
+    enabled_kinds: set[str] | None = None,
 ) -> tuple[go.Figure, dict[str, int]]:
     """Build one panel with separate Solar PV and Wind rows on a shared UTC axis.
 
@@ -29,23 +34,28 @@ def build_renewable_figure(
     signal its own y-range, so it cannot be visually flattened by wind output.
     Returns exact displayed trace counts for dashboard diagnostics and tests.
     """
+    unit_text = interval_unit_label(display_unit, interval_minutes)
+    factor = unit_factor("MWh", display_unit, interval_minutes)
     actuals = pd.DataFrame(actual_records).copy()
     actuals = _utc(actuals, "utc_timestamp")
     forecasts = forecast_records or {}
     start = pd.to_datetime(chart_start, utc=True, errors="coerce") if chart_start is not None else None
     end = pd.to_datetime(chart_end, utc=True, errors="coerce") if chart_end is not None else None
 
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
-        subplot_titles=("Solar PV generation", "Onshore wind generation"),
-        row_heights=[0.5, 0.5],
-    )
     counts = {"solar_actual": 0, "solar_forecast": 0, "wind_actual": 0, "wind_forecast": 0}
     specs = [
-        ("solar", "solar_actual_mwh", "Solar", "#D69E00", 1),
-        ("wind", "wind_actual_mwh", "Wind", "#159D82", 2),
+        ("solar", "solar_actual_mwh", "Solar", "#D69E00"),
+        ("wind", "wind_actual_mwh", "Wind", "#159D82"),
     ]
-    for kind, actual_col, label, line_color, row in specs:
+    if enabled_kinds is not None:
+        specs = [spec for spec in specs if spec[0] in enabled_kinds]
+    if not specs:
+        return go.Figure(), counts
+    fig = make_subplots(
+        rows=len(specs), cols=1, shared_xaxes=True, vertical_spacing=0.12,
+        subplot_titles=tuple("Solar PV generation" if spec[0] == "solar" else "Wind Energy generation" for spec in specs),
+    )
+    for row, (kind, actual_col, label, line_color) in enumerate(specs, 1):
         if not actuals.empty and actual_col in actuals.columns:
             actual_part = actuals.copy()
             actual_part[actual_col] = pd.to_numeric(actual_part[actual_col], errors="coerce")
@@ -56,11 +66,11 @@ def build_renewable_figure(
                 actual_part = actual_part[actual_part["utc_timestamp"] <= end]
             if not actual_part.empty:
                 fig.add_trace(go.Scatter(
-                    x=actual_part["utc_timestamp"], y=actual_part[actual_col],
+                    x=actual_part["utc_timestamp"], y=actual_part[actual_col] * factor,
                     mode="lines", name=f"{label} actual", legendgroup=kind,
                     line=dict(color=line_color, width=2.5), connectgaps=False,
                     hovertemplate=(
-                        f"{label} actual: %{{y:,.2f}} MWh / 15 min<br>"
+                        f"{label} actual: %{{y:,.2f}} {unit_text}<br>"
                         "%{x|%d %b %H:%M UTC}<extra></extra>"
                     ),
                 ), row=row, col=1)
@@ -91,11 +101,11 @@ def build_renewable_figure(
         if not forecast_part.empty:
             fig.add_trace(go.Scatter(
                 x=forecast_part["forecast_timestamp_utc"],
-                y=forecast_part["predicted_generation_mwh"],
+                y=forecast_part["predicted_generation_mwh"] * factor,
                 mode="lines", name=f"{label} forecast", legendgroup=kind,
                 line=dict(color=line_color, width=2.5, dash="dash"), connectgaps=False,
                 hovertemplate=(
-                    f"{label} forecast: %{{y:,.2f}} MWh / 15 min<br>"
+                    f"{label} forecast: %{{y:,.2f}} {unit_text}<br>"
                     "%{x|%d %b %H:%M UTC}<extra></extra>"
                 ),
             ), row=row, col=1)
@@ -105,22 +115,21 @@ def build_renewable_figure(
         if start is not None and pd.notna(start) and end is not None and pd.notna(end):
             fig.update_xaxes(range=[start, end])
         fig.update_layout(
-            height=500, template="plotly_dark", hovermode="x unified",
+            height=500 if len(specs) == 2 else 390, template="plotly_dark", hovermode="x unified",
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(7,20,39,.55)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             margin=dict(l=45, r=25, t=80, b=45),
         )
         fig.update_xaxes(
             showgrid=True, gridcolor="#263D58", tickformat="%d %b<br>%H:%M",
-            automargin=True, row=2, col=1,
+            automargin=True, row=len(specs), col=1,
         )
-        fig.update_xaxes(showticklabels=False, row=1, col=1)
-        fig.update_yaxes(
-            title_text="Solar (MWh / 15 min)", showgrid=True,
-            gridcolor="#263D58", rangemode="tozero", row=1, col=1,
-        )
-        fig.update_yaxes(
-            title_text="Wind (MWh / 15 min)", showgrid=True,
-            gridcolor="#263D58", rangemode="tozero", row=2, col=1,
-        )
+        if len(specs) == 2:
+            fig.update_xaxes(showticklabels=False, row=1, col=1)
+        for row, spec in enumerate(specs, 1):
+            label = "Solar" if spec[0] == "solar" else "Wind Energy"
+            fig.update_yaxes(
+                title_text=f"{label} ({unit_text})", uirevision=display_unit, showgrid=True,
+                gridcolor="#263D58", rangemode="tozero", row=row, col=1,
+            )
     return fig, counts

@@ -1,0 +1,23 @@
+{
+  "experiment_id": "tennet-wind_forecast-lstm-20261119-204444-ad1592",
+  "station": "tennet",
+  "algorithm": "lstm",
+  "component": "wind_forecast",
+  "parameters": {
+    "epochs": 18,
+    "batch_size": 8,
+    "hidden_size": 64,
+    "learning_rate": 0.001,
+    "patience": 4,
+    "max_train_origins": 256,
+    "max_validation_origins": 64,
+    "random_state": 42
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/tennet/tennet_wind_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "661aea49b3c7a1a1438cdece8af266549652c5e03ce29616f8b1b7df15db0387",
+  "created_at": "2026-11-19T15:14:44Z"
+}

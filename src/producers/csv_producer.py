@@ -272,6 +272,22 @@ def iter_rows_after_progress(
         )
 
 
+def wait_for_group_replay(ready_file: Path) -> float:
+    """Signal readiness and return the common first-publication deadline."""
+    release = ready_file.with_name("release")
+    ready_file.touch()
+    try:
+        deadline = time.monotonic() + 240
+        while not release.is_file():
+            if not ready_file.parent.is_dir() or time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the station group start.")
+            time.sleep(0.025)
+        start_at = float(release.read_text(encoding="ascii"))
+        return time.monotonic() + max(0.0, start_at - time.time())
+    finally:
+        ready_file.unlink(missing_ok=True)
+
+
 def run_producer(args: argparse.Namespace) -> None:
     if args.delay < 0 or args.limit < 0 or args.chunksize <= 0 or args.checkpoint_every <= 0:
         raise ValueError(
@@ -461,7 +477,16 @@ def run_producer(args: argparse.Namespace) -> None:
             flush=True,
         )
 
+        group_ready_file = getattr(args, "group_ready_file", None)
+        group_start = None
+        if group_ready_file is not None:
+            # Resolve the topic before signalling readiness so the first send
+            # does not wait separately for metadata on each station.
+            producer.partitions_for(topic)
+            group_start = wait_for_group_replay(group_ready_file)
         for row, timestamp in rows_with_first():
+            if group_start is not None:
+                time.sleep(max(0.0, group_start + sent * args.delay - time.monotonic()))
             if previous_timestamp is not None and timestamp <= previous_timestamp:
                 raise ValueError(
                     f"Non-increasing timestamp in {csv_path}: {timestamp} follows "
@@ -495,7 +520,7 @@ def run_producer(args: argparse.Namespace) -> None:
 
             if args.limit and sent >= args.limit:
                 break
-            if args.delay > 0:
+            if group_start is None and args.delay > 0:
                 time.sleep(args.delay)
 
         flush_acknowledged_batch()
@@ -517,6 +542,7 @@ def main() -> None:
         description="Publish a station's source CSV to its configured raw Kafka topic."
     )
     parser.add_argument("--station", required=True, help="Station key in config/stations.yaml")
+    parser.add_argument("--group-ready-file", type=Path, help="Coordinate the first publication with a batch of stations.")
     parser.add_argument("--csv", default=None, help="Streaming CSV path override")
     parser.add_argument("--history-file", default=None, help="History CSV path override")
     parser.add_argument("--topic", default=None, help="Optional Kafka topic override")

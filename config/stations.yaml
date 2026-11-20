@@ -1,26 +1,30 @@
-active_station: amprion
+active_station: 50_hertz
 stations:
   amprion:
     display_name: Amprion
+    hierarchy_path:
+    - level: Country
+      name: Germany
     enabled: true
     status: active
     input_file: data/training/amprion/demand_test.csv
     history_file: data/training/amprion/demand_train.csv
     raw_topic: amprion-raw
     featured_topic: amprion-featured
+    topics_ready: true
     model_checkpoint: models/amprion/demand_dense_nn/model.pt
     model_metadata: models/amprion/demand_dense_nn/metadata.json
     model_version: amprion-demand-dnn-v1
+    model_algorithm: dense_nn
     stream_delay_seconds: 2.0
     producer_checkpoint_every: 1
     forecast_every_steps: 1
-    actuals_file: data/processed/stations/amprion/actuals.csv
-    forecasts_file: data/processed/stations/amprion/forecasts.csv
-    topics_ready: true
-    model_algorithm: dense_nn
     interval_minutes: 15
     history_steps: 672
     horizon_steps: 96
+    expected_stream_start_utc: '2026-10-01T00:00:00Z'
+    actuals_file: data/processed/stations/amprion/actuals.csv
+    forecasts_file: data/processed/stations/amprion/forecasts.csv
     forecast_weather_file: data/raw/stations/amprion/demand_weather_forecast.csv
     forecast_weather_mode: forecast_temperature_for_future_horizon
     weather:
@@ -53,7 +57,7 @@ stations:
         longitude: 6.6371
       - location: Saarbrucken
         latitude: 49.2402
-        longitude: 6.9969
+        longitude: 7.0
       - location: Frankfurt_am_Main
         latitude: 50.1109
         longitude: 8.6821
@@ -77,14 +81,534 @@ stations:
         checkpoint: models/amprion/wind_dense_nn/model.pt
         metadata: models/amprion/wind_dense_nn/metadata.json
         model_version: amprion-wind-dense-v1
-    expected_stream_start_utc: '2026-10-01T00:00:00Z'
     residual_model_checkpoint: models/amprion/residual_anomaly/residual_ae_portable.pt
     residual_model_summary: null
     residual_demand_unit: mwh_per_interval
     residual_detection_settings:
-      decision_rule: either
+      decision_rule: both
       stat_threshold: 3.0
       ae_threshold: 10.0
       upward_only: true
+  50_hertz:
+    display_name: 50 Hertz
+    enabled: true
+    status: active
+    enabled_models:
+    - demand_forecast
+    - solar_forecast
+    - wind_forecast
+    - residual_anomaly
+    initial_training:
+      demand_forecast:
+        algorithm: dense_nn
+        status: ready
+        experiment_id: 50_hertz-demand_forecast-dense_nn-20261117-214217-50ee1e
+      solar_forecast:
+        algorithm: dense_nn
+        status: ready
+        experiment_id: 50_hertz-solar_forecast-dense_nn-20261117-214315-3b84e0
+      wind_forecast:
+        algorithm: dense_nn
+        status: ready
+        experiment_id: 50_hertz-wind_forecast-dense_nn-20261117-214350-01116b
+      residual_anomaly:
+        algorithm: dense_autoencoder
+        status: ready
+        experiment_id: 50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6
+    model_components:
+      demand_forecast:
+        enabled: true
+        algorithm: gbt
+        status: deployed
+        training_file: data/raw/stations/50_hertz/50_hertz_demand_training.csv
+        history_file: data/raw/stations/50_hertz/50_hertz_demand_history.csv
+        input_file: data/raw/stations/50_hertz/50_hertz_demand_stream.csv
+        checkpoint: models/50_hertz/experiments/50_hertz-demand_forecast-gbt-20261119-205244-52e086/model.joblib
+        metadata: models/50_hertz/experiments/50_hertz-demand_forecast-gbt-20261119-205244-52e086/metadata.json
+        active_experiment_id: 50_hertz-demand_forecast-gbt-20261119-205244-52e086
+      residual_anomaly:
+        enabled: true
+        algorithm: dense_autoencoder
+        status: deployed
+        training_file: data/raw/stations/50_hertz/50_hertz_residual_training.csv
+        checkpoint: models/50_hertz/experiments/50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6/residual_ae_portable.pt
+        metadata: models/50_hertz/experiments/50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6/metadata.json
+        active_experiment_id: 50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6
+      solar_forecast:
+        enabled: true
+        algorithm: lstm
+        status: deployed
+        training_file: data/raw/stations/50_hertz/50_hertz_solar_training.csv
+        checkpoint: models/50_hertz/experiments/50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7/model.pt
+        metadata: models/50_hertz/experiments/50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7/metadata.json
+        active_experiment_id: 50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7
+      wind_forecast:
+        enabled: true
+        algorithm: lstm
+        status: deployed
+        training_file: data/raw/stations/50_hertz/50_hertz_wind_training.csv
+        checkpoint: models/50_hertz/experiments/50_hertz-wind_forecast-lstm-20261117-225000-6f4e44/model.pt
+        metadata: models/50_hertz/experiments/50_hertz-wind_forecast-lstm-20261117-225000-6f4e44/metadata.json
+        active_experiment_id: 50_hertz-wind_forecast-lstm-20261117-225000-6f4e44
+    raw_topic: 50_hertz-raw
+    featured_topic: 50_hertz-featured
+    actuals_file: data/processed/stations/50_hertz/actuals.csv
+    forecasts_file: data/processed/stations/50_hertz/forecasts.csv
+    renewable_forecasts_file: data/processed/stations/50_hertz/renewable_forecasts.csv
+    interval_minutes: 15
+    history_window_hours: 168.0
+    forecast_horizon_hours: 24.0
+    history_steps: 672
+    horizon_steps: 96
+    source_timezone: UTC
+    timestamp_format: auto
+    registered_source_file: Station_Training_50Hertz.xlsx
+    archived_source_file: data/raw/stations/50_hertz/50_hertz_source.xlsx
+    registered_file_size_bytes: 9787257
+    model_data_diagnostics:
+      selected_models:
+      - demand_forecast
+      - solar_forecast
+      - wind_forecast
+      - residual_anomaly
+      worksheets:
+        Demand:
+          rows: 168288
+          start_utc: '2022-01-01T00:00:00+00:00'
+          end_utc: '2026-10-19T23:45:00+00:00'
+          columns:
+          - utc_timestamp
+          - demand
+          - temperature
+          - forecast_temperature
+          missing_day_ahead_rows: 132888
+        Solar:
+          rows: 168288
+          start_utc: '2022-01-01T00:00:00+00:00'
+          end_utc: '2026-10-19T23:45:00+00:00'
+          columns:
+          - utc_timestamp
+          - Photovoltaics [MWh]
+          - Photovoltaics_installed_capacity [MW]
+          - cloud_cover_mean_pct
+          - shortwave_radiation_mean_prev_hour_w_m2
+          - forecast_cloud_cover_mean_pct
+          - forecast_shortwave_radiation_mean_prev_hour_w_m2
+          missing_day_ahead_rows: 131424
+        Wind:
+          rows: 168288
+          start_utc: '2022-01-01T00:00:00+00:00'
+          end_utc: '2026-10-19T23:45:00+00:00'
+          columns:
+          - utc_timestamp
+          - Wind onshore [MWh]
+          - Wind_onshore_installed_capacity [MW]
+          - wind_speed_100m_mean_ms
+          - wind_direction_100m_circular_mean_deg
+          - future_wind_speed
+          - future_wind_direction
+          missing_day_ahead_rows: 133940
+      interval_minutes: 15
+      source_timezone: UTC
+      weather: &id001
+        provider: open_meteo
+        forecast_model: ecmwf_ifs
+        sites:
+        - location: Berlin
+          latitude: 52.52
+          longitude: 13.405
+        - location: Hamburg
+          latitude: 53.5511
+          longitude: 9.9937
+        - location: Rostock
+          latitude: 54.0924
+          longitude: 12.0991
+        - location: Schwerin
+          latitude: 53.6355
+          longitude: 11.4012
+        - location: Magdeburg
+          latitude: 52.1205
+          longitude: 11.6276
+        - location: Cottbus
+          latitude: 51.7563
+          longitude: 14.3329
+        - location: Leipzig
+          latitude: 51.3397
+          longitude: 12.3731
+        - location: Dresden
+          latitude: 51.0504
+          longitude: 13.7373
+        - location: Erfurt
+          latitude: 50.9848
+          longitude: 11.0299
+    model_row_counts:
+      demand_forecast:
+        total_rows: 168288
+        training_rows: 16896
+        fit_rows: 11827
+        validation_rows: 2534
+        test_rows: 2535
+        stream_rows: 1824
+      solar_forecast:
+        total_rows: 35040
+        train_rows: 24528
+        validation_rows: 5256
+        test_rows: 5256
+      wind_forecast:
+        total_rows: 16896
+        train_rows: 11827
+        validation_rows: 2534
+        test_rows: 2535
+      residual_anomaly:
+        total_rows: 166464
+        fit_rows: 133171
+        validation_rows: 16646
+        calibration_rows: 16647
+    replay_start_date: '2026-10-01'
+    residual_demand_unit: mwh_per_interval
+    stream_delay_seconds: 2.0
+    renewables:
+      enabled: true
+      components_enabled:
+        solar: true
+        wind: true
+      serving_adapter_supported: true
+      interval_minutes: 15
+      forecast_every_steps: 1
+      solar:
+        enabled: true
+        train_file: data/raw/stations/50_hertz/50_hertz_solar_training.csv
+        test_file: null
+        replay_file: data/raw/stations/50_hertz/50_hertz_solar_replay.csv
+        data_file: data/raw/stations/50_hertz/50_hertz_solar_data.csv
+        checkpoint: models/50_hertz/experiments/50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7/model.pt
+        metadata: models/50_hertz/experiments/50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7/metadata.json
+        model_version: v1
+        status: pending_training
+        algorithm: lstm
+        experiment_id: 50_hertz-solar_forecast-lstm-20261117-224441-bc1ce7
+      wind:
+        enabled: true
+        train_file: data/raw/stations/50_hertz/50_hertz_wind_training.csv
+        test_file: null
+        replay_file: data/raw/stations/50_hertz/50_hertz_wind_replay.csv
+        data_file: data/raw/stations/50_hertz/50_hertz_wind_data.csv
+        checkpoint: models/50_hertz/experiments/50_hertz-wind_forecast-lstm-20261117-225000-6f4e44/model.pt
+        metadata: models/50_hertz/experiments/50_hertz-wind_forecast-lstm-20261117-225000-6f4e44/metadata.json
+        model_version: v1
+        status: pending_training
+        algorithm: lstm
+        experiment_id: 50_hertz-wind_forecast-lstm-20261117-225000-6f4e44
+    weather: *id001
+    registered_rows: 168288
+    demand_data_file: null
+    demand_start_utc: '2022-01-01T00:00:00+00:00'
+    demand_end_utc: '2026-10-19T23:45:00+00:00'
+    training_file: data/raw/stations/50_hertz/50_hertz_demand_training.csv
+    history_file: data/raw/stations/50_hertz/50_hertz_demand_history.csv
+    input_file: data/raw/stations/50_hertz/50_hertz_demand_stream.csv
+    model_checkpoint: models/50_hertz/v1/50_hertz_encoder_decoder_lstm.pt
+    model_metadata: models/50_hertz/v1/metadata.json
+    model_version: v3
+    model_algorithm: gbt
+    training_rows: 166464
+    history_rows: 672
+    stream_rows: 1824
+    stream_start_utc: '2026-10-01T00:00:00+00:00'
+    stream_end_utc: '2026-10-19T23:45:00+00:00'
+    expected_stream_start_utc: '2026-10-01T00:00:00+00:00'
+    residual_model_checkpoint: models/50_hertz/experiments/50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6/residual_ae_portable.pt
+    residual_model_summary: models/50_hertz/experiments/50_hertz-residual_anomaly-dense_autoencoder-20261117-214405-f889e6/metadata.json
+    residual_detection_settings:
+      decision_rule: both
+      upward_only: true
+      stat_threshold: 3
+      ae_threshold: 10
+    stream_input: csv_replay
+    topics_ready: true
+    hierarchy_path:
+    - level: Country
+      name: Germany
+    hierarchy_grid_offset_seconds: 0
+    active_model:
+      experiment_id: 50_hertz-demand_forecast-gbt-20261119-205244-52e086
+      algorithm: gbt
+      version: v3
+      artifact_path: models/50_hertz/experiments/50_hertz-demand_forecast-gbt-20261119-205244-52e086/model.joblib
+      metadata_path: models/50_hertz/experiments/50_hertz-demand_forecast-gbt-20261119-205244-52e086/metadata.json
+      feature_schema: electricity_tabular_v1
+      deployed_at: '2026-11-19T15:30:10.231138+00:00'
+  tennet:
+    display_name: tennet
+    enabled: true
+    status: active
+    enabled_models:
+    - demand_forecast
+    - solar_forecast
+    - wind_forecast
+    - residual_anomaly
+    initial_training:
+      demand_forecast:
+        algorithm: dense_nn
+        status: ready
+        experiment_id: tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd
+      solar_forecast:
+        algorithm: lstm
+        status: ready
+        experiment_id: tennet-solar_forecast-lstm-20261119-204413-1c5822
+      wind_forecast:
+        algorithm: lstm
+        status: ready
+        experiment_id: tennet-wind_forecast-lstm-20261119-204444-ad1592
+      residual_anomaly:
+        algorithm: dense_autoencoder
+        status: ready
+        experiment_id: tennet-residual_anomaly-dense_autoencoder-20261119-204517-28a41a
+    model_components:
+      demand_forecast:
+        enabled: true
+        algorithm: dense_nn
+        status: deployed
+        training_file: data/raw/stations/tennet/tennet_demand_training.csv
+        history_file: data/raw/stations/tennet/tennet_demand_history.csv
+        input_file: data/raw/stations/tennet/tennet_demand_stream.csv
+        checkpoint: models/tennet/experiments/tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd/model.joblib
+        metadata: models/tennet/experiments/tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd/metadata.json
+        active_experiment_id: tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd
+      residual_anomaly:
+        enabled: true
+        algorithm: dense_autoencoder
+        status: deployed
+        training_file: data/raw/stations/tennet/tennet_residual_training.csv
+        checkpoint: models/tennet/experiments/tennet-residual_anomaly-dense_autoencoder-20261119-204517-28a41a/residual_ae_portable.pt
+        metadata: models/tennet/experiments/tennet-residual_anomaly-dense_autoencoder-20261119-204517-28a41a/metadata.json
+        active_experiment_id: tennet-residual_anomaly-dense_autoencoder-20261119-204517-28a41a
+      solar_forecast:
+        enabled: true
+        algorithm: lstm
+        status: deployed
+        training_file: data/raw/stations/tennet/tennet_solar_training.csv
+        checkpoint: models/tennet/experiments/tennet-solar_forecast-lstm-20261119-204413-1c5822/model.pt
+        metadata: models/tennet/experiments/tennet-solar_forecast-lstm-20261119-204413-1c5822/metadata.json
+        active_experiment_id: tennet-solar_forecast-lstm-20261119-204413-1c5822
+      wind_forecast:
+        enabled: true
+        algorithm: lstm
+        status: deployed
+        training_file: data/raw/stations/tennet/tennet_wind_training.csv
+        checkpoint: models/tennet/experiments/tennet-wind_forecast-lstm-20261119-204444-ad1592/model.pt
+        metadata: models/tennet/experiments/tennet-wind_forecast-lstm-20261119-204444-ad1592/metadata.json
+        active_experiment_id: tennet-wind_forecast-lstm-20261119-204444-ad1592
+    raw_topic: tennet-raw
+    featured_topic: tennet-featured
+    actuals_file: data/processed/stations/tennet/actuals.csv
+    forecasts_file: data/processed/stations/tennet/forecasts.csv
+    renewable_forecasts_file: data/processed/stations/tennet/renewable_forecasts.csv
+    interval_minutes: 15
+    history_window_hours: 168.0
+    forecast_horizon_hours: 24.0
+    history_steps: 672
+    horizon_steps: 96
+    source_timezone: UTC
+    timestamp_format: auto
+    registered_source_file: tennet_source.xlsx
+    archived_source_file: data/raw/stations/tennet/tennet_source.xlsx
+    registered_file_size_bytes: 10584490
+    model_data_diagnostics:
+      selected_models:
+      - demand_forecast
+      - solar_forecast
+      - wind_forecast
+      - residual_anomaly
+      worksheets:
+        Demand:
+          rows: 168288
+          start_utc: '2022-01-01T00:00:00+00:00'
+          end_utc: '2026-10-19T23:45:00+00:00'
+          columns:
+          - utc_timestamp
+          - demand
+          - temperature
+          - forecast_temperature
+          missing_day_ahead_rows: 132888
+        Solar:
+          rows: 168288
+          start_utc: '2022-01-01T00:00:00+00:00'
+          end_utc: '2026-10-19T23:45:00+00:00'
+          columns:
+          - utc_timestamp
+          - Photovoltaics [MWh]
+          - Photovoltaics_installed_capacity [MW]
+          - cloud_cover_mean_pct
+          - shortwave_radiation_mean_prev_hour_w_m2
+          - forecast_cloud_cover_mean_pct
+          - forecast_shortwave_radiation_mean_prev_hour_w_m2
+          missing_day_ahead_rows: 131424
+        Wind:
+          rows: 168288
+          start_utc: '2022-01-01T00:00:00+00:00'
+          end_utc: '2026-10-19T23:45:00+00:00'
+          columns:
+          - utc_timestamp
+          - Wind onshore [MWh]
+          - Wind_onshore_installed_capacity [MW]
+          - wind_speed_100m_mean_ms
+          - wind_direction_100m_circular_mean_deg
+          - future_wind_speed
+          - future_wind_direction
+          missing_day_ahead_rows: 133940
+      interval_minutes: 15
+      source_timezone: UTC
+      weather: &id002
+        provider: open_meteo
+        forecast_model: ecmwf_ifs
+        sites:
+        - location: Flensburg
+          latitude: 54.7833
+          longitude: 9.4333
+        - location: Kiel
+          latitude: 54.3233
+          longitude: 10.1228
+        - location: Hamburg
+          latitude: 53.5511
+          longitude: 9.9937
+        - location: Bremen
+          latitude: 53.0793
+          longitude: 8.8017
+        - location: Oldenburg
+          latitude: 53.1435
+          longitude: 8.2146
+        - location: Hannover
+          latitude: 52.3759
+          longitude: 9.732
+        - location: Braunschweig
+          latitude: 52.2689
+          longitude: 10.5268
+        - location: Kassel
+          latitude: 51.3127
+          longitude: 9.4797
+        - location: Wuerzburg
+          latitude: 49.7913
+          longitude: 9.9534
+        - location: Nuremberg
+          latitude: 49.4521
+          longitude: 11.0767
+        - location: Regensburg
+          latitude: 49.0134
+          longitude: 12.1016
+        - location: Munich
+          latitude: 48.1351
+          longitude: 11.582
+    model_row_counts:
+      demand_forecast:
+        total_rows: 168288
+        training_rows: 35712
+        fit_rows: 24998
+        eligible_origins_by_split:
+        - 22672
+        - 5262
+        - 5262
+        validation_rows: 5357
+        test_rows: 5357
+        stream_rows: 1824
+      solar_forecast:
+        total_rows: 35712
+        train_rows: 24998
+        eligible_origins_by_split:
+        - 24231
+        - 5262
+        - 5262
+        validation_rows: 5357
+        test_rows: 5357
+      wind_forecast:
+        total_rows: 35712
+        train_rows: 24998
+        eligible_origins_by_split:
+        - 21525
+        - 5262
+        - 5262
+        validation_rows: 5357
+        test_rows: 5357
+      residual_anomaly:
+        total_rows: 166464
+        fit_rows: 133171
+        validation_rows: 16646
+        calibration_rows: 16647
+    replay_start_date: '2026-10-01'
+    residual_demand_unit: mwh_per_interval
+    stream_delay_seconds: 2.0
+    renewables:
+      enabled: true
+      components_enabled:
+        solar: true
+        wind: true
+      serving_adapter_supported: true
+      interval_minutes: 15
+      forecast_every_steps: 1
+      solar:
+        enabled: true
+        train_file: data/raw/stations/tennet/tennet_solar_training.csv
+        test_file: null
+        replay_file: data/raw/stations/tennet/tennet_solar_replay.csv
+        data_file: data/raw/stations/tennet/tennet_solar_data.csv
+        checkpoint: models/tennet/experiments/tennet-solar_forecast-lstm-20261119-204413-1c5822/model.pt
+        metadata: models/tennet/experiments/tennet-solar_forecast-lstm-20261119-204413-1c5822/metadata.json
+        model_version: v2
+        algorithm: lstm
+        status: pending_training
+        experiment_id: tennet-solar_forecast-lstm-20261119-204413-1c5822
+      wind:
+        enabled: true
+        train_file: data/raw/stations/tennet/tennet_wind_training.csv
+        test_file: null
+        replay_file: data/raw/stations/tennet/tennet_wind_replay.csv
+        data_file: data/raw/stations/tennet/tennet_wind_data.csv
+        checkpoint: models/tennet/experiments/tennet-wind_forecast-lstm-20261119-204444-ad1592/model.pt
+        metadata: models/tennet/experiments/tennet-wind_forecast-lstm-20261119-204444-ad1592/metadata.json
+        model_version: v2
+        algorithm: lstm
+        status: pending_training
+        experiment_id: tennet-wind_forecast-lstm-20261119-204444-ad1592
+    weather: *id002
+    registered_rows: 168288
+    demand_data_file: null
+    demand_start_utc: '2022-01-01T00:00:00+00:00'
+    demand_end_utc: '2026-10-19T23:45:00+00:00'
+    training_file: data/raw/stations/tennet/tennet_demand_training.csv
+    history_file: data/raw/stations/tennet/tennet_demand_history.csv
+    input_file: data/raw/stations/tennet/tennet_demand_stream.csv
+    model_checkpoint: models/tennet/v1/tennet_encoder_decoder_lstm.pt
+    model_metadata: models/tennet/v1/metadata.json
+    model_version: v2
+    model_algorithm: dense_nn
+    training_rows: 166464
+    history_rows: 672
+    stream_rows: 1824
+    stream_start_utc: '2026-10-01T00:00:00+00:00'
+    stream_end_utc: '2026-10-19T23:45:00+00:00'
+    expected_stream_start_utc: '2026-10-01T00:00:00+00:00'
+    residual_model_checkpoint: models/tennet/experiments/tennet-residual_anomaly-dense_autoencoder-20261119-204517-28a41a/residual_ae_portable.pt
+    residual_model_summary: models/tennet/experiments/tennet-residual_anomaly-dense_autoencoder-20261119-204517-28a41a/metadata.json
+    residual_detection_settings:
+      decision_rule: both
+      upward_only: true
+      stat_threshold: null
+      ae_threshold: null
+    stream_input: csv_replay
+    topics_ready: true
+    hierarchy_path:
+    - level: Country
+      name: Germany
+    hierarchy_grid_offset_seconds: 0
+    active_model:
+      experiment_id: tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd
+      algorithm: dense_nn
+      version: v2
+      artifact_path: models/tennet/experiments/tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd/model.joblib
+      metadata_path: models/tennet/experiments/tennet-demand_forecast-dense_nn-20261119-204349-b0c6cd/metadata.json
+      feature_schema: electricity_tabular_v1
+      deployed_at: '2026-11-19T15:14:11.905669+00:00'
 active_stations:
+- 50_hertz
 - amprion
+- tennet

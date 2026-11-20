@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 from pathlib import Path
+import time
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,7 +11,8 @@ import streamlit as st
 
 try:
     from dashboard.ui import setup_page, render_status_strip
-    from dashboard.hierarchy_monitoring import METRICS, render_group, show_clock
+    from dashboard.hierarchy_monitoring import METRICS, render_group
+    from src.storage.hierarchy_rollup import demand_to_mw_factor
     from dashboard.station_tree import select_monitoring_node
     from dashboard.renewable_plot import build_renewable_figure
     from dashboard.renewable_summary import build_renewable_summaries
@@ -22,13 +24,18 @@ except ModuleNotFoundError:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from dashboard.ui import setup_page, render_status_strip
-    from dashboard.hierarchy_monitoring import METRICS, render_group, show_clock
+    from dashboard.hierarchy_monitoring import METRICS, render_group
+    from src.storage.hierarchy_rollup import demand_to_mw_factor
     from dashboard.station_tree import select_monitoring_node
     from dashboard.renewable_plot import build_renewable_figure
     from dashboard.renewable_summary import build_renewable_summaries
     from dashboard.forecast_selection import select_latest_complete_forecast_run
     from dashboard.residual_plot import residual_figures, residual_summary
     from dashboard.replay_display import filter_actuals_to_cutoff, read_last_acked_timestamp, resolve_actuals_display_cutoff
+
+from dashboard.monitoring_chart import ACTUAL_COLOR, FORECAST_COLOR, apply_monitoring_axes, mark_now, render_initializing
+from dashboard.monitoring_progress import forecast_cursor, timeline_is_live
+from dashboard.monitoring_units import interval_unit_label, unit_factor
 
 @st.cache_data(ttl=1, show_spinner=False)
 def api_get(api_url: str, endpoint: str, params: dict | None = None) -> dict:
@@ -77,18 +84,12 @@ def as_utc(frame: pd.DataFrame, column: str) -> pd.DataFrame:
     )
 
 
-def number_column(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+def number_column(frame: pd.DataFrame, column: str, factor: float = 1.0) -> pd.DataFrame:
     if frame.empty or column not in frame.columns:
         return pd.DataFrame()
     result = frame.copy()
-    result[column] = pd.to_numeric(result[column], errors="coerce")
+    result[column] = pd.to_numeric(result[column], errors="coerce") * factor
     return result.dropna(subset=[column])
-
-
-def fmt_mw(value) -> str:
-    if value is None or pd.isna(value):
-        return "—"
-    return f"{float(value):,.0f} MW"
 
 
 def fmt_utc(value) -> str:
@@ -102,17 +103,18 @@ def fmt_utc(value) -> str:
 # ---------------------------------------------------------------------
 api = setup_page("Live Monitoring", "monitoring")
 
-heading, clock = st.columns([3, 1], vertical_alignment="center")
-with heading:
-    st.title("⚡ Live Monitoring")
-with clock:
-    show_clock()
+monitoring_title = st.empty()
+monitoring_title.title("⚡ Live Monitoring")
 
 # ---------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------
 with st.sidebar:
     st.header("Monitoring Controls")
+    display_unit = st.radio(
+        "Display unit", ("MWh", "MW"), horizontal=True, key="monitoring_display_unit",
+        help="MWh shows energy per observation interval. MW shows average power over that interval.",
+    )
     auto_refresh = st.checkbox("Enable auto-refresh", value=True)
     # Migrate one existing Streamlit session to the new default. Subsequent user
     # choices are kept, so an explicit 5/10/15-second selection is respected.
@@ -178,16 +180,21 @@ if tree:
 else:
     station = st.selectbox("Station", station_ids, index=station_ids.index(preferred_station)
                            if preferred_station in station_ids else 0)
-    selected_node = {"id": station, "children": []}
+    selected_node = {"id": station, "name": stations[station].get("display_name") or station, "children": []}
 station = selected_node["id"]
+monitoring_title.title(f"⚡ Live Monitoring · {selected_node['name']}")
 
-use_hierarchy_view = bool(selected_node["children"] or stations.get(station, {}).get("hierarchy_path"))
-if use_hierarchy_view:
-    with st.sidebar:
-        group_metric = st.selectbox("Show", list(METRICS), format_func=lambda metric: METRICS[metric][0])
+use_hierarchy_view = bool(selected_node["children"])
+group_metric = None
+with st.sidebar:
+    if not selected_node["children"] and stations.get(station, {}).get("hierarchy_path"):
+        use_hierarchy_view = not st.checkbox(
+            "Show individual model and anomaly panels", value=True, key=f"individual_panels_{station}",
+        )
+    if use_hierarchy_view:
         include_forecasts = st.checkbox("Show forecasts", value=True)
         if not selected_node["children"]:
-            use_hierarchy_view = not st.checkbox("Show individual model and anomaly panels")
+            group_metric = st.selectbox("Show", list(METRICS), format_func=lambda metric: METRICS[metric][0])
 
 
 def render_live_monitoring_panel(
@@ -199,6 +206,7 @@ def render_live_monitoring_panel(
     auto_refresh: bool,
     refresh_seconds: int,
     show_diagnostics: bool = False,
+    display_unit: str = "MWh",
 ) -> None:
     """Render the live monitoring panel in isolation from the app shell.
 
@@ -228,6 +236,14 @@ def render_live_monitoring_panel(
     station_interval_minutes = int(stations[station].get("interval_minutes", 15))
     station_horizon_steps = int(stations[station].get("horizon_steps", 96))
     station_forecast_horizon_hours = float(stations[station].get("forecast_horizon_hours", 24))
+    unit_text = interval_unit_label(display_unit, station_interval_minutes)
+    demand_factor = demand_to_mw_factor(stations[station], station_interval_minutes) * unit_factor(
+        "MW", display_unit, station_interval_minutes,
+    )
+    energy_factor = unit_factor("MWh", display_unit, station_interval_minutes)
+
+    def format_value(value) -> str:
+        return f"{value:,.2f} {display_unit}" if pd.notna(value) else "—"
 
     # ---------------------------------------------------------------------
     # Load saved actuals and forecasts through FastAPI
@@ -237,18 +253,20 @@ def render_live_monitoring_panel(
         # forecast-history selector. The API reads this tail without loading the
         # entire append-only forecasts.csv file.
         forecast_payload = api_get(
-            api, "/results/forecasts", {"station": station, "limit": 2000}
+            api, "/results/forecasts", {"station": station, "limit": 2000, "include_live_progress": True}
         )
     except requests.RequestException as exc:
-        st.error(f"Could not retrieve forecasts from FastAPI: {exc}")
-        st.stop()
+        render_initializing("Demand forecasting", "Waiting for a response from the forecast service.")
+        if show_diagnostics:
+            st.caption(str(exc))
+        return
 
     forecasts = pd.DataFrame(forecast_payload.get("records", []))
     actuals = pd.DataFrame()
 
     if not forecasts.empty:
         forecasts = as_utc(forecasts, "forecast_timestamp_utc")
-        forecasts = number_column(forecasts, "predicted_demand")
+        forecasts = number_column(forecasts, "predicted_demand", demand_factor)
 
         for col in ["forecast_issued_at_utc", "forecast_origin_utc"]:
             if col in forecasts.columns:
@@ -294,54 +312,25 @@ def render_live_monitoring_panel(
         forecast_origin=forecast_origin,
     )
 
-    # Until the first complete forecast is saved, show an initialization state
-    # instead of the actual-only fallback graph. This is display-only: the
-    # existing demand/renewable chart windows and x-axis ranges remain unchanged.
-    if latest_run.empty:
-        replay_text = (
-            fmt_utc(replay_timestamp) if replay_timestamp is not None
-            else "Waiting for the first replay observation"
-        )
-        st.markdown(
-            f"""
-            <style>
-              .forecast-init-card {{
-                min-height: 320px; display:flex; flex-direction:column;
-                align-items:center; justify-content:center; text-align:center;
-                border:1px solid rgba(128,128,128,.28); border-radius:18px;
-                padding:34px 24px; margin:12px 0 22px 0;
-                background:linear-gradient(135deg, rgba(30,64,110,.10), rgba(14,165,160,.08));
-              }}
-              .forecast-init-spinner {{
-                width:58px; height:58px; border-radius:50%;
-                border:5px solid rgba(100,116,139,.22);
-                border-top-color:#0ea5a4; border-right-color:#3b82f6;
-                animation:forecast-spin 1.05s linear infinite;
-                box-shadow:0 0 24px rgba(14,165,164,.15);
-                margin-bottom:22px;
-              }}
-              @keyframes forecast-spin {{ to {{ transform:rotate(360deg); }} }}
-              .forecast-init-title {{ font-size:23px; font-weight:700; margin-bottom:9px; }}
-              .forecast-init-copy {{ max-width:650px; color:var(--text-color); opacity:.78;
-                font-size:14px; line-height:1.6; }}
-              .forecast-init-meta {{ margin-top:18px; font-size:12px; opacity:.65; }}
-            </style>
-            <div class="forecast-init-card">
-              <div class="forecast-init-spinner"></div>
-              <div class="forecast-init-title">Initializing demand forecasting</div>
-              <div class="forecast-init-copy">
-                Preparing the historical input window and waiting for the first
-                complete forecast. Monitoring charts will appear when the forecast
-                is ready.
-              </div>
-              <div class="forecast-init-meta">Replay progress: {replay_text}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    progress = st.session_state.setdefault("monitoring_timeline_progress", {})
+    replay_start = stations[station].get("expected_stream_start_utc")
+    live_through = forecast_payload.get("live_through_utc")
+    predictor_run = forecast_payload.get("predictor_run")
+    if forecast_origin is not None and (
+        "forecast_origin_utc" not in latest_run or latest_run["forecast_origin_utc"].isna().all()
+    ):
+        latest_run = latest_run.assign(forecast_origin_utc=forecast_origin)
+    cursor = forecast_cursor(
+        latest_run.to_dict(orient="records"), live_through, replay_start, station_horizon_steps, station_interval_minutes,
+    )
+    if not timeline_is_live(progress, ("station", station, "demand"), cursor, predictor_run):
+        render_initializing(
+            "Demand forecasting", "Waiting for a complete forecast and a newer live forecast origin.",
+            f"Replay progress · {fmt_utc(replay_timestamp or live_through)}" if replay_timestamp is not None or live_through else "",
         )
         return
 
-    # 5,000 rows comfortably covers the 72-hour view and forecast-context window.
+    # Allow room for the displayed history and the forecast context.
     actual_params = {"station": station, "limit": 600, "recent_only": True}
     if actuals_display_cutoff is not None:
         actual_params["end_time"] = actuals_display_cutoff.isoformat()
@@ -353,7 +342,7 @@ def render_live_monitoring_panel(
     actuals = pd.DataFrame(actual_payload.get("records", []))
     if not actuals.empty:
         actuals = as_utc(actuals, "utc_timestamp")
-        actuals = number_column(actuals, "actual_demand")
+        actuals = number_column(actuals, "actual_demand", demand_factor)
         actuals = (
             actuals.drop_duplicates("utc_timestamp", keep="last")
             .sort_values("utc_timestamp")
@@ -370,6 +359,14 @@ def render_live_monitoring_panel(
             residual_payload = api_get(api, '/results/residual/forecast', {'station':station,'history_runs':24,'cached_only':True,'origin_utc':forecast_origin.isoformat() if forecast_origin is not None else None,'lookback_minutes':60})
         except requests.RequestException as exc:
             residual_payload = {'available':False,'message':f'Residual risk service unavailable: {exc}'}
+    residual_origin = residual_payload.get("origin_utc")
+    residual_cursor = forecast_cursor(
+        [dict(row, forecast_origin_utc=residual_origin) for row in residual_payload.get("records", [])],
+        live_through, replay_start, station_horizon_steps, station_interval_minutes,
+    ) if residual_payload.get("available") else None
+    residual_ready = timeline_is_live(
+        progress, ("station", station, "residual"), residual_cursor, predictor_run,
+    )
     # ---------------------------------------------------------------------
     # KPI cards
     # ---------------------------------------------------------------------
@@ -391,10 +388,10 @@ def render_live_monitoring_panel(
 
     st.subheader("Demand · current forecast")
     k1, k2, k3, k4 = st.columns(4, gap="small")
-    k1.metric("Latest actual", fmt_mw(latest_actual))
-    k2.metric("Next forecast", fmt_mw(first_forecast))
-    k3.metric("24h peak", fmt_mw(peak_forecast))
-    k4.metric("24h average", fmt_mw(average_forecast))
+    k1.metric("Latest actual", format_value(latest_actual))
+    k2.metric("Next forecast", format_value(first_forecast))
+    k3.metric("24h peak", format_value(peak_forecast))
+    k4.metric("24h average", format_value(average_forecast))
     if forecast_origin is not None:
         st.caption(f"Forecast origin · {fmt_utc(forecast_origin)}")
     if show_diagnostics and not latest_run.empty and "forecast_issued_at_utc" in latest_run.columns:
@@ -436,10 +433,10 @@ def render_live_monitoring_panel(
                         y=actual_history["actual_demand"],
                         mode="lines",
                         name="Actual demand",
-                        line=dict(color="#1976D2", width=3.5),
+                        line=dict(color=ACTUAL_COLOR, width=3.5),
                         connectgaps=False,
                         hovertemplate=(
-                            "Actual: %{y:,.0f} MW<br>"
+                            f"Actual: %{{y:,.2f}} {unit_text}<br>"
                             "Time: %{x|%d %b %H:%M UTC}<extra></extra>"
                         ),
                     )
@@ -463,60 +460,19 @@ def render_live_monitoring_panel(
                     y=forecast_y,
                     mode="lines",
                     name="Forecast",
-                    line=dict(color="#F57C00", width=3.5, dash="dash"),
+                    line=dict(color=FORECAST_COLOR, width=3.5, dash="dash"),
                     connectgaps=False,
                     hovertemplate=(
-                        "Forecast: %{y:,.0f} MW<br>"
+                        f"Forecast: %{{y:,.2f}} {unit_text}<br>"
                         "Time: %{x|%d %b %H:%M UTC}<extra></extra>"
                     ),
                 )
             )
-            fig.add_vline(
-                x=forecast_origin,
-                line_width=2,
-                line_dash="dash",
-                line_color="#888888",
-                annotation_text="Now",
-                annotation_position="top",
-                annotation_font_color="#dceafa",
-            )
+            mark_now(fig, forecast_origin)
             chart_start = history_start
         else:
-            # Legacy forecast rows without an explicit origin can still be plotted.
             chart_start = forecast_targets[0]
-            st.warning("Forecast origin is missing; showing the forecast without a Now marker.")
-
         chart_end = latest_run["forecast_timestamp_utc"].max()
-        tick_interval_hours = 6 if history_hours >= 48 else 3
-        fig.update_xaxes(
-            range=[chart_start, chart_end],
-            dtick=tick_interval_hours * 60 * 60 * 1000,
-            tickformat="%d %b<br>%H:%M",
-            tickangle=0,
-            tickfont=dict(size=11),
-            automargin=True,
-            ticklabeloverflow="allow",
-        )
-
-    elif not actuals.empty:
-        # Actual-only fallback while waiting for a forecast run.
-        latest_time = actuals["utc_timestamp"].max()
-        chart_start = latest_time - pd.Timedelta(hours=history_hours)
-        chart_end = latest_time
-        actual_history = actuals[actuals["utc_timestamp"] >= chart_start]
-        fig.add_trace(
-            go.Scatter(
-                x=actual_history["utc_timestamp"],
-                y=actual_history["actual_demand"],
-                mode="lines",
-                name="Actual demand",
-                line=dict(color="#1976D2", width=3.5),
-                connectgaps=False,
-            )
-        )
-        st.info("Waiting for a saved forecast run; showing actual demand only.")
-    else:
-        st.info("Neither actual-demand observations nor forecast records were returned by the results API.")
 
     if show_diagnostics:
         # Surface retrieval sizes and the selected forecast boundary so a blank/stale
@@ -529,13 +485,13 @@ def render_live_monitoring_panel(
         st.caption(
             f"Actual-data display cutoff: {fmt_utc(actuals_display_cutoff) if actuals_display_cutoff is not None else 'not configured'} "
             f"({actuals_cutoff_source.replace('_', ' ')}). "
-            "Before the replay reaches 1 October, the graph shows only pre-stream history; "
-            "replay actuals are revealed up to the producer's acknowledged timestamp."
+            "The graph opens once a newer complete live forecast is available. "
+            "Observations are shown through the forecast origin."
         )
 
     # Residual-load anomaly intervals are FORECAST risks, not labels on observed demand.
     # Overlay only when both chart and residual assessment share the same origin.
-    if forecast_origin is not None and residual_payload.get('available') and not latest_run.empty:
+    if forecast_origin is not None and residual_ready and not latest_run.empty:
         from dashboard.residual_plot import add_spike_intervals
         assessment_origin = pd.to_datetime(residual_payload.get('origin_utc'), utc=True, errors='coerce')
         if pd.notna(assessment_origin) and assessment_origin == pd.Timestamp(forecast_origin):
@@ -546,45 +502,15 @@ def render_live_monitoring_panel(
             st.caption('Residual spike overlay is waiting for a forecast origin matching the Demand chart.')
 
     if fig.data:
-        fig.update_layout(
-            height=480,
-            template="plotly_dark",
-            hovermode="x unified",
-            font=dict(color="#e8f1ff",size=12),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(8,27,48,.50)",
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                x=0,
-            ),
-            margin=dict(l=25, r=25, t=65, b=35),
-            uirevision=f"live-monitor-{station}-{history_hours}",
-        )
-        fig.update_xaxes(
-            title_text="Time (UTC)",
-            showgrid=True,
-            gridcolor="#284365",
-            zeroline=False,
-            rangeslider_visible=False,
-            tickangle=0,
-            tickfont=dict(size=11,color="#d5e4fa"),
-            title_font=dict(color="#d5e4fa"),
-            automargin=True,
-        )
-        fig.update_yaxes(
-            title_text="Electricity demand (MW)",
-            showgrid=True,
-            gridcolor="#284365",
-            zeroline=False,
-            tickfont=dict(color="#d5e4fa"), title_font=dict(color="#d5e4fa"),
-            automargin=True,
-        )
+        apply_monitoring_axes(fig, chart_start, chart_end, history_hours, f"Electricity demand ({unit_text})",
+                              display_unit, f"live-monitor-{station}-{history_hours}")
         st.plotly_chart(fig, use_container_width=True)
 
     # Residual-load spike outlook below Demand; score diagnostics live in Model Analysis.
     st.subheader('Residual Load Spike Detection')
-    if residual_payload.get('available'):
+    if residual_available and not residual_ready:
+        render_initializing("Residual Load", "Waiting for a complete assessment at a newer live forecast origin.")
+    elif residual_ready:
         lag = residual_payload.get('snapshot_lag_minutes')
         if lag is not None and lag > 0:
             st.caption(
@@ -594,12 +520,14 @@ def render_live_monitoring_panel(
             )
         summary = residual_summary(residual_payload)
         r1,r2,r3,r4 = st.columns(4,gap='small')
-        fmt=lambda x: '—' if x is None else f'{x:,.0f}'
-        r1.metric('Next residual',fmt(summary['next']))
-        r2.metric('24h peak',fmt(summary['peak']))
-        r3.metric('Peak 30m ramp',fmt(summary['ramp']))
+        for col, label, key in ((r1, 'Next residual', 'next'), (r2, '24h peak', 'peak'),
+                                (r3, 'Peak 30m ramp', 'ramp')):
+            raw = summary[key]
+            col.metric(label, format_value(raw * energy_factor if raw is not None else None))
         r4.metric('Spike intervals',str(summary['flagged']))
-        residual_fig, _ = residual_figures(residual_payload)
+        residual_fig, _ = residual_figures(
+            residual_payload, display_unit=display_unit, interval_minutes=station_interval_minutes,
+        )
         st.plotly_chart(residual_fig,use_container_width=True,config={'displayModeBar':False})
         with st.expander('Earlier residual-load forecast assessments',expanded=False):
             history = pd.DataFrame([{'origin_utc':item.get('origin_utc'),
@@ -628,6 +556,25 @@ def render_live_monitoring_panel(
                 if col in renewable_actuals.columns:
                     renewable_actuals[col] = pd.to_numeric(renewable_actuals[col], errors="coerce")
         renewable_forecasts = renewable_payload.get("forecasts", {}) or {}
+        renewable_cfg = stations[station].get("renewables") or {}
+        enabled_kinds = [
+            kind for kind in ("solar", "wind")
+            if (renewable_cfg.get("components_enabled") or {}).get(
+                kind, (renewable_cfg.get(kind) or {}).get("enabled", bool(renewable_cfg.get(kind)))
+            )
+        ] if renewable_cfg.get("enabled") else list(renewable_forecasts)
+        ready_kinds = {
+            kind for kind in enabled_kinds if timeline_is_live(
+                progress, ("station", station, kind), forecast_cursor(
+                    renewable_forecasts.get(kind, []), live_through, replay_start,
+                    station_horizon_steps, station_interval_minutes,
+                ), predictor_run,
+            )
+        }
+        pending = {"solar": "Solar", "wind": "Wind Energy"}
+        for kind in enabled_kinds:
+            if kind not in ready_kinds:
+                render_initializing(pending[kind], "Waiting for a complete forecast at a newer live origin.")
         renewable_diagnostics = renewable_payload.get("diagnostics") or {}
         partial = [kind for kind in ("solar", "wind")
                    if renewable_forecasts.get(kind) and not renewable_diagnostics.get(f"{kind}_forecast_complete", True)]
@@ -643,25 +590,27 @@ def render_live_monitoring_panel(
 
         renewable_summary = build_renewable_summaries(renewable_actuals, renewable_forecasts)
         for kind, label in (("solar", "Solar"), ("wind", "Wind Energy")):
+            if kind not in ready_kinds:
+                continue
             stats = renewable_summary[kind]
-            st.markdown(f"**{label}** · MWh per {station_interval_minutes}-minute interval")
-            r1, r2, r3, r4 = st.columns(4, gap="small")
-            def fmt_mwh(value):
-                return f"{value:,.0f} MWh" if value is not None else "—"
-            r1.metric("Latest actual", fmt_mwh(stats["latest_actual"]))
-            r2.metric("Next forecast", fmt_mwh(stats["first_forecast"]))
-            r3.metric("Forecast peak", fmt_mwh(stats["peak_forecast"]))
-            r4.metric("Forecast average", fmt_mwh(stats["average_forecast"]))
+            st.markdown(f"**{label}** · {unit_text}")
+            columns = st.columns(4, gap="small")
+            for col, caption, key in zip(columns, ("Latest actual", "Next forecast", "Forecast peak", "Forecast average"),
+                                         ("latest_actual", "first_forecast", "peak_forecast", "average_forecast")):
+                raw = stats[key]
+                col.metric(caption, format_value(raw * energy_factor if raw is not None else None))
 
+        ready_forecasts = {kind: renewable_forecasts[kind] for kind in ready_kinds}
         renewable_fig, renewable_counts = build_renewable_figure(
-            renewable_actuals, renewable_forecasts,
+            renewable_actuals, ready_forecasts,
             chart_start=chart_start, chart_end=chart_end,
+            display_unit=display_unit, interval_minutes=station_interval_minutes, enabled_kinds=ready_kinds,
         )
         renewable_series_added = any(renewable_counts.values())
         if renewable_series_added:
             st.plotly_chart(renewable_fig, use_container_width=True)
-        elif not renewable_payload.get("history_pending"):
-            st.info("Waiting for Solar or Wind Energy forecasts for this time window.")
+        elif not enabled_kinds and not renewable_payload.get("history_pending"):
+            st.caption("No Solar or Wind Energy models are configured for this station.")
         coverage = renewable_payload.get("coverage", {}) or {}
         coverage = {kind: dict(details or {}) for kind, details in coverage.items()}
         # Coverage labels must describe the rows actually visible in this graph,
@@ -710,7 +659,9 @@ def render_live_monitoring_panel(
                     ("Renewable observations delayed", "; ".join(stale_kinds), "warn")
                 ])
     except requests.RequestException as exc:
-        st.warning(f"Renewable monitoring data is temporarily unavailable from FastAPI: {exc}")
+        render_initializing("Solar and Wind Energy", "Waiting for a response from the forecast service.")
+        if show_diagnostics:
+            st.caption(str(exc))
 
     if show_diagnostics:
         # ---------------------------------------------------------------------
@@ -733,16 +684,19 @@ def render_live_monitoring_panel(
                 if col in latest_run.columns
             ]
 
+            selected_columns = latest_run[display_columns]
             st.dataframe(
-                latest_run[display_columns],
+                selected_columns,
                 use_container_width=True,
                 hide_index=True,
+                column_config={"predicted_demand": f"Predicted demand ({unit_text})"},
             )
 
+            download = selected_columns.assign(demand_unit=display_unit, interval_minutes=station_interval_minutes)
             st.download_button(
                 "Download Latest Forecast Run",
-                data=latest_run[display_columns].to_csv(index=False).encode("utf-8"),
-                file_name=f"{station}_latest_forecast.csv",
+                data=download.to_csv(index=False).encode("utf-8"),
+                file_name=f"{station}_latest_forecast_{display_unit.lower()}.csv",
                 mime="text/csv",
             )
         else:
@@ -791,7 +745,7 @@ def render_live_monitoring_panel(
                 history_fig.update_layout(
                     title=f"Forecast run generated {selected_label}",
                     xaxis_title="Target timestamp (UTC)",
-                    yaxis_title="Predicted demand (MW)",
+                    yaxis_title=f"Predicted demand ({unit_text})",
                     hovermode="x unified",
                     height=380,
                     template="plotly_dark",
@@ -811,6 +765,7 @@ def render_live_monitoring_panel(
                 latest_run,
                 use_container_width=True,
                 hide_index=True,
+                column_config={"predicted_demand": f"Predicted demand ({unit_text})"},
             )
         else:
             st.info("No forecast steps are available.")
@@ -867,19 +822,31 @@ if not hasattr(st, "fragment"):
 if use_hierarchy_view:
     @st.fragment(run_every=float(refresh_seconds) if auto_refresh else None)
     def render_hierarchy_monitoring() -> None:
+        descendant = selected_node
+        while descendant["children"]:
+            descendant = descendant["children"][0]
+        interval = int(stations.get(descendant["id"], {}).get("interval_minutes", 15))
+        window = min(2016, max(1, history_hours * 60 // interval + 1))
+        view = (station, window, include_forecasts)
         try:
-            descendant = selected_node
-            while descendant["children"]:
-                descendant = descendant["children"][0]
-            interval = int(stations.get(descendant["id"], {}).get("interval_minutes", 15))
             payload = api_get(api, "/results/hierarchy", {
-                "node": station, "window": min(2016, max(1, history_hours * 60 // interval)),
-                "include_forecasts": include_forecasts,
+                "node": station, "window": window, "include_forecasts": include_forecasts, "include_history": True,
             })
+            st.session_state["last_hierarchy_reading"] = (view, time.monotonic(), payload)
         except requests.RequestException as exc:
-            st.warning(f"Hierarchy readings are temporarily unavailable: {exc}")
-            return
-        render_group(payload, selected_node, group_metric)
+            previous = st.session_state.get("last_hierarchy_reading")
+            if previous is None or previous[0] != view:
+                render_initializing(selected_node["name"], "Waiting for the shared readings from FastAPI.")
+                if show_diagnostics:
+                    st.caption(str(exc))
+                return
+            _, fetched_at, payload = previous
+            age = int(time.monotonic() - fetched_at)
+            st.warning(f"Hierarchy refresh delayed. Latest shared data arrived {age}s ago.")
+        progress = st.session_state.setdefault("monitoring_timeline_progress", {})
+        render_group(payload, selected_node, group_metric, progress=progress, history_hours=history_hours,
+                     include_forecasts=include_forecasts, show_forecast_table=show_forecast_table,
+                     display_unit=display_unit)
 
     render_hierarchy_monitoring()
 else:
@@ -887,4 +854,4 @@ else:
         run_every=float(refresh_seconds) if auto_refresh else None
     )(render_live_monitoring_panel)
     fragment_runner(api, station, stations, history_hours, show_forecast_table, auto_refresh,
-                    refresh_seconds, show_diagnostics)
+                    refresh_seconds, show_diagnostics, display_unit)

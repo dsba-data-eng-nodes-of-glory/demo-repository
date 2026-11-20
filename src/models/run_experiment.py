@@ -81,22 +81,8 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
     temp_checkpoint.replace(checkpoint_path)
 
     metrics = metadata.get("validation_metrics") or {}
-    station_frame_path = csv_path.resolve()
-    import pandas as pd
-    from src.ingestion.file_loader import load_station_csv
-    frame = load_station_csv(
-        station_frame_path,
-        interval_minutes=int(metadata.get("interval_minutes", station_entry.get("interval_minutes", 15))),
-    )
-    if station_entry.get("weather"):
-        from src.ingestion.station_weather import archive_training_span
-        frame = archive_training_span(frame, ["forecast_temperature"])
-    n_rows = len(frame)
-    split_row = int(n_rows * (1.0 - float(training_options.get("validation_fraction", 0.15))))
-    validation_start = pd.Timestamp(frame.iloc[split_row]["utc_timestamp"]).isoformat()
-    validation_end = pd.Timestamp(frame.iloc[-1]["utc_timestamp"]).isoformat()
-    training_start = pd.Timestamp(frame.iloc[0]["utc_timestamp"]).isoformat()
-    training_end = pd.Timestamp(frame.iloc[split_row - 1]["utc_timestamp"]).isoformat()
+    validation_start = metadata["validation_start_utc"]
+    validation_end = metadata["validation_end_utc"]
 
     metadata.update({
         "experiment_id": experiment_id,
@@ -107,11 +93,6 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
         "feature_schema": "lstm_seq2seq_v1",
         "parameters": params,
         "metrics": metrics,
-        "training_start_utc": training_start,
-        "training_end_utc": training_end,
-        "validation_start_utc": validation_start,
-        "validation_end_utc": validation_end,
-        "evaluation_protocol": "chronological_holdout_sampled_origins_v1",
         "validation_fraction": float(training_options.get("validation_fraction", 0.15)),
         "model_size_bytes": int(checkpoint_path.stat().st_size),
         "created_at": utc_now(),
@@ -135,6 +116,8 @@ def run_lstm(config: dict[str, Any]) -> dict[str, Any]:
         "validation_end_utc": validation_end,
         "validation_origin_count": int(metadata.get("validation_windows", 0)),
         "evaluation_protocol": metadata["evaluation_protocol"],
+        **{key: metadata[key] for key in ("test_start_utc", "test_end_utc", "test_origin_count", "test_metrics")
+           if key in metadata},
         "parameters": params,
         "metrics": metrics,
         "training_duration_seconds": metadata.get("training_duration_seconds"),
